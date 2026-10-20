@@ -1,0 +1,5 @@
+HUB=1.2.3.4:7000
+KEY=REPLACE_WITH_dsh-remote_genkey
+NAME=dsh
+LOG=stderr
+GH_REPO=owner/repo
