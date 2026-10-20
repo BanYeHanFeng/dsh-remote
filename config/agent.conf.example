@@ -1,0 +1,8 @@
+HUB=1.2.3.4:7000
+KEY=REPLACE_WITH_dsh-remote_genkey
+NAME=nas
+ROOTS=/data:/home/ops
+ALLOW_BASH=1
+MAX_OUTPUT=262144
+MAX_FILE=67108864
+LOG=stderr
