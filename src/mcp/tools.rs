@@ -154,13 +154,12 @@ pub fn list() -> Value {
         },
         {
             "name": "actions",
-            "description": "把 GitHub Actions 的临时 runner 变成房间里的被控端：start 派发工作流（节点以 gh-<运行号> 进房间，默认保持 60 分钟并等它上线），stop 向节点发 shutdown 让它自行退出（运行在 Actions 里保持成功，节点不在线时兜底取消运行），status 看最近的运行与在线状态。需要 server 配置 GH_REPO，并且本机 gh 已登录。",
+            "description": "把 GitHub Actions 的临时 runner 变成房间里的被控端：start 派发工作流（节点以 Actions 进房间，默认保持 60 分钟并等它上线），stop 向节点发 shutdown 让它自行退出（运行在 Actions 里保持成功，节点不在线时兜底取消运行），status 看最近的运行与在线状态。需要 server 配置 GH_REPO，并且本机 gh 已登录。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["start", "stop", "status"], "description": "start 开节点、stop 关节点、status 查看运行" },
                     "duration_minutes": { "type": "integer", "description": format!("start 时保持多少分钟，默认 {DEFAULT_DURATION_MINUTES}，上限 {MAX_DURATION_MINUTES}") },
-                    "name": { "type": "string", "description": "start 时的目标名，默认 gh-<运行号>" },
                     "allow_bash": { "type": "boolean", "description": "start 时是否允许 bash 工具，默认 true" },
                     "roots": { "type": "string", "description": "start 时允许访问的目录，冒号分隔，默认 /" },
                     "version": { "type": "string", "description": "start 时的二进制来源：latest 用最新发布、source 现场编译、或具体 tag" },
@@ -482,12 +481,10 @@ async fn actions(session: &Session, args: &Value, cancel: &CancellationToken) ->
                     "中继地址 {hub} 只在 DSH 本机可达，Actions 节点连不上；用 hub 参数指定公网地址"
                 ));
             }
-            let name = optional_str(args, "name");
             let roots = optional_str(args, "roots").unwrap_or_else(|| "/".to_string());
             let version = optional_str(args, "version").unwrap_or_else(|| "latest".to_string());
             let request = StartRequest {
                 hub: &hub,
-                name: name.as_deref(),
                 duration_minutes: optional_u64(args, "duration_minutes")
                     .unwrap_or(DEFAULT_DURATION_MINUTES),
                 allow_bash: optional_bool(args, "allow_bash").unwrap_or(true),

@@ -26,7 +26,7 @@ const INSTRUCTIONS: &str = "\
 用 write。远端首次排错建议顺序：targets → bash（uname -a、ps、systemctl status）→ \
 read（看配置文件）。工具失败时 isError 为真，错误码说明原因（unknown_target、\
 offline、timeout、denied、too_large、busy、io、protocol）。需要临时算力时用 \
-actions 在 GitHub Actions 上开一个一次性被控端（目标名 gh-<运行号>，注册进房间后\
+actions 在 GitHub Actions 上开一个一次性被控端（目标名 Actions，注册进房间后\
 即可当普通 target 用），用完 actions stop 关掉（直接向节点发 shutdown，节点自行退出，\
 运行保持成功），别让它白烧额度。";
 

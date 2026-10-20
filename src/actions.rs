@@ -20,6 +20,7 @@ const STOP_POLL: Duration = Duration::from_secs(5);
 
 pub const DEFAULT_DURATION_MINUTES: u64 = 60;
 pub const MAX_DURATION_MINUTES: u64 = 350;
+pub const DEFAULT_NODE_NAME: &str = "Actions";
 pub const RUN_NAME_PREFIX: &str = "临时被控端 ";
 
 pub struct GhClient {
@@ -47,7 +48,6 @@ pub struct StopWait {
 
 pub struct StartRequest<'a> {
     pub hub: &'a str,
-    pub name: Option<&'a str>,
     pub duration_minutes: u64,
     pub allow_bash: bool,
     pub roots: &'a str,
@@ -72,7 +72,7 @@ impl RunSummary {
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .map(str::to_string)
-            .unwrap_or_else(|| default_node_name(self.id))
+            .unwrap_or_else(default_node_name)
     }
 
     fn active(&self) -> bool {
@@ -80,8 +80,8 @@ impl RunSummary {
     }
 }
 
-pub fn default_node_name(run_id: u64) -> String {
-    format!("gh-{run_id}")
+pub fn default_node_name() -> String {
+    DEFAULT_NODE_NAME.to_string()
 }
 
 impl GhClient {
@@ -155,7 +155,7 @@ impl GhClient {
             "-f".to_string(),
             format!("ref={}", self.cfg.git_ref),
         ];
-        let mut inputs = vec![
+        let inputs = vec![
             ("duration", request.duration_minutes.to_string()),
             (
                 "allow_bash",
@@ -168,9 +168,6 @@ impl GhClient {
             ("roots", request.roots.trim().to_string()),
             ("version", request.version.trim().to_string()),
         ];
-        if let Some(name) = request.name {
-            inputs.push(("name", name.trim().to_string()));
-        }
         for (name, value) in inputs {
             args.push("-f".to_string());
             args.push(format!("inputs[{name}]={value}"));
@@ -180,10 +177,7 @@ impl GhClient {
             .context("派发工作流失败（确认工作流文件已在 GH_REF 分支上）")?;
 
         let run = self.wait_new_run(&repo, before, cancel).await?;
-        let node = request
-            .name
-            .map(str::to_string)
-            .unwrap_or_else(|| default_node_name(run.id));
+        let node = default_node_name();
 
         let mut out = String::new();
         let _ = writeln!(out, "已派发 Actions 临时被控端");
@@ -612,16 +606,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_run_name() {
+    fn uses_actions_name_when_title_has_no_suffix() {
         let run = RunSummary {
             id: 42,
             status: "in_progress".into(),
             conclusion: String::new(),
-            title: "临时被控端 gh-42".into(),
+            title: "临时被控端".into(),
             created_at: "2026-01-02T03:04:05Z".into(),
             url: String::new(),
         };
-        assert_eq!(run.node_name(), "gh-42");
+        assert_eq!(run.node_name(), DEFAULT_NODE_NAME);
         assert!(run.active());
     }
 
@@ -635,8 +629,21 @@ mod tests {
             created_at: String::new(),
             url: String::new(),
         };
-        assert_eq!(run.node_name(), "gh-7");
+        assert_eq!(run.node_name(), DEFAULT_NODE_NAME);
         assert!(!run.active());
+    }
+
+    #[test]
+    fn keeps_legacy_title_suffix() {
+        let run = RunSummary {
+            id: 9,
+            status: "in_progress".into(),
+            conclusion: String::new(),
+            title: "临时被控端 gh-9".into(),
+            created_at: String::new(),
+            url: String::new(),
+        };
+        assert_eq!(run.node_name(), "gh-9");
     }
 
     #[test]
