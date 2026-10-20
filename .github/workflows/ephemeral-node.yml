@@ -8,11 +8,6 @@ on:
         required: false
         default: ""
         type: string
-      name:
-        description: 目标名，留空用 gh-<运行号>
-        required: false
-        default: ""
-        type: string
       duration:
         description: 保持分钟数（1-350）
         required: false
@@ -37,7 +32,7 @@ on:
         default: latest
         type: string
 
-run-name: ${{ inputs.name && format('临时被控端 {0}', inputs.name) || '临时被控端' }}
+run-name: 临时被控端
 
 permissions:
   contents: read
@@ -49,7 +44,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   HUB: ${{ secrets.DSH_REMOTE_HUB || vars.DSH_REMOTE_HUB || inputs.hub }}
-  NODE_NAME: ${{ inputs.name || format('gh-{0}', github.run_id) }}
+  NODE_NAME: Actions
   DURATION: ${{ inputs.duration || '60' }}
   ROOTS: ${{ inputs.roots || '/' }}
   ALLOW_BASH: ${{ inputs.allow_bash || '1' }}
@@ -136,7 +131,7 @@ jobs:
           conf="$RUNNER_TEMP/node.conf"
           log="$RUNNER_TEMP/agent.log"
           : >"$log"
-          ./dsh-remote agent --config "$conf" > >(tee -a "$log") 2>&1 &
+          ./dsh-remote agent --config "$conf" > >(tee -a "$log" | grep --line-buffered -vF "已注册到中继") 2>&1 &
           pid=$!
           registered=0
           for _ in $(seq 1 90); do
