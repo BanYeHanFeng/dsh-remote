@@ -1,0 +1,174 @@
+name: 构建
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 正式发布版本号（如 v0.1.0），留空则只构建
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -C linker=rust-lld
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v7
+      - name: 计算滚动构建版本
+        id: version
+        if: github.event_name == 'push'
+        env:
+          COMMIT_TS: ${{ github.event.head_commit.timestamp }}
+        run: |
+          [ -n "$COMMIT_TS" ] || COMMIT_TS=now
+          day=$(date -u -d "$COMMIT_TS" +%Y%m%d)
+          version="rolling-$day-${GITHUB_SHA:0:7}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "DSH_REMOTE_BUILD_VERSION=$version" >> "$GITHUB_ENV"
+          echo "滚动构建版本: $version"
+      - name: 安装编译目标
+        run: rustup target add ${{ matrix.target }}
+      - name: 缓存编译依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-on-failure: true
+      - name: 编译静态 musl
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: 确认静态链接
+        run: |
+          if readelf -d target/${{ matrix.target }}/release/dsh-remote | grep -q NEEDED; then
+            echo "二进制仍然依赖动态库" >&2
+            exit 1
+          fi
+      - name: 校验注入的版本号
+        if: matrix.arch == 'amd64'
+        env:
+          EXPECTED: ${{ steps.version.outputs.version }}
+        run: |
+          got=$(./target/${{ matrix.target }}/release/dsh-remote --version | awk '{print $2}')
+          echo "二进制报告版本: $got"
+          if [ -n "$EXPECTED" ] && [ "$got" != "$EXPECTED" ]; then
+            echo "版本号未注入: 期望 $EXPECTED，实际 $got" >&2
+            exit 1
+          fi
+      - name: 产出裸二进制
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/dsh-remote dist/dsh-remote-linux-${{ matrix.arch }}
+          chmod 755 dist/dsh-remote-linux-${{ matrix.arch }}
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: dsh-remote-linux-${{ matrix.arch }}
+          path: dist/dsh-remote-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  publish-dev:
+    name: 发布滚动构建
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 读取滚动构建版本
+        id: version
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          case "$VERSION" in
+            rolling-*) ;;
+            *)
+              echo "滚动构建版本号缺失或格式不对: $VERSION" >&2
+              exit 1
+              ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: 清理旧滚动构建
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: ${{ steps.version.outputs.version }}
+        run: |
+          set -uo pipefail
+          list_tags() {
+            gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/rolling" \
+              --jq '.[].ref' 2>/dev/null | sed 's#^refs/tags/##' || true
+          }
+          {
+            gh release list -R "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' || true
+            list_tags
+          } | grep '^rolling' | sort -u | grep -vx "$KEEP" > stale.txt || true
+          while read -r tag; do
+            echo "删除旧滚动构建 $tag"
+            gh release delete "$tag" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null \
+              || gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" 2>/dev/null \
+              || echo "跳过 $tag（已不存在）"
+          done < stale.txt
+          echo "剩余滚动构建："
+          list_tags
+      - name: 发布滚动构建
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: 滚动构建 ${{ steps.version.outputs.version }}
+          prerelease: true
+          make_latest: false
+          files: dist/dsh-remote-linux-*
+          generate_release_notes: true
+
+  publish-release:
+    name: 发布正式版
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.version != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 校验版本号
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          case "$VERSION" in
+            v*) ;;
+            *)
+              echo "版本号需要以 v 开头，例如 v0.1.0" >&2
+              exit 1
+              ;;
+          esac
+      - name: 发布正式版
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          prerelease: false
+          make_latest: true
+          files: dist/dsh-remote-linux-*
+          generate_release_notes: true

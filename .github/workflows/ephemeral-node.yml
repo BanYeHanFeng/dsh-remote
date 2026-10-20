@@ -1,0 +1,169 @@
+name: 临时被控端
+
+on:
+  workflow_dispatch:
+    inputs:
+      hub:
+        description: 中继地址覆盖（一般留空，用仓库密钥 DSH_REMOTE_HUB）
+        required: false
+        default: ""
+        type: string
+      name:
+        description: 目标名，留空用 gh-<运行号>
+        required: false
+        default: ""
+        type: string
+      duration:
+        description: 保持分钟数（1-350）
+        required: false
+        default: "60"
+        type: string
+      allow_bash:
+        description: 是否允许 bash 工具
+        required: false
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "0"
+      roots:
+        description: 允许访问的目录，冒号分隔
+        required: false
+        default: /
+        type: string
+      version:
+        description: 二进制来源：latest 用最新发布、source 现场编译、或具体 tag
+        required: false
+        default: latest
+        type: string
+
+run-name: ${{ inputs.name && format('临时被控端 {0}', inputs.name) || '临时被控端' }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ephemeral-node-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  HUB: ${{ secrets.DSH_REMOTE_HUB || vars.DSH_REMOTE_HUB || inputs.hub }}
+  NODE_NAME: ${{ inputs.name || format('gh-{0}', github.run_id) }}
+  DURATION: ${{ inputs.duration || '60' }}
+  ROOTS: ${{ inputs.roots || '/' }}
+  ALLOW_BASH: ${{ inputs.allow_bash || '1' }}
+  VERSION: ${{ inputs.version || 'latest' }}
+
+jobs:
+  node:
+    name: 临时节点
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      KEY: ${{ secrets.DSH_REMOTE_KEY }}
+    steps:
+      - name: 检出源码（仅源码编译时需要）
+        if: env.VERSION == 'source'
+        uses: actions/checkout@v7
+      - name: 校验参数
+        run: |
+          fail() { echo "$1" >&2; exit 1; }
+          [ -n "$HUB" ] || fail "缺少中继地址：设置仓库密钥 DSH_REMOTE_HUB（actions start 会自动写入）"
+          [ -n "$KEY" ] || fail "缺少仓库密钥 DSH_REMOTE_KEY（actions start 会自动写入）"
+          case "$HUB" in
+            *:*:*) fail "中继地址格式不对" ;;
+            *:*) ;;
+            *) fail "中继地址需要主机:端口" ;;
+          esac
+          host=${HUB%:*}
+          echo "::add-mask::$host"
+          case "$HUB" in
+            127.*|localhost*|0.0.0.0*|"[::1]"*) fail "中继地址是回环地址，Actions 节点连不上" ;;
+          esac
+          case "$DURATION" in
+            ''|*[!0-9]*) fail "duration 需要整数分钟，收到 $DURATION" ;;
+          esac
+          [ "$DURATION" -ge 1 ] && [ "$DURATION" -le 350 ] || fail "duration 需要在 1-350 之间，收到 $DURATION"
+          [ -n "$ROOTS" ] || fail "roots 不能为空"
+          case "$NODE_NAME" in
+            *[!A-Za-z0-9._-]*) fail "目标名只能包含字母、数字、点、下划线和短横线：$NODE_NAME" ;;
+          esac
+          [ "${#NODE_NAME}" -le 64 ] || fail "目标名最长 64 字节"
+          echo "目标名 $NODE_NAME｜保持 $DURATION 分钟｜bash=$ALLOW_BASH｜目录 $ROOTS"
+      - name: 准备二进制
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$VERSION" = source ]; then
+            rustup target add x86_64-unknown-linux-musl
+            RUSTFLAGS="-C linker=rust-lld" cargo build --locked --release --target x86_64-unknown-linux-musl
+            cp target/x86_64-unknown-linux-musl/release/dsh-remote ./dsh-remote
+          else
+            tag="$VERSION"
+            if [ "$tag" = latest ]; then
+              tag=$(gh release list -R "$GITHUB_REPOSITORY" --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName')
+            fi
+            [ -n "$tag" ] || { echo "没有找到可用的发布，试试 version=source" >&2; exit 1; }
+            echo "下载 $tag 的 amd64 构建"
+            gh release download "$tag" -R "$GITHUB_REPOSITORY" --pattern dsh-remote-linux-amd64 --output ./dsh-remote
+          fi
+          chmod 755 ./dsh-remote
+          ./dsh-remote --version
+      - name: 写入节点配置
+        run: |
+          conf="$RUNNER_TEMP/node.conf"
+          umask 077
+          cat >"$conf" <<EOF
+          HUB=$HUB
+          KEY=$KEY
+          NAME=$NODE_NAME
+          ROOTS=$ROOTS
+          ALLOW_BASH=$ALLOW_BASH
+          MAX_OUTPUT=262144
+          MAX_FILE=67108864
+          LOG=stderr
+          EOF
+          chmod 600 "$conf"
+          sed -E 's/^(KEY|HUB)=.*/\1=***/' "$conf"
+      - name: 连通性与密钥自检
+        run: |
+          timeout 90 ./dsh-remote targets --hub "$HUB" --key "$KEY" --name "probe-$NODE_NAME" --log stderr
+      - name: 上线并保持
+        run: |
+          set -uo pipefail
+          conf="$RUNNER_TEMP/node.conf"
+          log="$RUNNER_TEMP/agent.log"
+          : >"$log"
+          ./dsh-remote agent --config "$conf" > >(tee -a "$log") 2>&1 &
+          pid=$!
+          registered=0
+          for _ in $(seq 1 90); do
+            if grep -q "已注册到中继" "$log"; then
+              registered=1
+              break
+            fi
+            if grep -q "中继拒绝连接" "$log"; then
+              break
+            fi
+            sleep 1
+          done
+          if [ "$registered" != 1 ]; then
+            echo "节点没能在 90 秒内注册，日志：" >&2
+            tail -40 "$log" >&2
+            kill -TERM "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null
+            exit 1
+          fi
+          echo "节点 $NODE_NAME 已上线，保持 $DURATION 分钟；收到停止指令会自行退出（运行保持成功）"
+          deadline=$((SECONDS + DURATION * 60))
+          while kill -0 "$pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+            sleep 5
+          done
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "保持时间到，通知节点退出"
+            kill -TERM "$pid" 2>/dev/null || true
+          fi
+          wait "$pid" 2>/dev/null
+          echo "节点已下线"
