@@ -1,0 +1,236 @@
+# dsh-remote 协议
+
+协议只服务 dsh-remote 自己的三个角色，目标是好实现、好排错、可演进。内部用
+CBOR（`ciborium`）编码，文档里的示例写成 JSON 方便阅读。
+
+## 1. 传输分层
+
+```text
+TCP
+└── Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s（每条连接独立握手）
+    └── 帧：u16 密文长度（大端）+ Noise 密文（明文 = u8 type + CBOR payload）
+        └── 消息：Hello / Call / Result / Chunk / End / ...
+```
+
+- 握手与传输阶段都用 `u16` 长度前缀；Noise 单条消息上限 65535 字节，明文最大 65519。
+- 应用层分片：`Chunk.data` 每片 32 KiB，接收端按 `seq` 拼接；控制消息远小于上限。
+- 版本字段 `proto: 1` 放在 `Hello`/`Welcome`；不匹配由 hub 回 `Bye` 后断开。
+- 所有整数大端；`req_id` 为 u64，连接内单调递增；时间戳为 Unix 毫秒。
+
+## 2. 握手
+
+```text
+initiator                          responder
+   │ ── e, es, s, ss {psk} ──────▶ │   IK 第一趟
+   │ ◀─────── e, ee, se {psk} ──── │   IK 第二趟，双方完成认证
+   │ ── Hello ───────────────────▶ │
+   │ ◀────────────────── Welcome ── │
+```
+
+- 发起方静态公钥由 Key 派生，responder 校验其等于期望值；responder 的静态公钥
+  同样由 Key 派生，发起方据此确认连到了持有同一 Key 的中继。
+- 握手失败（Key 不同）不返回任何明文原因，只记本地日志并断开，避免探测。
+- 握手完成后 5 秒内必须收到合法 `Hello`，否则断开。
+
+## 3. 消息
+
+### 3.1 控制
+
+| type | 名称 | 方向 | 字段 |
+| --- | --- | --- | --- |
+| 0x01 | `Hello` | C→S | `proto, role, name, version, os, arch, caps[], roots[]` |
+| 0x02 | `Welcome` | S→C | `proto, hub_name, session, targets[], server_online` |
+| 0x03 | `Ping` | 双向 | `nonce` |
+| 0x04 | `Pong` | 双向 | `nonce` |
+| 0x05 | `Bye` | 双向 | `code, message` |
+| 0x20 | `TargetsSnapshot` | S→C | `targets[]` |
+| 0x21 | `TargetEvent` | S→C | `kind: online\|offline, target` |
+
+`role` 取 `server` / `agent`。`caps` 是字符串数组，如 `bash`、`fs`、`transfer`。
+`roots` 仅用于展示，实际限制在 agent 本地执行。
+
+`Welcome.targets` 里 `hub` 自身也在列表中：
+
+```json
+{"name":"hub","kind":"hub","os":"linux","arch":"x86_64","version":"0.1.0",
+ "since":1730000000000,"roots":["/data"],"caps":["bash","fs","transfer"]}
+```
+
+### 3.2 调用
+
+| type | 名称 | 方向 | 字段 |
+| --- | --- | --- | --- |
+| 0x10 | `Call` | server→hub | `id, target, method, params` |
+| 0x11 | `Result` | hub→server | `id, ok, value?, error?` |
+| 0x12 | `Chunk` | 双向 | `id, seq, stream: 1\|2, data` |
+| 0x13 | `End` | 双向 | `id, status, exit_code?, size?, sha256?, truncated?` |
+| 0x14 | `Cancel` | server→hub→agent | `id, reason?` |
+
+- `method` 取工具名：`bash`、`read`、`write`、`edit`、`list`、
+  `upload`、`download`、`targets`、`shutdown`。`params` 是方法参数的 CBOR map，原样透传。
+- `shutdown` 只有 agent 处理：先回 `Result{ok:true, value:{stopping:true}}`，
+  然后断开中继、退出进程；hub 自身回 `unsupported`（中继不能被远程关掉）。
+- 短结果用 `Result` 一次返回（`targets`、`read`、`write`、`edit`、`list`）。
+- 长结果用流：先若干 `Chunk`，最后 `End`。`bash` 的 stdout 用 `stream=1`，
+  stderr 用 `stream=2`；文件传输只用 `stream=1`。
+- `End.status` 取 `ok` / `error` / `cancelled` / `truncated`；`exit_code` 只在
+  `bash` 出现；文件传输带 `size` 与 `sha256`。下载的 `End` 是终态；上传的 `End`
+  只是上行数据结束，agent 还会回一条 `Result`。
+- `seq` 在每个 `stream` 内独立从 0 递增，接收端按流分别拼接；重复或跳号即判定
+  `protocol` 错误并 `Cancel`。
+- `Call.id` 由 server 分配；hub 转发给 agent 前改写为房间内全局唯一的 `call_id`，
+  回程再改写回 server 的 `id`。
+- `Result` 与 `End` 都是终止消息：hub 收到后释放 `pending` 与超时计时器。
+  例外是上传方向 server 发出的 `End`，它只表示数据发完，hub 保留 `pending`
+  直到 agent 的 `Result`。
+- 一条 `Call` 的任一阶段出错，都以 `Result{ok:false}` 或 `End{status:"error"}`
+  收尾，保证请求不悬挂。
+
+示例：一次 `bash` 调用
+
+```json
+{"id":17,"target":"nas","method":"bash",
+ "params":{"command":"df -h","cwd":"/data","timeout_ms":30000}}
+```
+
+```json
+{"id":17,"seq":0,"stream":1,"data":"<stdout bytes>"}
+{"id":17,"status":"ok","exit_code":0,"truncated":false}
+```
+
+### 3.3 文件传输
+
+上传（server → hub → agent）：
+
+```text
+server ── Call{id, target, method:"upload",
+             params:{remote_path,size,overwrite,create_parents?}} ──▶
+server ── Chunk{id, seq, stream:1} ... ──▶
+server ── End{id, status:"ok", size, sha256} ──▶
+agent  ── Result{ok:true, value:{path,size,sha256}} ──▶
+```
+
+- hub 为 server 发来的 `Chunk`/`End` 按 `(server_id, id)` 找到 `call_id` 后转发；
+  不缓存内容，也不在上行 `End` 时释放 `pending`。`target` 就是 hub 自己时，
+  这些消息直接交给进程内执行器的上传任务。
+- agent 收到 `Call` 后先校验路径与覆盖策略，再在目标目录创建
+  `.dsh-remote-<pid>-<rand>.part`；每个 `Chunk` 按 `seq` 顺序写入并累计 sha256。
+- `Call.params.size` 用于提前拒绝超过 `MAX_FILE` 的请求；`End.size` 与
+  `End.sha256` 是最终校验依据。校验失败或取消时删除临时文件。
+- 校验通过后 `rename` 到目标路径；`overwrite=false` 时目标已存在直接回
+  `conflict`。
+
+下载（agent → hub → server）：
+
+```text
+server ── Call{id, target, method:"download", params:{remote_path,max_size}} ──▶
+agent  ── Chunk{id, seq, stream:1} ... ──▶
+agent  ── End{id, status:"ok", size, sha256} ──▶
+```
+
+- 下载没有额外的 `Result`，`End` 即终态。
+- server 边收边写本地 `.part`，按 `seq` 拼接并累计 sha256，校验 `size` 后原子
+  rename；失败、取消或超时删除 `.part`。
+- agent 在打开文件前检查自身的 `MAX_FILE` 与请求里的 `max_size`，取较小值。
+
+分块与结果上限：
+
+- `Chunk.data` 每片 32 KiB，`stream` 固定为 1；`seq` 从 0 连续递增。
+- `read`/`write`/`edit`/`list` 走单条 `Result`，编码后不超过 60 KiB。
+- `write` 内容上限 48 KiB，`read` 一次最多返回 32 KiB 文本；更大的数据用上传下载。
+
+## 4. 路由
+
+hub 内维护：
+
+- `agents: Map<name, Conn>`，注册时查重；断开即移除并广播 `TargetEvent{offline}`。
+- `servers: Set<Conn>`，允许多个并存（DSH 探测进程、多个 DSH 实例），事件广播给全部。
+- `pending: Map<call_id, Pending{server_id, server_req_id, agent_id, deadline}>`，
+  回程按 `call_id` 找到发起方，再改回 `server_req_id`。
+
+处理一条 `Call`：
+
+1. 校验来源是 `server`，否则记日志忽略。
+2. `method == "targets"` 或 `target == hub_name` → 本地应答，不转发。
+3. 查 `agents`：不存在回 `Result{error:{code:"unknown_target"}}`。
+4. 分配 `call_id`，记录 `pending`，转发给 agent，设置截止时间。
+5. server 后续的 `Chunk`/`End`（上传）按 `(server_id, req_id)` 找到 `call_id` 后
+   转发给 agent；上行 `End` 不释放 `pending`。
+6. agent 的 `Result`/`Chunk`/`End` 按 `call_id` 找到发起方，改写 `id` 后回传。
+7. 超时：回 server `Result{error:{code:"timeout"}}`，给 agent 发 `Cancel`。
+8. agent 断开：其所有 `pending` 回 `offline`；server 断开：其所有 `pending` 给
+   agent 发 `Cancel`。
+
+hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`target`、`req_id`
+用于路由和审计。这正是“逐段加密”的边界。
+
+## 5. 心跳、超时与重连
+
+| 项 | 值 |
+| --- | --- |
+| 心跳空闲间隔 | 15s |
+| 判定断线 | 45s 内无任何帧（含心跳） |
+| 握手超时 | 10s |
+| `Hello` 超时 | 5s |
+| 默认调用超时 | 60s；`bash` 为 `timeout_ms + 30s`；文件传输为 `300s + 大小/256KiB`，封顶 1 小时 |
+| 重连退避 | 1s 起翻倍到 30s，加 0–20% 抖动 |
+
+- server 与 agent 断线后无限重连；进程不退出（除非 stdin EOF / SIGTERM）。
+- 重连成功后重新 `Hello`，hub 重建注册表并推送 `TargetsSnapshot`。
+- server 重连时若发现同名 agent 已换连接，后续调用直接走新连接，无需重启。
+
+## 6. 错误码
+
+| code | 场景 |
+| --- | --- |
+| `bad_key` | 握手 PSK 不匹配（仅本地日志，不回明文） |
+| `duplicate_name` | agent 名已被占用 |
+| `unknown_target` | 目标名不存在（含刚下线） |
+| `offline` | 目标在线但连接已断 |
+| `timeout` | hub 或本地执行超时 |
+| `cancelled` | 调用方主动取消 |
+| `denied` | 路径越界、bash 被禁用、权限不足 |
+| `not_found` | 路径不存在、`edit` 没有匹配 |
+| `conflict` | 目标已存在且未允许覆盖、`edit` 匹配到多处 |
+| `too_large` | 输出或文件超上限 |
+| `busy` | 并发执行数达到上限 |
+| `io` | 本地文件/进程 IO 错误 |
+| `protocol` | 帧或消息不合法（含 `seq` 跳号） |
+| `unsupported` | 目标不支持该方法（例如 agent 上的 `targets`） |
+| `internal` | 未分类错误 |
+
+`Result.error` 结构：`{code, message, detail?}`。`message` 面向模型，中文；
+`detail` 只进日志，不回给模型（避免泄露绝对路径等）。
+
+## 7. MCP 映射
+
+对外只有 MCP 一种入口（`dsh-remote server`），工具名与内部 `Call.method` 一一对应，
+参数用 JSON 名称，内部再转 CBOR（内部 `list` 只供 CLI `file list` 使用，不暴露为 MCP 工具）：
+
+| 工具 | 内部 method | 终态消息 | MCP 侧超时 |
+| --- | --- | --- | --- |
+| `targets` | `targets`（发给 hub） | `Result` | 用本地快照，断线也应答 |
+| `bash` | `bash` | `Chunk` + `End` | `timeout_ms + 15s`，上限 600s |
+| `read` | `read` | `Result` | 60s |
+| `write` | `write` | `Result` | 60s |
+| `edit` | `edit` | `Result` | 60s |
+| `upload` | `upload` | 上行 `Chunk`+`End`，回程 `Result` | `300s + 大小/256KiB` |
+| `download` | `download` | 下行 `Chunk`+`End` | `300s + 大小/256KiB` |
+| `actions stop`（内部） | `shutdown`（发给目标节点） | `Result` | 10s |
+
+- `req_id` 由 server 侧的 `Session` 单调分配，一条连接内并发任意多路；
+  收到 `End`/`Result` 即释放。
+- MCP 的 `notifications/cancelled` → 内部 `Cancel{id}`，hub 再转发给 agent：
+  bash 杀进程组，传输删临时文件。
+- 错误码原样透出（`unknown_target`、`offline`、`timeout`、`denied` 等），
+  MCP 里表现为 `isError: true` 加一行 `错误 [code]: message`。
+- 中继断开时 `pending` 中的调用统一回 `offline`，`targets` 返回未连接的空列表；
+  重连后 `Welcome.targets` 覆盖本地快照，不需要重启 DSH。
+
+## 8. 演进
+
+- 新增消息类型不改变已有语义；未知 type 记录日志后忽略，连接不断开。
+- `Hello.proto` 只做“同主版本可通信”的粗校验；字段用 CBOR 可选字段扩展。
+- 端到端加密演进：把 `Call.params` 与 `Chunk.data` 换成 server 与 agent 协商的
+  不透明密文，hub 只保留 `target`、`req_id`、`method` 用于路由；消息表不推翻。
+- MCP 层协议版本走 MCP 自己的 `initialize` 协商，与内部协议版本无关。
