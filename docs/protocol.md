@@ -13,8 +13,13 @@ TCP
 ```
 
 - 握手与传输阶段都用 `u16` 长度前缀；Noise 单条消息上限 65535 字节，明文最大 65519。
-- 应用层分片：`Chunk.data` 每片 32 KiB，接收端按 `seq` 拼接；控制消息远小于上限。
-- 版本字段 `proto: 1` 放在 `Hello`/`Welcome`；不匹配由 hub 回 `Bye` 后断开。
+- 应用层分片：`Chunk.data` 每片 60 KiB，CBOR 里编码为字节串（不是整数数组），
+  连同头部仍小于明文上限；接收端按 `seq` 拼接，允许乱序到达后重排。
+- 版本字段 `proto: 2` 放在 `Hello`/`Welcome`；不匹配由 hub 回 `Bye{code:"proto_mismatch"}`
+  后断开。2 与 1 的分片编码不同，不互通，三端需要一起升级。
+- 每条连接有两条出站队列：`Chunk`/`End`/`Result` 走数据队列并按入队顺序发送，
+  `Ping`/`Pong`/`Bye`/`Cancel` 等走控制队列优先发送。写线程按批合并帧
+  （一次 `write_all` + 一次 `flush`），心跳不会排在成兆的数据后面。
 - 所有整数大端；`req_id` 为 u64，连接内单调递增；时间戳为 Unix 毫秒。
 
 ## 2. 握手
@@ -135,7 +140,9 @@ agent  ── End{id, status:"ok", size, sha256} ──▶
 
 分块与结果上限：
 
-- `Chunk.data` 每片 32 KiB，`stream` 固定为 1；`seq` 从 0 连续递增。
+- `Chunk.data` 每片 60 KiB，`stream` 固定为 1；`seq` 从 0 连续递增。
+- 接收端按 `seq` 重排：连号即落盘并累计 sha256，超前分片先缓存（最多 512 片），
+  收尾时仍有空洞就判定失败并丢弃临时文件。
 - `read`/`write`/`edit`/`list` 走单条 `Result`，编码后不超过 60 KiB。
 - `write` 内容上限 48 KiB，`read` 一次最多返回 32 KiB 文本；更大的数据用上传下载。
 
@@ -160,6 +167,10 @@ hub 内维护：
 7. 超时：回 server `Result{error:{code:"timeout"}}`，给 agent 发 `Cancel`。
 8. agent 断开：其所有 `pending` 回 `offline`；server 断开：其所有 `pending` 给
    agent 发 `Cancel`。
+
+server 侧每个调用有独立的投递队列：连接读循环只做非阻塞入队，慢调用不会拖住
+其它调用；队列积压超过 256 条视为调用方停滞，回 `Cancel` 并放弃该调用。
+连接断开时所有队列立即关闭，等待中的调用马上拿到“连接中断”而不是空等到超时。
 
 hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`target`、`req_id`
 用于路由和审计。这正是“逐段加密”的边界。
