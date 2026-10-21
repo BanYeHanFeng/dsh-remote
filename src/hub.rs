@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use ciborium::value::Value;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 use crate::config::HubConfig;
 use crate::exec::transfer::transfer_limit;
 use crate::exec::{Executor, Settings, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS};
-use crate::net::{spawn_io, IoHandles, SecureConn};
+use crate::net::{spawn_io, IoHandles, SecureConn, Sink};
 use crate::proto::value as cbor;
 use crate::proto::{
     caps, now_ms, Msg, ProtoError, Role, TargetEventKind, TargetInfo, TargetKind, PROTO_VERSION,
@@ -31,21 +31,21 @@ const CALL_TIMEOUT_EXTRA: Duration = Duration::from_secs(30);
 
 struct AgentEntry {
     info: TargetInfo,
-    tx: mpsc::Sender<Msg>,
+    tx: Sink,
     conn_id: u64,
     token: CancellationToken,
 }
 
 struct ServerEntry {
-    tx: mpsc::Sender<Msg>,
+    tx: Sink,
 }
 
 struct Pending {
     server_id: u64,
-    server_tx: mpsc::Sender<Msg>,
+    server_tx: Sink,
     server_req_id: u64,
     agent_id: u64,
-    agent_tx: mpsc::Sender<Msg>,
+    agent_tx: Sink,
     timer: JoinHandle<()>,
 }
 
@@ -101,7 +101,7 @@ impl HubState {
     async fn register_agent(
         &self,
         info: &TargetInfo,
-        tx: &mpsc::Sender<Msg>,
+        tx: &Sink,
         conn_id: u64,
         token: &CancellationToken,
     ) -> Result<Option<AgentEntry>, ProtoError> {
@@ -121,7 +121,7 @@ impl HubState {
         Ok(previous.filter(|old| !old.tx.is_closed() && old.conn_id != conn_id))
     }
 
-    async fn remove_agent(&self, name: &str, tx: &mpsc::Sender<Msg>) -> bool {
+    async fn remove_agent(&self, name: &str, tx: &Sink) -> bool {
         let mut agents = self.agents.write().await;
         let matched = agents
             .get(name)
@@ -133,7 +133,7 @@ impl HubState {
         matched
     }
 
-    async fn register_server(&self, conn_id: u64, tx: mpsc::Sender<Msg>) {
+    async fn register_server(&self, conn_id: u64, tx: Sink) {
         self.servers
             .write()
             .await
@@ -145,7 +145,7 @@ impl HubState {
     }
 
     async fn broadcast(&self, msg: Msg) {
-        let targets: Vec<mpsc::Sender<Msg>> = self
+        let targets: Vec<Sink> = self
             .servers
             .read()
             .await
@@ -160,7 +160,7 @@ impl HubState {
     async fn handle_call(
         &self,
         server_id: u64,
-        server_tx: mpsc::Sender<Msg>,
+        server_tx: Sink,
         req_id: u64,
         target: String,
         method: String,
@@ -178,7 +178,7 @@ impl HubState {
     async fn handle_local_call(
         &self,
         server_id: u64,
-        server_tx: mpsc::Sender<Msg>,
+        server_tx: Sink,
         req_id: u64,
         method: String,
         params: Value,
@@ -216,7 +216,7 @@ impl HubState {
     async fn route_call(
         &self,
         server_id: u64,
-        server_tx: mpsc::Sender<Msg>,
+        server_tx: Sink,
         req_id: u64,
         target: String,
         method: String,
@@ -357,13 +357,7 @@ impl HubState {
         }
     }
 
-    async fn cleanup_connection(
-        &self,
-        role: Role,
-        info: &TargetInfo,
-        tx: &mpsc::Sender<Msg>,
-        conn_id: u64,
-    ) {
+    async fn cleanup_connection(&self, role: Role, info: &TargetInfo, tx: &Sink, conn_id: u64) {
         match role {
             Role::Agent => {
                 let removed = self.remove_agent(&info.name, tx).await;
@@ -484,7 +478,24 @@ async fn handle_conn(
     let hello = timeout(HELLO_TIMEOUT, conn.recv())
         .await
         .map_err(|_| anyhow!("等待 Hello 超时"))??;
-    let (role, name, info) = parse_hello(hello)?;
+    let (role, name, info) = match parse_hello(hello) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let mismatch = format!("{err:#}").contains("协议版本不匹配");
+            let _ = conn
+                .send(&Msg::Bye {
+                    code: if mismatch {
+                        "proto_mismatch"
+                    } else {
+                        "handshake"
+                    }
+                    .into(),
+                    message: format!("{err:#}"),
+                })
+                .await;
+            return Err(err);
+        }
+    };
     info!(%peer, ?role, name = %name, "握手完成");
 
     let IoHandles {
@@ -699,7 +710,7 @@ fn call_timeout(method: &str, params: &Value) -> Duration {
     }
 }
 
-async fn reply_error(tx: &mpsc::Sender<Msg>, id: u64, code: &str, message: impl Into<String>) {
+async fn reply_error(tx: &Sink, id: u64, code: &str, message: impl Into<String>) {
     let _ = tx
         .send(Msg::Result {
             id,

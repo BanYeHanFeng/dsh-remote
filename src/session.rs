@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -13,14 +13,14 @@ use tracing::{debug, info, warn};
 use crate::config::{ClientConfig, GithubConfig};
 use crate::key::KeyMaterial;
 use crate::net::backoff::Backoff;
-use crate::net::{spawn_io, IoHandles, SecureConn};
+use crate::net::{spawn_io, IoHandles, SecureConn, Sink};
 use crate::proto::{caps, EndStatus, Msg, Role, TargetEventKind, TargetInfo, PROTO_VERSION};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const REPLY_QUEUE: usize = 64;
-const ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
+const CALL_BACKLOG: usize = 256;
 const INITIAL_CONNECT_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
@@ -117,8 +117,90 @@ struct State {
 
 struct Conn {
     serial: u64,
-    outbound: mpsc::Sender<Msg>,
-    pending: HashMap<u64, mpsc::Sender<Msg>>,
+    outbound: Sink,
+    pending: HashMap<u64, CallQueue>,
+}
+
+#[derive(Clone)]
+struct CallQueue {
+    inner: Arc<CallQueueInner>,
+}
+
+struct CallQueueInner {
+    backlog: Mutex<VecDeque<Msg>>,
+    notify: Notify,
+    consumer: mpsc::Sender<Msg>,
+    closed: AtomicBool,
+}
+
+impl CallQueue {
+    fn new(capacity: usize) -> (Self, mpsc::Receiver<Msg>) {
+        let (consumer, rx) = mpsc::channel(capacity);
+        let inner = Arc::new(CallQueueInner {
+            backlog: Mutex::new(VecDeque::new()),
+            notify: Notify::new(),
+            consumer,
+            closed: AtomicBool::new(false),
+        });
+        let pump_inner = inner.clone();
+        tokio::spawn(async move {
+            pump(pump_inner).await;
+        });
+        (Self { inner }, rx)
+    }
+
+    fn close(&self) {
+        self.inner.closed.store(true, Ordering::SeqCst);
+        self.inner.notify.notify_one();
+    }
+
+    fn push(&self, msg: Msg) -> bool {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return false;
+        }
+        {
+            let mut backlog = self
+                .inner
+                .backlog
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if backlog.len() >= CALL_BACKLOG {
+                return false;
+            }
+            backlog.push_back(msg);
+        }
+        self.inner.notify.notify_one();
+        true
+    }
+}
+
+async fn pump(inner: Arc<CallQueueInner>) {
+    loop {
+        let notified = inner.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        loop {
+            let msg = {
+                let mut backlog = inner
+                    .backlog
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                backlog.pop_front()
+            };
+            match msg {
+                Some(msg) => {
+                    if inner.consumer.send(msg).await.is_err() {
+                        return;
+                    }
+                }
+                None => break,
+            }
+        }
+        if inner.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
 }
 
 impl Session {
@@ -245,10 +327,7 @@ impl Session {
         info!("中继连接已停止");
     }
 
-    async fn open(
-        &self,
-        shutdown: &CancellationToken,
-    ) -> Result<(mpsc::Receiver<Msg>, mpsc::Sender<Msg>, u64)> {
+    async fn open(&self, shutdown: &CancellationToken) -> Result<(mpsc::Receiver<Msg>, Sink, u64)> {
         let mut conn = SecureConn::connect(&self.inner.hub, &self.inner.key).await?;
         let hello = Msg::Hello {
             proto: PROTO_VERSION,
@@ -307,7 +386,7 @@ impl Session {
     async fn serve(
         &self,
         mut inbound: mpsc::Receiver<Msg>,
-        outbound: mpsc::Sender<Msg>,
+        outbound: Sink,
         serial: u64,
         shutdown: CancellationToken,
     ) {
@@ -351,7 +430,7 @@ impl Session {
         }
     }
 
-    async fn handle(&self, serial: u64, outbound: &mpsc::Sender<Msg>, msg: Msg) -> Result<()> {
+    async fn handle(&self, serial: u64, outbound: &Sink, msg: Msg) -> Result<()> {
         match msg {
             Msg::Ping { nonce } => {
                 let _ = outbound.try_send(Msg::Pong { nonce });
@@ -365,15 +444,15 @@ impl Session {
                 self.apply_event(serial, kind, target);
             }
             Msg::Result { id, .. } | Msg::Chunk { id, .. } | Msg::End { id, .. } => {
-                self.route(serial, outbound, id, msg).await;
+                self.route(serial, outbound, id, msg);
             }
             other => debug!(msg = ?other, "忽略消息"),
         }
         Ok(())
     }
 
-    async fn route(&self, serial: u64, outbound: &mpsc::Sender<Msg>, id: u64, msg: Msg) {
-        let sender = {
+    fn route(&self, serial: u64, outbound: &Sink, id: u64, msg: Msg) {
+        let queue = {
             let state = self.lock_state();
             state
                 .conn
@@ -381,29 +460,19 @@ impl Session {
                 .filter(|conn| conn.serial == serial)
                 .and_then(|conn| conn.pending.get(&id).cloned())
         };
-        let Some(sender) = sender else {
+        let Some(queue) = queue else {
             debug!(id, "丢弃没有归属的回复");
             return;
         };
-        match timeout(ROUTE_TIMEOUT, sender.send(msg)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                debug!(id, "调用方已放弃，通知中继取消");
-                self.unregister(serial, id);
-                let _ = outbound.try_send(Msg::Cancel {
-                    id,
-                    reason: Some("client gone".into()),
-                });
-            }
-            Err(_) => {
-                warn!(id, "调用方处理过慢，放弃该调用");
-                self.unregister(serial, id);
-                let _ = outbound.try_send(Msg::Cancel {
-                    id,
-                    reason: Some("client stalled".into()),
-                });
-            }
+        if queue.push(msg) {
+            return;
         }
+        warn!(id, "调用方处理过慢，放弃该调用");
+        self.unregister(serial, id);
+        let _ = outbound.try_send(Msg::Cancel {
+            id,
+            reason: Some("client stalled".into()),
+        });
     }
 
     pub async fn begin(
@@ -414,13 +483,13 @@ impl Session {
     ) -> RemoteResult<CallHandle> {
         self.ready().await;
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(REPLY_QUEUE);
+        let (queue, rx) = CallQueue::new(REPLY_QUEUE);
         let (outbound, serial) = {
             let mut state = self.lock_state();
             let Some(conn) = state.conn.as_mut() else {
                 return Err(RemoteError::new("offline", "尚未连接中继"));
             };
-            conn.pending.insert(id, tx);
+            conn.pending.insert(id, queue);
             (conn.outbound.clone(), conn.serial)
         };
         let call = Msg::Call {
@@ -483,20 +552,19 @@ impl Session {
     }
 
     fn unregister(&self, serial: u64, id: u64) {
-        let mut state = self.lock_state();
-        if let Some(conn) = state.conn.as_mut() {
-            if conn.serial == serial {
-                conn.pending.remove(&id);
+        let removed = {
+            let mut state = self.lock_state();
+            match state.conn.as_mut() {
+                Some(conn) if conn.serial == serial => conn.pending.remove(&id),
+                _ => None,
             }
+        };
+        if let Some(queue) = removed {
+            queue.close();
         }
     }
 
-    fn install(
-        &self,
-        outbound: mpsc::Sender<Msg>,
-        hub_name: String,
-        targets: Vec<TargetInfo>,
-    ) -> u64 {
+    fn install(&self, outbound: Sink, hub_name: String, targets: Vec<TargetInfo>) -> u64 {
         let mut state = self.lock_state();
         let serial = state.next_serial;
         state.next_serial += 1;
@@ -515,7 +583,11 @@ impl Session {
     fn teardown(&self, serial: u64) {
         let mut state = self.lock_state();
         if state.conn.as_ref().map(|conn| conn.serial) == Some(serial) {
-            state.conn = None;
+            if let Some(conn) = state.conn.take() {
+                for queue in conn.pending.into_values() {
+                    queue.close();
+                }
+            }
             if let Ok(mut targets) = self.inner.targets.write() {
                 targets.clear();
             }
