@@ -1,18 +1,18 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
 
 use crate::exec::error::{ToolError, ToolResult};
-use crate::proto::Msg;
 
-pub const CHUNK_SIZE: usize = 32 * 1024;
+pub const CHUNK_SIZE: usize = 60 * 1024;
 pub const MAX_CHUNK_SIZE: usize = 64 * 1024;
+pub const MAX_PENDING_CHUNKS: usize = 512;
+pub const WINDOW_CHUNKS: usize = 32;
 const TRANSFER_TIMEOUT_FLOOR: u64 = 300;
 const TRANSFER_TIMEOUT_MAX: u64 = 3_600;
 const TRANSFER_BYTES_PER_SECOND: u64 = 256 * 1024;
@@ -41,6 +41,7 @@ pub struct Incoming {
     max_file: u64,
     received: u64,
     next_seq: u64,
+    pending: BTreeMap<u64, Vec<u8>>,
     permissions: Option<std::fs::Permissions>,
     committed: bool,
 }
@@ -105,6 +106,7 @@ impl Incoming {
                         max_file,
                         received: 0,
                         next_seq: 0,
+                        pending: BTreeMap::new(),
                         permissions,
                         committed: false,
                     });
@@ -126,12 +128,6 @@ impl Incoming {
     }
 
     pub async fn push(&mut self, seq: u64, data: &[u8]) -> ToolResult<()> {
-        if seq != self.next_seq {
-            return Err(ToolError::protocol(format!(
-                "分块序号错乱：期望 {}，收到 {seq}",
-                self.next_seq
-            )));
-        }
         if data.is_empty() || data.len() > MAX_CHUNK_SIZE {
             return Err(ToolError::protocol(format!(
                 "分块长度非法: {} 字节",
@@ -145,12 +141,38 @@ impl Incoming {
                 self.max_file
             )));
         }
+        if seq < self.next_seq {
+            return Err(ToolError::protocol(format!(
+                "分块重复：{} 已写入，当前期望 {}",
+                seq, self.next_seq
+            )));
+        }
+        self.received = received;
+        if seq != self.next_seq {
+            if self.pending.len() >= MAX_PENDING_CHUNKS {
+                return Err(ToolError::protocol(format!(
+                    "乱序分块超过 {} 片，放弃该次上传",
+                    MAX_PENDING_CHUNKS
+                )));
+            }
+            if self.pending.insert(seq, data.to_vec()).is_some() {
+                return Err(ToolError::protocol(format!("分块重复：{seq}")));
+            }
+            return Ok(());
+        }
+        self.write_next(data).await?;
+        while let Some(chunk) = self.pending.remove(&self.next_seq) {
+            self.write_next(&chunk).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_next(&mut self, data: &[u8]) -> ToolResult<()> {
         self.file
             .write_all(data)
             .await
             .map_err(|err| ToolError::io(format!("写入临时文件失败: {err}")))?;
         self.hasher.update(data);
-        self.received = received;
         self.next_seq += 1;
         Ok(())
     }
@@ -160,6 +182,12 @@ impl Incoming {
         size: Option<u64>,
         sha256: Option<&str>,
     ) -> ToolResult<TransferReport> {
+        if !self.pending.is_empty() {
+            return Err(ToolError::protocol(format!(
+                "缺少 {} 片数据，临时文件已丢弃",
+                self.pending.len()
+            )));
+        }
         if let Some(size) = size {
             if size != self.received {
                 return Err(ToolError::protocol(format!(
@@ -208,15 +236,4 @@ impl Incoming {
         let _ = self.file.flush().await;
         let _ = tokio::fs::remove_file(&self.temp_path).await;
     }
-}
-
-pub async fn send_chunk(sink: &mpsc::Sender<Msg>, id: u64, seq: u64, data: &[u8]) -> Result<()> {
-    sink.send(Msg::Chunk {
-        id,
-        seq,
-        stream: crate::proto::STREAM_STDOUT,
-        data: data.to_vec(),
-    })
-    .await
-    .map_err(|_| anyhow!("发送分块失败"))
 }

@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::error::{ToolError, ToolResult};
 use super::transfer::{Incoming, TransferReport};
+use crate::net::Sink;
 use crate::proto::{EndStatus, Msg, STREAM_STDOUT};
 
 pub struct Request {
@@ -13,7 +14,7 @@ pub struct Request {
     pub expected_size: Option<u64>,
     pub max_file: u64,
     pub reply_id: u64,
-    pub sink: mpsc::Sender<Msg>,
+    pub sink: Sink,
     pub chunks: mpsc::Receiver<Msg>,
     pub cancel: CancellationToken,
 }

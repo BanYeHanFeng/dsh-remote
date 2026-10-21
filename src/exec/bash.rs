@@ -5,9 +5,9 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::net::Sink;
 use crate::proto::{EndStatus, Msg};
 
 pub const CHUNK_SIZE: usize = 32 * 1024;
@@ -87,7 +87,7 @@ pub async fn run(request: Request, cancel: CancellationToken) -> Result<Outcome>
     })
 }
 
-pub async fn send_output(sink: &mpsc::Sender<Msg>, reply_id: u64, outcome: &Outcome) -> Result<()> {
+pub async fn send_output(sink: &Sink, reply_id: u64, outcome: &Outcome) -> Result<()> {
     send_chunks(sink, reply_id, crate::proto::STREAM_STDOUT, &outcome.stdout).await?;
     send_chunks(sink, reply_id, crate::proto::STREAM_STDERR, &outcome.stderr).await?;
     let status = match outcome.stop {
@@ -107,12 +107,7 @@ pub async fn send_output(sink: &mpsc::Sender<Msg>, reply_id: u64, outcome: &Outc
     .map_err(|_| anyhow!("发送执行结果失败"))
 }
 
-async fn send_chunks(
-    sink: &mpsc::Sender<Msg>,
-    reply_id: u64,
-    stream: u8,
-    data: &[u8],
-) -> Result<()> {
+async fn send_chunks(sink: &Sink, reply_id: u64, stream: u8, data: &[u8]) -> Result<()> {
     for (seq, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
         sink.send(Msg::Chunk {
             id: reply_id,

@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::config::{ClientConfig, HubConfig};
+use crate::net::Sink;
 use crate::proto::value;
 use crate::proto::{Msg, ProtoError};
 use error::{ToolError, ToolResult};
@@ -96,7 +97,7 @@ impl Executor {
         reply_id: u64,
         method: &str,
         params: Value,
-        sink: mpsc::Sender<Msg>,
+        sink: Sink,
     ) {
         debug!(call_id, reply_id, method, "执行工具");
         match method {
@@ -128,7 +129,7 @@ impl Executor {
         }
     }
 
-    async fn dispatch_shutdown(&self, reply_id: u64, sink: mpsc::Sender<Msg>) {
+    async fn dispatch_shutdown(&self, reply_id: u64, sink: Sink) {
         let Some(shutdown) = self.shutdown.clone() else {
             reply_error(&sink, reply_id, "unsupported", "该目标不支持远程关停").await;
             return;
@@ -156,7 +157,7 @@ impl Executor {
         server_id: u64,
         reply_id: u64,
         params: Value,
-        sink: mpsc::Sender<Msg>,
+        sink: Sink,
     ) {
         if !self.settings.allow_bash {
             reply_error(&sink, reply_id, "denied", "该目标已禁用 bash").await;
@@ -238,13 +239,7 @@ impl Executor {
         });
     }
 
-    async fn dispatch_file(
-        &self,
-        reply_id: u64,
-        method: &str,
-        params: Value,
-        sink: mpsc::Sender<Msg>,
-    ) {
+    async fn dispatch_file(&self, reply_id: u64, method: &str, params: Value, sink: Sink) {
         let permit = match self.slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -279,7 +274,7 @@ impl Executor {
         server_id: u64,
         reply_id: u64,
         params: Value,
-        sink: mpsc::Sender<Msg>,
+        sink: Sink,
     ) {
         let remote_path = match require_text(&params, "remote_path") {
             Ok(path) => path,
@@ -392,7 +387,7 @@ impl Executor {
         server_id: u64,
         reply_id: u64,
         params: Value,
-        sink: mpsc::Sender<Msg>,
+        sink: Sink,
     ) {
         let remote_path = match require_text(&params, "remote_path") {
             Ok(path) => path,
@@ -615,7 +610,7 @@ async fn deliver(sender: mpsc::Sender<Msg>, msg: Msg) -> Delivery {
     }
 }
 
-pub(crate) async fn reply_value(sink: &mpsc::Sender<Msg>, reply_id: u64, value: Value) {
+pub(crate) async fn reply_value(sink: &Sink, reply_id: u64, value: Value) {
     let msg = Msg::Result {
         id: reply_id,
         ok: true,
@@ -646,11 +641,7 @@ pub(crate) async fn reply_value(sink: &mpsc::Sender<Msg>, reply_id: u64, value: 
     }
 }
 
-pub(crate) async fn reply_transfer(
-    sink: &mpsc::Sender<Msg>,
-    reply_id: u64,
-    report: &transfer::TransferReport,
-) {
+pub(crate) async fn reply_transfer(sink: &Sink, reply_id: u64, report: &transfer::TransferReport) {
     match value::serialize(report) {
         Ok(value) => reply_value(sink, reply_id, value).await,
         Err(err) => {
@@ -665,12 +656,7 @@ pub(crate) async fn reply_transfer(
     }
 }
 
-async fn reply_error(
-    sink: &mpsc::Sender<Msg>,
-    reply_id: u64,
-    code: &str,
-    message: impl Into<String>,
-) {
+async fn reply_error(sink: &Sink, reply_id: u64, code: &str, message: impl Into<String>) {
     let _ = sink
         .send(Msg::Result {
             id: reply_id,

@@ -2,18 +2,18 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::error::{ToolError, ToolResult};
 use super::transfer::CHUNK_SIZE;
+use crate::net::Sink;
 use crate::proto::{EndStatus, Msg, STREAM_STDOUT};
 
 pub struct Request {
     pub path: PathBuf,
     pub max_file: u64,
     pub reply_id: u64,
-    pub sink: mpsc::Sender<Msg>,
+    pub sink: Sink,
     pub cancel: CancellationToken,
 }
 
@@ -104,7 +104,7 @@ pub async fn run(request: Request) {
 
 async fn stream(
     file: &mut tokio::fs::File,
-    sink: &mpsc::Sender<Msg>,
+    sink: &Sink,
     reply_id: u64,
     cancel: &CancellationToken,
 ) -> ToolResult<()> {
