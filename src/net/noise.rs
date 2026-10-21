@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::key::KeyMaterial;
-use crate::proto::frame::{decode, encode};
+use crate::proto::frame::decode;
 use crate::proto::Msg;
 
 pub const NOISE_PATTERN: &str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
@@ -160,20 +160,36 @@ pub struct Writer {
 
 impl Writer {
     pub async fn send(&mut self, msg: &Msg) -> Result<()> {
-        let body = encode(msg)?;
-        if body.is_empty() || body.len() > MAX_PLAIN {
-            bail!("消息长度非法: {} 字节", body.len());
+        self.send_batch(std::slice::from_ref(msg)).await.map(|_| ())
+    }
+
+    pub async fn send_batch(&mut self, msgs: &[Msg]) -> Result<usize> {
+        if msgs.is_empty() {
+            return Ok(0);
         }
-        let mut cipher = vec![0u8; body.len() + TAG_LEN];
-        let written = {
-            let mut state = self.cipher.lock().map_err(|_| anyhow!("加密状态锁失效"))?;
-            state.write_message(&body, &mut cipher).map_err(noise_err)?
-        };
-        let len = u16::try_from(written).map_err(|_| anyhow!("密文过长"))?;
-        self.half.write_all(&len.to_be_bytes()).await?;
-        self.half.write_all(&cipher[..written]).await?;
+        let mut frames = Vec::with_capacity(msgs.len().saturating_mul(96));
+        let mut body = Vec::new();
+        let mut cipher = Vec::new();
+        for msg in msgs {
+            body.clear();
+            ciborium::ser::into_writer(msg, &mut body)
+                .map_err(|e| anyhow!("CBOR 编码失败: {e}"))?;
+            if body.is_empty() || body.len() > MAX_PLAIN {
+                bail!("消息长度非法: {} 字节", body.len());
+            }
+            cipher.clear();
+            cipher.resize(body.len() + TAG_LEN, 0);
+            let written = {
+                let mut state = self.cipher.lock().map_err(|_| anyhow!("加密状态锁失效"))?;
+                state.write_message(&body, &mut cipher).map_err(noise_err)?
+            };
+            let len = u16::try_from(written).map_err(|_| anyhow!("密文过长"))?;
+            frames.extend_from_slice(&len.to_be_bytes());
+            frames.extend_from_slice(&cipher[..written]);
+        }
+        self.half.write_all(&frames).await?;
         self.half.flush().await?;
-        Ok(())
+        Ok(msgs.len())
     }
 
     pub async fn close(&mut self) -> Result<()> {
