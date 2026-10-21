@@ -33,6 +33,7 @@ struct AgentEntry {
     info: TargetInfo,
     tx: mpsc::Sender<Msg>,
     conn_id: u64,
+    token: CancellationToken,
 }
 
 struct ServerEntry {
@@ -102,25 +103,22 @@ impl HubState {
         info: &TargetInfo,
         tx: &mpsc::Sender<Msg>,
         conn_id: u64,
-    ) -> Result<(), ProtoError> {
-        let mut agents = self.agents.write().await;
-        if let Some(existing) = agents.get(&info.name) {
-            if !existing.tx.is_closed() {
-                return Err(ProtoError::new(
-                    "duplicate_name",
-                    format!("目标名 {} 已被占用", info.name),
-                ));
-            }
+        token: &CancellationToken,
+    ) -> Result<Option<AgentEntry>, ProtoError> {
+        if info.name == self.cfg.name {
+            return Err(ProtoError::new(
+                "duplicate_name",
+                format!("目标名 {} 与中继自身重名", info.name),
+            ));
         }
-        agents.insert(
-            info.name.clone(),
-            AgentEntry {
-                info: info.clone(),
-                tx: tx.clone(),
-                conn_id,
-            },
-        );
-        Ok(())
+        let entry = AgentEntry {
+            info: info.clone(),
+            tx: tx.clone(),
+            conn_id,
+            token: token.clone(),
+        };
+        let previous = self.agents.write().await.insert(info.name.clone(), entry);
+        Ok(previous.filter(|old| !old.tx.is_closed() && old.conn_id != conn_id))
     }
 
     async fn remove_agent(&self, name: &str, tx: &mpsc::Sender<Msg>) -> bool {
@@ -496,10 +494,25 @@ async fn handle_conn(
         writer,
     } = spawn_io(conn);
     let conn_id = state.next_id.fetch_add(1, Ordering::Relaxed);
+    let conn_token = CancellationToken::new();
 
     match role {
-        Role::Agent => {
-            if let Err(err) = state.register_agent(&info, &outbound, conn_id).await {
+        Role::Agent => match state
+            .register_agent(&info, &outbound, conn_id, &conn_token)
+            .await
+        {
+            Ok(previous) => {
+                if let Some(old) = previous {
+                    info!(
+                        name = %info.name,
+                        old = old.conn_id,
+                        new = conn_id,
+                        "顶替同名目标的旧连接"
+                    );
+                    old.token.cancel();
+                }
+            }
+            Err(err) => {
                 let _ = outbound.try_send(Msg::Bye {
                     code: err.code,
                     message: err.message,
@@ -509,7 +522,7 @@ async fn handle_conn(
                 reader.abort();
                 return Ok(());
             }
-        }
+        },
         Role::Server => {
             state.register_server(conn_id, outbound.clone()).await;
         }
@@ -548,6 +561,14 @@ async fn handle_conn(
 
     loop {
         tokio::select! {
+            _ = conn_token.cancelled() => {
+                let _ = outbound.try_send(Msg::Bye {
+                    code: "replaced".into(),
+                    message: format!("目标名 {} 已被新连接顶替", info.name),
+                });
+                info!(name = %info.name, conn_id, "连接被同名目标顶替");
+                break;
+            }
             _ = shutdown.cancelled() => {
                 let _ = outbound.try_send(Msg::Bye {
                     code: "shutdown".into(),

@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ciborium::value::Value;
 use dsh_remote::agent;
 use dsh_remote::config::{ClientConfig, GithubConfig, HubConfig};
 use dsh_remote::hub;
@@ -146,8 +147,27 @@ async fn hub_registers_agent() {
     let _ = timeout(Duration::from_secs(3), hub_task).await;
 }
 
+async fn recv_kind<F>(conn: &mut SecureConn, want: F, label: &str) -> Msg
+where
+    F: Fn(&Msg) -> bool,
+{
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(left, conn.recv()).await {
+            Ok(Ok(msg)) => {
+                if want(&msg) {
+                    return msg;
+                }
+            }
+            Ok(Err(err)) => panic!("等待 {label} 时连接出错: {err}"),
+            Err(_) => panic!("等待 {label} 超时"),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn duplicate_agent_name_rejected() {
+async fn duplicate_agent_name_replaced() {
     let key = key();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -161,15 +181,136 @@ async fn duplicate_agent_name_rejected() {
 
     let mut first = SecureConn::connect(&addr.to_string(), &key).await.unwrap();
     first.send(&hello(Role::Agent, "nas")).await.unwrap();
-    let welcome = timeout(Duration::from_secs(2), first.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(welcome, Msg::Welcome { .. }));
+    recv_kind(
+        &mut first,
+        |msg| matches!(msg, Msg::Welcome { .. }),
+        "首个 Welcome",
+    )
+    .await;
 
     let mut second = SecureConn::connect(&addr.to_string(), &key).await.unwrap();
     second.send(&hello(Role::Agent, "nas")).await.unwrap();
-    let reply = timeout(Duration::from_secs(2), second.recv())
+    recv_kind(
+        &mut second,
+        |msg| matches!(msg, Msg::Welcome { .. }),
+        "顶替方 Welcome",
+    )
+    .await;
+
+    match recv_kind(&mut first, |msg| matches!(msg, Msg::Bye { .. }), "replaced").await {
+        Msg::Bye { code, .. } => assert_eq!(code, "replaced"),
+        other => panic!("期望 replaced，收到 {other:?}"),
+    }
+
+    let targets = wait_for_target(&addr.to_string(), &key, "nas").await;
+    assert_eq!(
+        targets.iter().filter(|target| target.name == "nas").count(),
+        1
+    );
+
+    drop(first);
+    drop(second);
+    shutdown.cancel();
+    let _ = timeout(Duration::from_secs(3), hub_task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_fails_pending_calls() {
+    let key = key();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = CancellationToken::new();
+
+    let hub_task = tokio::spawn(hub::serve(
+        listener,
+        hub_config(&addr.to_string(), &key),
+        shutdown.clone(),
+    ));
+
+    let mut agent = SecureConn::connect(&addr.to_string(), &key).await.unwrap();
+    agent.send(&hello(Role::Agent, "nas")).await.unwrap();
+    recv_kind(
+        &mut agent,
+        |msg| matches!(msg, Msg::Welcome { .. }),
+        "agent Welcome",
+    )
+    .await;
+
+    let mut server = SecureConn::connect(&addr.to_string(), &key).await.unwrap();
+    server
+        .send(&hello(Role::Server, "test-server"))
+        .await
+        .unwrap();
+    recv_kind(
+        &mut server,
+        |msg| matches!(msg, Msg::Welcome { .. }),
+        "server Welcome",
+    )
+    .await;
+
+    server
+        .send(&Msg::Call {
+            id: 42,
+            target: "nas".to_string(),
+            method: "roots".to_string(),
+            params: Value::Map(Vec::new()),
+        })
+        .await
+        .unwrap();
+    recv_kind(
+        &mut agent,
+        |msg| matches!(msg, Msg::Call { .. }),
+        "转发的调用",
+    )
+    .await;
+
+    let mut successor = SecureConn::connect(&addr.to_string(), &key).await.unwrap();
+    successor.send(&hello(Role::Agent, "nas")).await.unwrap();
+    recv_kind(
+        &mut successor,
+        |msg| matches!(msg, Msg::Welcome { .. }),
+        "后继 Welcome",
+    )
+    .await;
+
+    match recv_kind(
+        &mut server,
+        |msg| matches!(msg, Msg::Result { .. }),
+        "offline 结果",
+    )
+    .await
+    {
+        Msg::Result { id, ok, error, .. } => {
+            assert_eq!(id, 42);
+            assert!(!ok);
+            assert_eq!(error.unwrap().code, "offline");
+        }
+        other => panic!("期望 offline 结果，收到 {other:?}"),
+    }
+
+    drop(agent);
+    drop(successor);
+    drop(server);
+    shutdown.cancel();
+    let _ = timeout(Duration::from_secs(3), hub_task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_name_conflicts_with_hub() {
+    let key = key();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = CancellationToken::new();
+
+    let hub_task = tokio::spawn(hub::serve(
+        listener,
+        hub_config(&addr.to_string(), &key),
+        shutdown.clone(),
+    ));
+
+    let mut conn = SecureConn::connect(&addr.to_string(), &key).await.unwrap();
+    conn.send(&hello(Role::Agent, "hub")).await.unwrap();
+    let reply = timeout(Duration::from_secs(2), conn.recv())
         .await
         .unwrap()
         .unwrap();
@@ -178,7 +319,7 @@ async fn duplicate_agent_name_rejected() {
         other => panic!("期望 duplicate_name，收到 {other:?}"),
     }
 
-    drop(first);
+    drop(conn);
     shutdown.cancel();
     let _ = timeout(Duration::from_secs(3), hub_task).await;
 }

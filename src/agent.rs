@@ -15,6 +15,19 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const WRITER_DRAIN: Duration = Duration::from_secs(2);
+const REPLACED_RETRY: Duration = Duration::from_secs(60);
+const REPLACED_JITTER_MS: u64 = 15_000;
+
+#[derive(Debug)]
+struct Replaced;
+
+impl std::fmt::Display for Replaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("同名目标已被新连接顶替")
+    }
+}
+
+impl std::error::Error for Replaced {}
 
 pub async fn run(cfg: ClientConfig, shutdown: CancellationToken) -> Result<()> {
     let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
@@ -22,14 +35,29 @@ pub async fn run(cfg: ClientConfig, shutdown: CancellationToken) -> Result<()> {
         if shutdown.is_cancelled() {
             break;
         }
+        let mut replaced = false;
         match connect_once(&cfg, &shutdown, &mut backoff).await {
             Ok(()) => info!("中继连接已关闭"),
-            Err(err) => warn!(error = %format!("{err:#}"), "连接中继失败"),
+            Err(err) => {
+                replaced = err.downcast_ref::<Replaced>().is_some();
+                if replaced {
+                    warn!(
+                        error = %format!("{err:#}"),
+                        "连接被同名目标顶替，检查是否重复启动了实例"
+                    );
+                } else {
+                    warn!(error = %format!("{err:#}"), "连接中继失败");
+                }
+            }
         }
         if shutdown.is_cancelled() {
             break;
         }
-        let delay = backoff.next_delay();
+        let delay = if replaced {
+            REPLACED_RETRY + Duration::from_millis(rand::random_range(0..=REPLACED_JITTER_MS))
+        } else {
+            backoff.next_delay()
+        };
         info!(seconds = delay.as_secs_f32(), "等待重连");
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -77,6 +105,9 @@ async fn connect_once(
                 "已注册到中继"
             );
         }
+        Msg::Bye { code, message } if code == "replaced" => {
+            return Err(anyhow::Error::new(Replaced).context(format!("中继拒绝连接: {message}")));
+        }
         Msg::Bye { code, message } => bail!("中继拒绝连接: {code} {message}"),
         other => bail!("意外的首条响应: {other:?}"),
     }
@@ -114,6 +145,10 @@ async fn connect_once(
                         }
                         Msg::TargetEvent { kind, target } => {
                             debug!(kind = ?kind, name = %target.name, "目标事件");
+                        }
+                        Msg::Bye { code, message } if code == "replaced" => {
+                            break Err(anyhow::Error::new(Replaced)
+                                .context(format!("中继关闭连接: {message}")));
                         }
                         Msg::Bye { code, message } => {
                             break Err(anyhow!("中继关闭连接: {code} {message}"));

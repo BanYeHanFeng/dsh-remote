@@ -178,13 +178,19 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 - server 与 agent 断线后无限重连；进程不退出（除非 stdin EOF / SIGTERM）。
 - 重连成功后重新 `Hello`，hub 重建注册表并推送 `TargetsSnapshot`。
 - server 重连时若发现同名 agent 已换连接，后续调用直接走新连接，无需重启。
+- 同名 agent 重连时顶替旧连接：hub 先接受新连接并注册，再给仍被认为是
+  在线（TCP 未关但已失联）的旧连接发 `Bye{code:"replaced"}` 并立即回收，
+  不必等对方 45s 心跳超时。旧连接名下的 `pending` 立即回 `offline`。
+- 被顶替的 agent 收到 `replaced` 后按 60s + 0–15s 抖动重试，避免两个同名
+  实例互踢；这通常意味着重复启动了同一目标。
 
 ## 6. 错误码
 
 | code | 场景 |
 | --- | --- |
 | `bad_key` | 握手 PSK 不匹配（仅本地日志，不回明文） |
-| `duplicate_name` | agent 名已被占用 |
+| `duplicate_name` | agent 名与中继自身名字冲突 |
+| `replaced` | hub 通知旧连接：同名目标已由新连接顶替 |
 | `unknown_target` | 目标名不存在（含刚下线） |
 | `offline` | 目标在线但连接已断 |
 | `timeout` | hub 或本地执行超时 |
