@@ -495,3 +495,101 @@ async fn upload_checksum_mismatch_is_rejected() {
     assert!(leftovers.is_empty(), "残留临时文件: {leftovers:?}");
     harness.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_consumer_does_not_stall_other_calls() {
+    let harness = start().await;
+    let session = harness.session().await;
+    let local = harness.root.join("parallel.bin");
+    let size = 16 * 1024 * 1024;
+    write_pattern(&local, size);
+    let remote = harness.remote("sub/parallel.bin");
+    call::upload(&session, "nas", &local, &remote, false, true, &no_cancel())
+        .await
+        .unwrap();
+
+    let mut slow = session
+        .begin(
+            "nas",
+            "download",
+            value::map(vec![(
+                "remote_path",
+                ciborium::value::Value::Text(remote.clone()),
+            )]),
+        )
+        .await
+        .unwrap();
+    let slow_task = tokio::spawn(async move {
+        let mut seen = 0usize;
+        while let Some(msg) = slow.recv().await {
+            seen += 1;
+            if matches!(msg, Msg::End { .. }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        seen
+    });
+
+    let base_started = Instant::now();
+    let baseline_path = harness.root.join("parallel-baseline.bin");
+    call::download(
+        &session,
+        "nas",
+        &remote,
+        &baseline_path,
+        false,
+        &no_cancel(),
+    )
+    .await
+    .unwrap();
+    let baseline = base_started.elapsed();
+
+    let fast_local = harness.root.join("parallel-fast.bin");
+    let started = Instant::now();
+    let report = call::download(&session, "nas", &remote, &fast_local, false, &no_cancel())
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(report.size, size);
+    assert_eq!(sha256_file(&fast_local), sha256_file(&local));
+    assert!(
+        elapsed < baseline * 2 + Duration::from_secs(2),
+        "慢消费者拖住了其它调用：基线 {baseline:?}，实际 {elapsed:?}"
+    );
+    let seen = slow_task.await.unwrap();
+    assert!(seen > 0);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn call_ends_when_hub_disappears() {
+    let harness = start().await;
+    let session = harness.session().await;
+    let local = harness.root.join("drop.bin");
+    write_pattern(&local, 2 * 1024 * 1024);
+    let remote = harness.remote("sub/drop.bin");
+    call::upload(&session, "nas", &local, &remote, false, true, &no_cancel())
+        .await
+        .unwrap();
+
+    let mut handle = session
+        .begin(
+            "nas",
+            "download",
+            value::map(vec![(
+                "remote_path",
+                ciborium::value::Value::Text(remote.clone()),
+            )]),
+        )
+        .await
+        .unwrap();
+    assert!(handle.recv().await.is_some());
+    harness.shutdown.cancel();
+    let outcome = timeout(Duration::from_secs(10), handle.recv()).await;
+    assert!(
+        matches!(outcome, Ok(None)),
+        "中继断开后调用应当立刻结束，实际 {outcome:?}"
+    );
+    harness.stop().await;
+}
