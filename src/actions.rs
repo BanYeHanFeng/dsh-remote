@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
@@ -302,7 +302,7 @@ impl GhClient {
                 self.cfg.workflow
             ));
         }
-        let now = now_epoch();
+        let now = crate::time::now_epoch();
         let mut out = String::new();
         let _ = writeln!(
             out,
@@ -556,36 +556,8 @@ fn is_safe_token(text: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || "-_./".contains(ch))
 }
 
-fn now_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_secs() as i64)
-        .unwrap_or_default()
-}
-
 fn created_epoch(stamp: &str) -> i64 {
-    let year = stamp.get(0..4).and_then(|text| text.parse::<i64>().ok());
-    let month = stamp.get(5..7).and_then(|text| text.parse::<i64>().ok());
-    let day = stamp.get(8..10).and_then(|text| text.parse::<i64>().ok());
-    let hour = stamp.get(11..13).and_then(|text| text.parse::<i64>().ok());
-    let minute = stamp.get(14..16).and_then(|text| text.parse::<i64>().ok());
-    let second = stamp.get(17..19).and_then(|text| text.parse::<i64>().ok());
-    match (year, month, day, hour, minute, second) {
-        (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) => {
-            days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second
-        }
-        _ => now_epoch(),
-    }
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let month_pos = if month > 2 { month - 3 } else { month + 9 };
-    let day_of_year = (153 * month_pos + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+    crate::time::parse_stamp(stamp).unwrap_or_else(crate::time::now_epoch)
 }
 
 fn age_text(seconds: i64) -> String {

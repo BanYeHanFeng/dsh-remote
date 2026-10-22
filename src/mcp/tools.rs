@@ -740,38 +740,7 @@ fn human_duration(ms: u64) -> String {
 }
 
 fn format_time(ms: u64) -> String {
-    let seconds = ms / 1000;
-    let days = (seconds / 86_400) as i64;
-    let rest = seconds % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
-        rest / 3600,
-        (rest % 3600) / 60,
-        rest % 60
-    )
-}
-
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let shifted = days + 719_468;
-    let era = if shifted >= 0 {
-        shifted
-    } else {
-        shifted - 146_096
-    } / 146_097;
-    let day_of_era = (shifted - era * 146_097) as u64;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era as i64 + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_pos = (5 * day_of_year + 2) / 153;
-    let day = (day_of_year - (153 * month_pos + 2) / 5 + 1) as u32;
-    let month = if month_pos < 10 {
-        month_pos + 3
-    } else {
-        month_pos - 9
-    } as u32;
-    (if month <= 2 { year + 1 } else { year }, month, day)
+    crate::time::format_epoch((ms / 1000) as i64)
 }
 
 #[cfg(test)]
