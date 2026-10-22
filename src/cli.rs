@@ -23,12 +23,8 @@ pub enum Command {
     Agent(Box<ClientArgs>),
     #[command(about = "启动 DSH 侧服务端，MCP 走 stdio")]
     Server(Box<ClientArgs>),
-    #[command(about = "向远端目标执行一条命令（调试入口）")]
-    Run(Box<RunArgs>),
     #[command(about = "列出房间内的在线目标")]
     Targets(Box<ClientArgs>),
-    #[command(about = "文件工具调试入口")]
-    File(Box<FileArgs>),
 }
 
 #[derive(Args, Debug, Clone, Default)]
@@ -76,272 +72,51 @@ pub struct ClientArgs {
     pub hub: Option<String>,
 }
 
-#[derive(Args, Debug, Clone)]
-pub struct RunArgs {
-    #[command(flatten)]
-    pub client: ClientArgs,
-    #[arg(long, value_name = "目标", default_value = "hub", help = "目标名")]
-    pub target: String,
-    #[arg(
-        long,
-        value_name = "毫秒",
-        default_value_t = 120_000,
-        help = "执行超时"
-    )]
-    pub timeout_ms: u64,
-    #[arg(long, value_name = "目录", help = "远端工作目录")]
-    pub cwd: Option<String>,
-    #[arg(long = "output-limit", value_name = "字节", help = "输出上限")]
-    pub output_limit: Option<usize>,
-    #[arg(
-        last = true,
-        required = true,
-        value_name = "命令",
-        help = "放在 -- 之后的命令"
-    )]
-    pub command: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-pub struct FileArgs {
-    #[command(subcommand)]
-    pub action: FileAction,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum FileAction {
-    #[command(about = "读取远端文本文件，带行号")]
-    Read(FileReadArgs),
-    #[command(about = "写入远端文本文件，临时文件加原子替换")]
-    Write(FileWriteArgs),
-    #[command(about = "在远端文本文件中做字面替换")]
-    Edit(FileEditArgs),
-    #[command(about = "列出远端目录")]
-    List(FileListArgs),
-    #[command(about = "上传本地文件到远端")]
-    Upload(FileUploadArgs),
-    #[command(about = "从远端下载文件到本地")]
-    Download(FileDownloadArgs),
-}
-
-#[derive(Args, Debug, Clone)]
-pub struct FileTargetArgs {
-    #[command(flatten)]
-    pub client: ClientArgs,
-    #[arg(long, value_name = "目标", default_value = "hub", help = "目标名")]
-    pub target: String,
-}
-
-#[derive(Args, Debug)]
-pub struct FileReadArgs {
-    #[command(flatten)]
-    pub target: FileTargetArgs,
-    #[arg(long, value_name = "远端路径")]
-    pub path: String,
-    #[arg(long, value_name = "行号", default_value_t = 0, help = "跳过前 N 行")]
-    pub offset: u64,
-    #[arg(
-        long,
-        value_name = "行数",
-        default_value_t = 2000,
-        help = "最多读取的行数"
-    )]
-    pub limit: u64,
-}
-
-#[derive(Args, Debug)]
-#[command(group(
-    clap::ArgGroup::new("source")
-        .required(true)
-        .args(["content", "from", "stdin"])
-))]
-pub struct FileWriteArgs {
-    #[command(flatten)]
-    pub target: FileTargetArgs,
-    #[arg(long, value_name = "远端路径")]
-    pub path: String,
-    #[arg(long, value_name = "文本", group = "source", help = "直接给出内容")]
-    pub content: Option<String>,
-    #[arg(
-        long = "from",
-        value_name = "本地文件",
-        group = "source",
-        help = "从本地文件读取内容"
-    )]
-    pub from: Option<PathBuf>,
-    #[arg(long, group = "source", help = "从 stdin 读取内容")]
-    pub stdin: bool,
-    #[arg(long, help = "自动创建父目录")]
-    pub create_parents: bool,
-}
-
-#[derive(Args, Debug)]
-#[command(group(
-    clap::ArgGroup::new("old-source")
-        .required(true)
-        .args(["old", "old_file"])
-))]
-#[command(group(
-    clap::ArgGroup::new("new-source")
-        .required(true)
-        .args(["new", "new_file"])
-))]
-pub struct FileEditArgs {
-    #[command(flatten)]
-    pub target: FileTargetArgs,
-    #[arg(long, value_name = "远端路径")]
-    pub path: String,
-    #[arg(
-        long = "old",
-        value_name = "文本",
-        group = "old-source",
-        help = "要替换的原文"
-    )]
-    pub old: Option<String>,
-    #[arg(
-        long = "old-file",
-        value_name = "本地文件",
-        group = "old-source",
-        help = "从文件读取要替换的原文"
-    )]
-    pub old_file: Option<PathBuf>,
-    #[arg(
-        long = "new",
-        value_name = "文本",
-        group = "new-source",
-        help = "替换后的文本"
-    )]
-    pub new: Option<String>,
-    #[arg(
-        long = "new-file",
-        value_name = "本地文件",
-        group = "new-source",
-        help = "从文件读取替换后的文本"
-    )]
-    pub new_file: Option<PathBuf>,
-    #[arg(long, help = "替换所有匹配")]
-    pub replace_all: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct FileListArgs {
-    #[command(flatten)]
-    pub target: FileTargetArgs,
-    #[arg(long, value_name = "远端路径")]
-    pub path: String,
-    #[arg(long, value_name = "层数", default_value_t = 1, help = "递归层数")]
-    pub depth: u64,
-}
-
-#[derive(Args, Debug)]
-pub struct FileUploadArgs {
-    #[command(flatten)]
-    pub target: FileTargetArgs,
-    #[arg(long, value_name = "本地文件")]
-    pub local: PathBuf,
-    #[arg(long, value_name = "远端路径")]
-    pub remote: String,
-    #[arg(long, help = "允许覆盖远端已有文件")]
-    pub overwrite: bool,
-    #[arg(long, help = "自动创建远端父目录")]
-    pub create_parents: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct FileDownloadArgs {
-    #[command(flatten)]
-    pub target: FileTargetArgs,
-    #[arg(long, value_name = "远端路径")]
-    pub remote: String,
-    #[arg(long, value_name = "本地文件")]
-    pub local: PathBuf,
-    #[arg(long, help = "允许覆盖本地已有文件")]
-    pub overwrite: bool,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_run_command() {
+    fn parses_targets() {
         let cli = Cli::try_parse_from([
             "dsh-remote",
-            "run",
+            "targets",
             "--hub",
             "127.0.0.1:1",
             "--key",
             "0123456789abcdef",
-            "--target",
-            "nas",
-            "--",
-            "echo",
-            "hi",
+            "--name",
+            "probe",
         ])
         .unwrap();
         match cli.command {
-            Command::Run(args) => {
-                assert_eq!(args.target, "nas");
-                assert_eq!(args.command, vec!["echo", "hi"]);
+            Command::Targets(args) => {
+                assert_eq!(args.common.name.as_deref(), Some("probe"));
+                assert_eq!(args.hub.as_deref(), Some("127.0.0.1:1"));
             }
-            other => panic!("期望 run，收到 {other:?}"),
+            other => panic!("期望 targets，收到 {other:?}"),
         }
     }
 
     #[test]
-    fn parses_file_edit() {
+    fn parses_roots_list() {
         let cli = Cli::try_parse_from([
             "dsh-remote",
-            "file",
-            "edit",
-            "--hub",
+            "hub",
+            "--listen",
             "127.0.0.1:1",
-            "--key",
-            "0123456789abcdef",
-            "--target",
-            "nas",
-            "--path",
-            "/tmp/a.txt",
-            "--old",
-            "a",
-            "--new",
-            "b",
+            "--roots",
+            "/data:/home",
         ])
         .unwrap();
         match cli.command {
-            Command::File(args) => match args.action {
-                FileAction::Edit(edit) => {
-                    assert_eq!(edit.target.target, "nas");
-                    assert_eq!(edit.old.as_deref(), Some("a"));
-                    assert_eq!(edit.new.as_deref(), Some("b"));
-                }
-                other => panic!("期望 edit，收到 {other:?}"),
-            },
-            other => panic!("期望 file，收到 {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_file_write_from_stdin() {
-        let cli = Cli::try_parse_from([
-            "dsh-remote",
-            "file",
-            "write",
-            "--hub",
-            "127.0.0.1:1",
-            "--key",
-            "0123456789abcdef",
-            "--path",
-            "/tmp/a.txt",
-            "--stdin",
-        ])
-        .unwrap();
-        match cli.command {
-            Command::File(args) => match args.action {
-                FileAction::Write(write) => assert!(write.stdin),
-                other => panic!("期望 write，收到 {other:?}"),
-            },
-            other => panic!("期望 file，收到 {other:?}"),
+            Command::Hub(args) => {
+                assert_eq!(
+                    args.common.roots,
+                    Some(vec!["/data".to_string(), "/home".to_string()])
+                );
+            }
+            other => panic!("期望 hub，收到 {other:?}"),
         }
     }
 }

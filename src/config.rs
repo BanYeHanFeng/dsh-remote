@@ -5,34 +5,32 @@ use std::str::FromStr;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::cli::{ClientArgs, CommonArgs, HubArgs};
+use crate::exec::Settings;
 use crate::key::KeyMaterial;
 
-#[derive(Clone)]
+const DEFAULT_MAX_OUTPUT: usize = 262_144;
+const DEFAULT_MAX_FILE: u64 = 67_108_864;
+
+#[derive(Clone, Debug)]
 pub struct HubConfig {
     pub listen: String,
     pub key: KeyMaterial,
     pub name: String,
-    pub roots: Vec<String>,
-    pub allow_bash: bool,
-    pub max_output: usize,
-    pub max_file: u64,
+    pub target: Settings,
     pub log: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ClientConfig {
     pub hub: String,
     pub key: KeyMaterial,
     pub name: String,
-    pub roots: Vec<String>,
-    pub allow_bash: bool,
-    pub max_output: usize,
-    pub max_file: u64,
+    pub target: Settings,
     pub log: String,
     pub github: GithubConfig,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct GithubConfig {
     pub repo: Option<String>,
     pub workflow: String,
@@ -100,27 +98,8 @@ pub fn hub_config(args: &HubArgs) -> Result<HubConfig> {
             .unwrap_or_else(|| "0.0.0.0:7000".to_string()),
         key: resolve_key(&args.common, &raw)?,
         name: resolve_name(&args.common, &raw),
-        roots: resolve_roots(&args.common, &raw),
-        allow_bash: resolve_allow_bash(&args.common, &raw),
-        max_output: parse_num(
-            pick(
-                args.common.max_output.map(|v| v.to_string()),
-                &raw,
-                "MAX_OUTPUT",
-            ),
-            262_144,
-            "MAX_OUTPUT",
-        )?,
-        max_file: parse_num(
-            pick(
-                args.common.max_file.map(|v| v.to_string()),
-                &raw,
-                "MAX_FILE",
-            ),
-            67_108_864,
-            "MAX_FILE",
-        )?,
-        log: pick(args.common.log.clone(), &raw, "LOG").unwrap_or_else(|| "stderr".to_string()),
+        target: resolve_settings(&args.common, &raw)?,
+        log: resolve_log(&args.common, &raw),
     })
 }
 
@@ -131,28 +110,18 @@ pub fn client_config(args: &ClientArgs) -> Result<ClientConfig> {
             .context("缺少中继地址：用 --hub 或配置文件 HUB=")?,
         key: resolve_key(&args.common, &raw)?,
         name: resolve_name(&args.common, &raw),
-        roots: resolve_roots(&args.common, &raw),
-        allow_bash: resolve_allow_bash(&args.common, &raw),
-        max_output: parse_num(
-            pick(
-                args.common.max_output.map(|v| v.to_string()),
-                &raw,
-                "MAX_OUTPUT",
-            ),
-            262_144,
-            "MAX_OUTPUT",
-        )?,
-        max_file: parse_num(
-            pick(
-                args.common.max_file.map(|v| v.to_string()),
-                &raw,
-                "MAX_FILE",
-            ),
-            67_108_864,
-            "MAX_FILE",
-        )?,
-        log: pick(args.common.log.clone(), &raw, "LOG").unwrap_or_else(|| "stderr".to_string()),
+        target: resolve_settings(&args.common, &raw)?,
+        log: resolve_log(&args.common, &raw),
         github: resolve_github(&raw),
+    })
+}
+
+fn resolve_settings(common: &CommonArgs, raw: &RawConfig) -> Result<Settings> {
+    Ok(Settings {
+        roots: resolve_roots(common, raw),
+        allow_bash: resolve_allow_bash(common, raw),
+        max_output: number(common.max_output, raw, "MAX_OUTPUT", DEFAULT_MAX_OUTPUT)?,
+        max_file: number(common.max_file, raw, "MAX_FILE", DEFAULT_MAX_FILE)?,
     })
 }
 
@@ -172,6 +141,10 @@ fn resolve_github(raw: &RawConfig) -> GithubConfig {
 fn pick(cli: Option<String>, raw: &RawConfig, key: &str) -> Option<String> {
     cli.filter(|value| !value.trim().is_empty())
         .or_else(|| raw.get(key))
+}
+
+fn resolve_log(common: &CommonArgs, raw: &RawConfig) -> String {
+    pick(common.log.clone(), raw, "LOG").unwrap_or_else(|| "stderr".to_string())
 }
 
 fn resolve_key(common: &CommonArgs, raw: &RawConfig) -> Result<KeyMaterial> {
@@ -238,15 +211,16 @@ fn resolve_allow_bash(common: &CommonArgs, raw: &RawConfig) -> bool {
     true
 }
 
-fn parse_num<T>(value: Option<String>, default: T, field: &str) -> Result<T>
+fn number<T>(cli: Option<T>, raw: &RawConfig, key: &str, default: T) -> Result<T>
 where
     T: FromStr,
     T::Err: std::fmt::Display,
 {
-    match value {
-        Some(value) => value
-            .parse()
-            .map_err(|err| anyhow!("{field} 的值非法: {err}")),
+    if let Some(value) = cli {
+        return Ok(value);
+    }
+    match raw.get(key) {
+        Some(text) => text.parse().map_err(|err| anyhow!("{key} 的值非法: {err}")),
         None => Ok(default),
     }
 }
@@ -286,12 +260,16 @@ mod tests {
     }
 
     #[test]
-    fn roots_split() {
+    fn settings_bundle_fields() {
         let common = CommonArgs {
             roots: Some(vec!["/data".into(), "/home".into()]),
+            max_output: Some(1024),
             ..Default::default()
         };
         let raw = RawConfig::load(None).unwrap();
-        assert_eq!(resolve_roots(&common, &raw), vec!["/data", "/home"]);
+        let settings = resolve_settings(&common, &raw).unwrap();
+        assert_eq!(settings.roots, vec!["/data", "/home"]);
+        assert_eq!(settings.max_output, 1024);
+        assert_eq!(settings.max_file, DEFAULT_MAX_FILE);
     }
 }

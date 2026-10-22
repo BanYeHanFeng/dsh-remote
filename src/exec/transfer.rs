@@ -12,7 +12,6 @@ use crate::exec::error::{ToolError, ToolResult};
 pub const CHUNK_SIZE: usize = 60 * 1024;
 pub const MAX_CHUNK_SIZE: usize = 64 * 1024;
 pub const MAX_PENDING_CHUNKS: usize = 512;
-pub const WINDOW_CHUNKS: usize = 32;
 const TRANSFER_TIMEOUT_FLOOR: u64 = 300;
 const TRANSFER_TIMEOUT_MAX: u64 = 3_600;
 const TRANSFER_BYTES_PER_SECOND: u64 = 256 * 1024;

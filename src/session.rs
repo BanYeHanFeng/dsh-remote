@@ -1,26 +1,25 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use tokio::sync::{mpsc, watch, Notify};
-use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
+use tokio::sync::{mpsc, watch};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::config::{ClientConfig, GithubConfig};
 use crate::key::KeyMaterial;
 use crate::net::backoff::Backoff;
-use crate::net::{spawn_io, IoHandles, SecureConn, Sink};
-use crate::proto::{caps, EndStatus, Msg, Role, TargetEventKind, TargetInfo, PROTO_VERSION};
+use crate::net::link::{End, Link, HELLO_TIMEOUT};
+use crate::net::Sink;
+use crate::proto::{
+    target_names, EndStatus, Msg, Role, TargetEventKind, TargetInfo, PROTO_VERSION,
+};
 
-const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
-const REPLY_QUEUE: usize = 64;
-const CALL_BACKLOG: usize = 256;
+const REPLY_QUEUE: usize = 512;
 const INITIAL_CONNECT_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
@@ -56,7 +55,7 @@ pub struct CallResult {
     pub truncated: bool,
     pub size: Option<u64>,
     pub sha256: Option<String>,
-    pub stopped: Option<EndStatus>,
+    pub status: Option<EndStatus>,
     pub error: Option<crate::proto::ProtoError>,
     pub value: Option<ciborium::value::Value>,
 }
@@ -71,7 +70,7 @@ impl CallResult {
             truncated: false,
             size: None,
             sha256: None,
-            stopped: None,
+            status: None,
             error: None,
             value: None,
         }
@@ -100,10 +99,10 @@ struct Inner {
     key: KeyMaterial,
     name: String,
     roots: Vec<String>,
-    allow_bash: bool,
     max_file: u64,
     github: GithubConfig,
     next_id: AtomicU64,
+    ever_connected: AtomicBool,
     state: Mutex<State>,
     targets: RwLock<Vec<TargetInfo>>,
     connected: watch::Sender<bool>,
@@ -112,95 +111,11 @@ struct Inner {
 struct State {
     conn: Option<Conn>,
     hub_name: Option<String>,
-    next_serial: u64,
 }
 
 struct Conn {
-    serial: u64,
     outbound: Sink,
-    pending: HashMap<u64, CallQueue>,
-}
-
-#[derive(Clone)]
-struct CallQueue {
-    inner: Arc<CallQueueInner>,
-}
-
-struct CallQueueInner {
-    backlog: Mutex<VecDeque<Msg>>,
-    notify: Notify,
-    consumer: mpsc::Sender<Msg>,
-    closed: AtomicBool,
-}
-
-impl CallQueue {
-    fn new(capacity: usize) -> (Self, mpsc::Receiver<Msg>) {
-        let (consumer, rx) = mpsc::channel(capacity);
-        let inner = Arc::new(CallQueueInner {
-            backlog: Mutex::new(VecDeque::new()),
-            notify: Notify::new(),
-            consumer,
-            closed: AtomicBool::new(false),
-        });
-        let pump_inner = inner.clone();
-        tokio::spawn(async move {
-            pump(pump_inner).await;
-        });
-        (Self { inner }, rx)
-    }
-
-    fn close(&self) {
-        self.inner.closed.store(true, Ordering::SeqCst);
-        self.inner.notify.notify_one();
-    }
-
-    fn push(&self, msg: Msg) -> bool {
-        if self.inner.closed.load(Ordering::SeqCst) {
-            return false;
-        }
-        {
-            let mut backlog = self
-                .inner
-                .backlog
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if backlog.len() >= CALL_BACKLOG {
-                return false;
-            }
-            backlog.push_back(msg);
-        }
-        self.inner.notify.notify_one();
-        true
-    }
-}
-
-async fn pump(inner: Arc<CallQueueInner>) {
-    loop {
-        let notified = inner.notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        loop {
-            let msg = {
-                let mut backlog = inner
-                    .backlog
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                backlog.pop_front()
-            };
-            match msg {
-                Some(msg) => {
-                    if inner.consumer.send(msg).await.is_err() {
-                        return;
-                    }
-                }
-                None => break,
-            }
-        }
-        if inner.closed.load(Ordering::SeqCst) {
-            return;
-        }
-        notified.await;
-    }
+    pending: HashMap<u64, mpsc::Sender<Msg>>,
 }
 
 impl Session {
@@ -211,15 +126,14 @@ impl Session {
                 hub: cfg.hub.clone(),
                 key: cfg.key.clone(),
                 name: cfg.name.clone(),
-                roots: cfg.roots.clone(),
-                allow_bash: cfg.allow_bash,
-                max_file: cfg.max_file,
+                roots: cfg.target.roots.clone(),
+                max_file: cfg.target.max_file,
                 github: cfg.github.clone(),
                 next_id: AtomicU64::new(1),
+                ever_connected: AtomicBool::new(false),
                 state: Mutex::new(State {
                     conn: None,
                     hub_name: None,
-                    next_serial: 0,
                 }),
                 targets: RwLock::new(Vec::new()),
                 connected,
@@ -229,10 +143,6 @@ impl Session {
 
     pub fn hub(&self) -> &str {
         &self.inner.hub
-    }
-
-    pub fn name(&self) -> &str {
-        &self.inner.name
     }
 
     pub fn max_file(&self) -> u64 {
@@ -271,13 +181,10 @@ impl Session {
     }
 
     pub async fn ready(&self) {
-        let first_attempt = {
-            let state = self.lock_state();
-            state.next_serial == 0
-        };
-        if first_attempt && !self.is_connected() {
-            let _ = self.wait_connected(INITIAL_CONNECT_GRACE).await;
+        if self.inner.ever_connected.load(Ordering::Relaxed) || self.is_connected() {
+            return;
         }
+        let _ = self.wait_connected(INITIAL_CONNECT_GRACE).await;
     }
 
     pub fn hub_name(&self) -> Option<String> {
@@ -293,10 +200,10 @@ impl Session {
     }
 
     pub async fn connect_now(&self, shutdown: CancellationToken) -> Result<()> {
-        let (inbound, outbound, serial) = self.open(&shutdown).await?;
+        let link = self.open(&shutdown).await?;
         let session = self.clone();
         tokio::spawn(async move {
-            session.serve(inbound, outbound, serial, shutdown).await;
+            session.serve(link, shutdown).await;
         });
         Ok(())
     }
@@ -308,10 +215,7 @@ impl Session {
                 break;
             }
             match self.open(&shutdown).await {
-                Ok((inbound, outbound, serial)) => {
-                    self.serve(inbound, outbound, serial, shutdown.clone())
-                        .await;
-                }
+                Ok(link) => self.serve(link, shutdown.clone()).await,
                 Err(err) => warn!(error = %format!("{err:#}"), "连接中继失败"),
             }
             if shutdown.is_cancelled() {
@@ -327,8 +231,8 @@ impl Session {
         info!("中继连接已停止");
     }
 
-    async fn open(&self, shutdown: &CancellationToken) -> Result<(mpsc::Receiver<Msg>, Sink, u64)> {
-        let mut conn = SecureConn::connect(&self.inner.hub, &self.inner.key).await?;
+    async fn open(&self, shutdown: &CancellationToken) -> Result<Link> {
+        let mut link = Link::connect(&self.inner.hub, &self.inner.key).await?;
         let hello = Msg::Hello {
             proto: PROTO_VERSION,
             role: Role::Server,
@@ -336,11 +240,10 @@ impl Session {
             version: crate::VERSION.to_string(),
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
-            caps: caps(self.inner.allow_bash),
             roots: self.inner.roots.clone(),
         };
-        conn.send(&hello).await?;
-        let welcome = timeout(HELLO_TIMEOUT, conn.recv())
+        link.send(hello).await?;
+        let welcome = timeout(HELLO_TIMEOUT, link.recv())
             .await
             .map_err(|_| anyhow!("等待 Welcome 超时"))??;
         let (hub_name, targets) = match welcome {
@@ -349,7 +252,6 @@ impl Session {
                 hub_name,
                 targets,
                 server_online,
-                ..
             } => {
                 if proto != PROTO_VERSION {
                     bail!("中继协议版本不匹配: {proto}");
@@ -368,111 +270,79 @@ impl Session {
         if shutdown.is_cancelled() {
             bail!("连接途中收到退出信号");
         }
-
-        let IoHandles {
-            inbound,
-            outbound,
-            reader,
-            writer,
-        } = spawn_io(conn);
-        let serial = self.install(outbound.clone(), hub_name, targets);
-        tokio::spawn(async move {
-            let _ = writer.await;
-            reader.abort();
-        });
-        Ok((inbound, outbound, serial))
+        self.install(link.sink().clone(), hub_name, targets);
+        Ok(link)
     }
 
-    async fn serve(
-        &self,
-        mut inbound: mpsc::Receiver<Msg>,
-        outbound: Sink,
-        serial: u64,
-        shutdown: CancellationToken,
-    ) {
-        let mut ticker = interval(HEARTBEAT_INTERVAL);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut last_rx = Instant::now();
-
-        let outcome: Result<()> = loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    let _ = outbound.try_send(Msg::Bye {
-                        code: "shutdown".into(),
-                        message: "服务端退出".into(),
-                    });
-                    break Ok(());
+    async fn serve(&self, mut link: Link, shutdown: CancellationToken) {
+        let never = CancellationToken::new();
+        loop {
+            match link.next(&shutdown, &never).await {
+                Ok(msg) => {
+                    if let Err(err) = self.handle(link.sink(), msg).await {
+                        warn!(error = %format!("{err:#}"), "中继连接中断");
+                        break;
+                    }
                 }
-                incoming = inbound.recv() => match incoming {
-                    Some(msg) => {
-                        last_rx = Instant::now();
-                        if let Err(err) = self.handle(serial, &outbound, msg).await {
-                            break Err(err);
-                        }
-                    }
-                    None => break Err(anyhow!("中继连接断开")),
-                },
-                _ = ticker.tick() => {
-                    if last_rx.elapsed() > IDLE_TIMEOUT {
-                        break Err(anyhow!("中继心跳超时"));
-                    }
-                    if outbound.try_send(Msg::Ping { nonce: rand::random() }).is_err() {
-                        break Err(anyhow!("发送心跳失败"));
-                    }
+                Err(End::Shutdown) => {
+                    link.bye("shutdown", "服务端退出");
+                    break;
+                }
+                Err(end) => {
+                    warn!(reason = end.reason(), "中继连接中断");
+                    break;
                 }
             }
-        };
-
-        self.teardown(serial);
-        match outcome {
-            Ok(()) => info!("中继连接已关闭"),
-            Err(err) => warn!(error = %format!("{err:#}"), "中继连接中断"),
         }
+        self.teardown();
+        link.close().await;
     }
 
-    async fn handle(&self, serial: u64, outbound: &Sink, msg: Msg) -> Result<()> {
+    async fn handle(&self, outbound: &Sink, msg: Msg) -> Result<()> {
         match msg {
             Msg::Ping { nonce } => {
                 let _ = outbound.try_send(Msg::Pong { nonce });
             }
             Msg::Pong { .. } => {}
             Msg::Bye { code, message } => bail!("中继关闭连接: {code} {message}"),
-            Msg::TargetsSnapshot { targets } => {
-                self.replace_targets(serial, targets);
-            }
-            Msg::TargetEvent { kind, target } => {
-                self.apply_event(serial, kind, target);
-            }
-            Msg::Result { id, .. } | Msg::Chunk { id, .. } | Msg::End { id, .. } => {
-                self.route(serial, outbound, id, msg);
+            Msg::TargetEvent { kind, target } => self.apply_event(kind, target),
+            Msg::Result { .. } | Msg::Chunk { .. } | Msg::End { .. } => {
+                self.route(outbound, msg);
             }
             other => debug!(msg = ?other, "忽略消息"),
         }
         Ok(())
     }
 
-    fn route(&self, serial: u64, outbound: &Sink, id: u64, msg: Msg) {
-        let queue = {
+    fn route(&self, outbound: &Sink, msg: Msg) {
+        let Some(id) = msg.id() else {
+            return;
+        };
+        let sender = {
             let state = self.lock_state();
             state
                 .conn
                 .as_ref()
-                .filter(|conn| conn.serial == serial)
                 .and_then(|conn| conn.pending.get(&id).cloned())
         };
-        let Some(queue) = queue else {
+        let Some(sender) = sender else {
             debug!(id, "丢弃没有归属的回复");
             return;
         };
-        if queue.push(msg) {
-            return;
+        match sender.try_send(msg) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.drop_call(id);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(id, "调用方处理过慢，放弃该调用");
+                self.drop_call(id);
+                let _ = outbound.try_send(Msg::Cancel {
+                    id,
+                    reason: Some("client stalled".into()),
+                });
+            }
         }
-        warn!(id, "调用方处理过慢，放弃该调用");
-        self.unregister(serial, id);
-        let _ = outbound.try_send(Msg::Cancel {
-            id,
-            reason: Some("client stalled".into()),
-        });
     }
 
     pub async fn begin(
@@ -483,14 +353,14 @@ impl Session {
     ) -> RemoteResult<CallHandle> {
         self.ready().await;
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let (queue, rx) = CallQueue::new(REPLY_QUEUE);
-        let (outbound, serial) = {
+        let (tx, rx) = mpsc::channel(REPLY_QUEUE);
+        let outbound = {
             let mut state = self.lock_state();
             let Some(conn) = state.conn.as_mut() else {
                 return Err(RemoteError::new("offline", "尚未连接中继"));
             };
-            conn.pending.insert(id, queue);
-            (conn.outbound.clone(), conn.serial)
+            conn.pending.insert(id, tx);
+            conn.outbound.clone()
         };
         let call = Msg::Call {
             id,
@@ -499,13 +369,12 @@ impl Session {
             params,
         };
         if outbound.send(call).await.is_err() {
-            self.unregister(serial, id);
+            self.drop_call(id);
             return Err(RemoteError::new("offline", "中继连接已断开"));
         }
         Ok(CallHandle {
             session: self.clone(),
             id,
-            serial,
             rx,
         })
     }
@@ -533,14 +402,10 @@ impl Session {
         handle.finish(deadline, cancel).await
     }
 
-    pub async fn send_raw(&self, serial: u64, msg: Msg) -> RemoteResult<()> {
+    pub async fn send(&self, msg: Msg) -> RemoteResult<()> {
         let outbound = {
             let state = self.lock_state();
-            state
-                .conn
-                .as_ref()
-                .filter(|conn| conn.serial == serial)
-                .map(|conn| conn.outbound.clone())
+            state.conn.as_ref().map(|conn| conn.outbound.clone())
         };
         let Some(outbound) = outbound else {
             return Err(RemoteError::new("offline", "中继连接已断开"));
@@ -551,43 +416,36 @@ impl Session {
             .map_err(|_| RemoteError::new("offline", "中继连接已断开"))
     }
 
-    fn unregister(&self, serial: u64, id: u64) {
+    fn drop_call(&self, id: u64) {
         let removed = {
             let mut state = self.lock_state();
-            match state.conn.as_mut() {
-                Some(conn) if conn.serial == serial => conn.pending.remove(&id),
-                _ => None,
-            }
+            state
+                .conn
+                .as_mut()
+                .and_then(|conn| conn.pending.remove(&id))
         };
-        if let Some(queue) = removed {
-            queue.close();
-        }
+        drop(removed);
     }
 
-    fn install(&self, outbound: Sink, hub_name: String, targets: Vec<TargetInfo>) -> u64 {
+    fn install(&self, outbound: Sink, hub_name: String, targets: Vec<TargetInfo>) {
         let mut state = self.lock_state();
-        let serial = state.next_serial;
-        state.next_serial += 1;
         state.hub_name = Some(hub_name);
-        state.conn = Some(Conn {
-            serial,
+        let previous = state.conn.replace(Conn {
             outbound,
             pending: HashMap::new(),
         });
         drop(state);
+        drop(previous);
         self.inner.connected.send_replace(true);
-        self.replace_targets(serial, targets);
-        serial
+        self.inner.ever_connected.store(true, Ordering::Relaxed);
+        self.replace_targets(targets);
     }
 
-    fn teardown(&self, serial: u64) {
+    fn teardown(&self) {
         let mut state = self.lock_state();
-        if state.conn.as_ref().map(|conn| conn.serial) == Some(serial) {
-            if let Some(conn) = state.conn.take() {
-                for queue in conn.pending.into_values() {
-                    queue.close();
-                }
-            }
+        let conn = state.conn.take();
+        drop(state);
+        if conn.is_some() {
             if let Ok(mut targets) = self.inner.targets.write() {
                 targets.clear();
             }
@@ -595,28 +453,14 @@ impl Session {
         }
     }
 
-    fn replace_targets(&self, serial: u64, targets: Vec<TargetInfo>) {
-        let connected = {
-            let state = self.lock_state();
-            state.conn.as_ref().map(|conn| conn.serial) == Some(serial)
-        };
-        if !connected {
-            return;
-        }
+    fn replace_targets(&self, targets: Vec<TargetInfo>) {
         if let Ok(mut current) = self.inner.targets.write() {
             debug!(count = targets.len(), "更新目标快照");
             *current = targets;
         }
     }
 
-    fn apply_event(&self, serial: u64, kind: TargetEventKind, target: TargetInfo) {
-        let connected = {
-            let state = self.lock_state();
-            state.conn.as_ref().map(|conn| conn.serial) == Some(serial)
-        };
-        if !connected {
-            return;
-        }
+    fn apply_event(&self, kind: TargetEventKind, target: TargetInfo) {
         let Ok(mut targets) = self.inner.targets.write() else {
             return;
         };
@@ -638,7 +482,6 @@ impl Session {
 pub struct CallHandle {
     session: Session,
     id: u64,
-    serial: u64,
     rx: mpsc::Receiver<Msg>,
 }
 
@@ -656,19 +499,16 @@ impl CallHandle {
     }
 
     pub async fn send(&self, msg: Msg) -> RemoteResult<()> {
-        self.session.send_raw(self.serial, msg).await
+        self.session.send(msg).await
     }
 
     pub async fn cancel(&self, reason: impl Into<String>) {
         let _ = self
             .session
-            .send_raw(
-                self.serial,
-                Msg::Cancel {
-                    id: self.id,
-                    reason: Some(reason.into()),
-                },
-            )
+            .send(Msg::Cancel {
+                id: self.id,
+                reason: Some(reason.into()),
+            })
             .await;
     }
 
@@ -680,12 +520,11 @@ impl CallHandle {
         let mut result = CallResult::empty();
         let session = self.session.clone();
         let id = self.id;
-        let serial = self.serial;
         let outcome = timeout(deadline, async {
             loop {
                 let msg = tokio::select! {
                     _ = cancel.cancelled() => {
-                        let _ = send_cancel(&session, serial, id, "cancelled").await;
+                        let _ = send_cancel(&session, id, "cancelled").await;
                         return Err(RemoteError::new("cancelled", "调用已取消"));
                     }
                     msg = self.rx.recv() => msg,
@@ -711,7 +550,7 @@ impl CallHandle {
                     } => {
                         result.ok = status == EndStatus::Ok;
                         result.exit_code = exit_code;
-                        result.stopped = Some(status);
+                        result.status = Some(status);
                         result.truncated = truncated.unwrap_or(false);
                         result.size = size;
                         result.sha256 = sha256;
@@ -735,11 +574,11 @@ impl CallHandle {
         match outcome {
             Ok(Ok(())) => Ok(result),
             Ok(Err(err)) => {
-                let _ = send_cancel(&session, serial, id, "client error").await;
+                let _ = send_cancel(&session, id, "client error").await;
                 Err(err)
             }
             Err(_) => {
-                let _ = send_cancel(&session, serial, id, "timeout").await;
+                let _ = send_cancel(&session, id, "timeout").await;
                 Err(RemoteError::new(
                     "timeout",
                     format!("调用超过 {} 秒未完成", deadline.as_secs()),
@@ -749,28 +588,17 @@ impl CallHandle {
     }
 }
 
-async fn send_cancel(session: &Session, serial: u64, id: u64, reason: &str) -> RemoteResult<()> {
-    session
-        .send_raw(
-            serial,
-            Msg::Cancel {
-                id,
-                reason: Some(reason.to_string()),
-            },
-        )
-        .await
-}
-
 impl Drop for CallHandle {
     fn drop(&mut self) {
-        self.session.unregister(self.serial, self.id);
+        self.session.drop_call(self.id);
     }
 }
 
-fn target_names(targets: &[TargetInfo]) -> String {
-    targets
-        .iter()
-        .map(|target| target.name.as_str())
-        .collect::<Vec<_>>()
-        .join(",")
+async fn send_cancel(session: &Session, id: u64, reason: &str) -> RemoteResult<()> {
+    session
+        .send(Msg::Cancel {
+            id,
+            reason: Some(reason.to_string()),
+        })
+        .await
 }

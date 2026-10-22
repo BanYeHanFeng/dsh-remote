@@ -14,9 +14,6 @@ pub const MAX_READ_LINES: u64 = 5_000;
 pub const MAX_LINE_BYTES: usize = 4 * 1024;
 pub const MAX_WRITE_BYTES: usize = 48 * 1024;
 pub const MAX_EDIT_FILE: u64 = 8 * 1024 * 1024;
-pub const MAX_LIST_ENTRIES: usize = 500;
-pub const MAX_LIST_BYTES: usize = 48 * 1024;
-pub const MAX_LIST_DEPTH: u64 = 5;
 pub const DEFAULT_READ_LINES: u64 = 2_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,23 +44,6 @@ pub struct EditReport {
     pub replacements: u64,
     pub size: u64,
     pub sha256: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Entry {
-    pub name: String,
-    pub path: String,
-    pub kind: String,
-    pub size: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListReport {
-    pub path: String,
-    pub depth: u64,
-    pub entries: Vec<Entry>,
-    pub skipped: u64,
-    pub truncated: bool,
 }
 
 pub fn read(roots: &[String], raw_path: &str, offset: u64, limit: u64) -> ToolResult<ReadReport> {
@@ -223,113 +203,6 @@ pub fn edit(
     })
 }
 
-pub fn list(roots: &[String], raw_path: &str, depth: u64) -> ToolResult<ListReport> {
-    let path = paths::resolve_existing(raw_path, roots)?;
-    let meta = fs::metadata(&path)
-        .map_err(|err| ToolError::io(format!("读取 {} 失败: {err}", path.display())))?;
-    if !meta.is_dir() {
-        return Err(ToolError::io(format!("不是目录: {}", path.display())));
-    }
-    fs::read_dir(&path)
-        .map_err(|err| ToolError::io(format!("读取目录 {} 失败: {err}", path.display())))?;
-    let depth = depth.clamp(1, MAX_LIST_DEPTH);
-    let canonical_roots = paths::canonical_roots(roots);
-    let mut walk = Walk {
-        roots: &canonical_roots,
-        max_depth: depth,
-        entries: Vec::new(),
-        skipped: 0,
-        truncated: false,
-        used: 0,
-    };
-    walk.visit(&path, 1)?;
-    Ok(ListReport {
-        path: path.display().to_string(),
-        depth,
-        entries: walk.entries,
-        skipped: walk.skipped,
-        truncated: walk.truncated,
-    })
-}
-
-struct Walk<'a> {
-    roots: &'a [std::path::PathBuf],
-    max_depth: u64,
-    entries: Vec<Entry>,
-    skipped: u64,
-    truncated: bool,
-    used: usize,
-}
-
-impl Walk<'_> {
-    fn visit(&mut self, dir: &Path, level: u64) -> ToolResult<()> {
-        let read_dir = match fs::read_dir(dir) {
-            Ok(read_dir) => read_dir,
-            Err(_) => {
-                self.skipped += 1;
-                return Ok(());
-            }
-        };
-        let mut items = Vec::new();
-        for item in read_dir {
-            match item {
-                Ok(item) => items.push(item),
-                Err(_) => self.skipped += 1,
-            }
-            if items.len() > MAX_LIST_ENTRIES {
-                self.truncated = true;
-                break;
-            }
-        }
-        items.sort_by_key(|item| item.file_name());
-
-        for item in items {
-            if self.entries.len() >= MAX_LIST_ENTRIES {
-                self.truncated = true;
-                return Ok(());
-            }
-            let path = item.path();
-            let meta = match fs::symlink_metadata(&path) {
-                Ok(meta) => meta,
-                Err(_) => {
-                    self.skipped += 1;
-                    continue;
-                }
-            };
-            if meta.file_type().is_symlink() {
-                let allowed = path
-                    .canonicalize()
-                    .map(|target| self.roots.iter().any(|root| target.starts_with(root)))
-                    .unwrap_or(false);
-                if !allowed {
-                    self.skipped += 1;
-                    continue;
-                }
-            }
-            let name = item.file_name().to_string_lossy().to_string();
-            let cost = name.len() + path.to_string_lossy().len() + 64;
-            if self.used + cost > MAX_LIST_BYTES && !self.entries.is_empty() {
-                self.truncated = true;
-                return Ok(());
-            }
-            self.used += cost;
-            self.entries.push(Entry {
-                name,
-                path: path.display().to_string(),
-                kind: kind_of(&meta).to_string(),
-                size: meta.is_file().then_some(meta.len()),
-            });
-            if meta.is_dir() && !meta.file_type().is_symlink() && level < self.max_depth {
-                self.visit(&path, level + 1)?;
-                if self.truncated {
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
 fn write_atomic(path: &Path, data: &[u8], max_file: u64) -> ToolResult<()> {
     if data.len() as u64 > max_file {
         return Err(ToolError::too_large(format!(
@@ -428,19 +301,6 @@ fn trim_newline(line: &[u8]) -> &[u8] {
         end -= 1;
     }
     &line[..end]
-}
-
-fn kind_of(meta: &fs::Metadata) -> &'static str {
-    let file_type = meta.file_type();
-    if file_type.is_symlink() {
-        "symlink"
-    } else if file_type.is_dir() {
-        "dir"
-    } else if file_type.is_file() {
-        "file"
-    } else {
-        "other"
-    }
 }
 
 fn mtime_ms(meta: &fs::Metadata) -> u64 {

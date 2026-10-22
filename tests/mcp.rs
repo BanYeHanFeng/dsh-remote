@@ -1,131 +1,17 @@
-use std::path::PathBuf;
+mod common;
+
 use std::process::Stdio;
 use std::time::Duration;
 
+use common::*;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpListener;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
-use tokio_util::sync::CancellationToken;
 
-use dsh_remote::agent;
-use dsh_remote::config::{ClientConfig, GithubConfig, HubConfig};
-use dsh_remote::hub;
-use dsh_remote::key::KeyMaterial;
-
-const KEY: &str = "0123456789abcdef0123456789abcdef";
 const REPLY_LIMIT: Duration = Duration::from_secs(30);
 
-struct Harness {
-    addr: String,
-    key: String,
-    root: PathBuf,
-    hub_shutdown: CancellationToken,
-    agent_shutdown: CancellationToken,
-    hub: Option<JoinHandle<anyhow::Result<()>>>,
-    agent: Option<JoinHandle<anyhow::Result<()>>>,
-}
-
-impl Harness {
-    fn remote(&self, name: &str) -> String {
-        self.root.join(name).to_string_lossy().to_string()
-    }
-
-    fn local(&self, name: &str) -> PathBuf {
-        self.root.join(name)
-    }
-
-    fn hub_config(&self) -> HubConfig {
-        HubConfig {
-            listen: self.addr.clone(),
-            key: KeyMaterial::parse(&self.key).unwrap(),
-            name: "hub".to_string(),
-            roots: vec![self.root.to_string_lossy().to_string()],
-            allow_bash: true,
-            max_output: 262_144,
-            max_file: 67_108_864,
-            log: "stderr".to_string(),
-        }
-    }
-
-    async fn start_hub(&mut self) {
-        let listener = TcpListener::bind(&self.addr).await.unwrap();
-        self.hub_shutdown = CancellationToken::new();
-        self.hub = Some(tokio::spawn(hub::serve(
-            listener,
-            self.hub_config(),
-            self.hub_shutdown.clone(),
-        )));
-    }
-
-    async fn stop_hub(&mut self) {
-        self.hub_shutdown.cancel();
-        if let Some(handle) = self.hub.take() {
-            let _ = timeout(Duration::from_secs(3), handle).await;
-        }
-    }
-
-    async fn stop(mut self) {
-        self.stop_hub().await;
-        self.agent_shutdown.cancel();
-        if let Some(handle) = self.agent.take() {
-            let _ = timeout(Duration::from_secs(3), handle).await;
-        }
-        std::fs::remove_dir_all(&self.root).ok();
-    }
-}
-
-async fn start() -> Harness {
-    let key = KeyMaterial::parse(KEY).unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    let root = std::env::temp_dir().join(format!(
-        "dsh-remote-m4-{}-{}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let roots = vec![root.to_string_lossy().to_string()];
-
-    let hub_shutdown = CancellationToken::new();
-    let hub_cfg = HubConfig {
-        listen: addr.clone(),
-        key: key.clone(),
-        name: "hub".to_string(),
-        roots: roots.clone(),
-        allow_bash: true,
-        max_output: 262_144,
-        max_file: 67_108_864,
-        log: "stderr".to_string(),
-    };
-    let agent_cfg = ClientConfig {
-        hub: addr.clone(),
-        key: key.clone(),
-        name: "nas".to_string(),
-        roots,
-        allow_bash: true,
-        max_output: 262_144,
-        max_file: 67_108_864,
-        log: "stderr".to_string(),
-        github: GithubConfig::default(),
-    };
-
-    let hub = tokio::spawn(hub::serve(listener, hub_cfg, hub_shutdown.clone()));
-    let agent_shutdown = CancellationToken::new();
-    let agent = tokio::spawn(agent::run(agent_cfg, agent_shutdown.clone()));
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    Harness {
-        addr,
-        key: KEY.to_string(),
-        root,
-        hub_shutdown,
-        agent_shutdown,
-        hub: Some(hub),
-        agent: Some(agent),
-    }
-}
 struct Mcp {
     child: Child,
     stdin: ChildStdin,
@@ -228,7 +114,7 @@ impl Mcp {
 }
 
 async fn connect(harness: &Harness) -> Mcp {
-    let mut mcp = Mcp::spawn(&harness.addr, &harness.key).await;
+    let mut mcp = Mcp::spawn(&harness.addr, KEY).await;
     let response = mcp
         .request(
             "initialize",
@@ -257,8 +143,8 @@ async fn connect(harness: &Harness) -> Mcp {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn initialize_and_tools_list() {
-    let harness = start().await;
-    let mut mcp = Mcp::spawn(&harness.addr, &harness.key).await;
+    let harness = Harness::start("mcp", true, true, None).await;
+    let mut mcp = Mcp::spawn(&harness.addr, KEY).await;
 
     let response = mcp
         .request(
@@ -305,7 +191,7 @@ async fn initialize_and_tools_list() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tools_run_against_agent_and_hub() {
-    let harness = start().await;
+    let harness = Harness::start("mcp", true, true, None).await;
     let mut mcp = connect(&harness).await;
 
     let (targets, is_error) = mcp.tool("targets", json!({})).await;
@@ -390,7 +276,7 @@ async fn tools_run_against_agent_and_hub() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upload_and_download_through_mcp() {
-    let harness = start().await;
+    let harness = Harness::start("mcp", true, true, None).await;
     let mut mcp = connect(&harness).await;
 
     let local_dir = harness.local("local");
@@ -439,7 +325,7 @@ async fn upload_and_download_through_mcp() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_call_returns_quickly() {
-    let harness = start().await;
+    let harness = Harness::start("mcp", true, true, None).await;
     let mut mcp = connect(&harness).await;
 
     let id = mcp.next_id;
@@ -508,7 +394,7 @@ async fn offline_hub_still_answers_mcp() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_reconnects_after_hub_restart() {
-    let mut harness = start().await;
+    let mut harness = Harness::start("mcp", true, true, None).await;
     let mut mcp = connect(&harness).await;
 
     harness.stop_hub().await;
@@ -524,7 +410,7 @@ async fn server_reconnects_after_hub_restart() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    harness.start_hub().await;
+    harness.restart_hub().await;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let (text, _) = mcp.tool("targets", json!({})).await;

@@ -8,12 +8,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::actions::{GhClient, StartRequest, DEFAULT_DURATION_MINUTES, MAX_DURATION_MINUTES};
 use crate::call;
+use crate::exec::limits;
+use crate::proto::params::BashParams;
 use crate::proto::{now_ms, EndStatus};
 use crate::session::{RemoteError, Session};
 
-const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
-const MAX_BASH_TIMEOUT_MS: u64 = 600_000;
-const BASH_DEADLINE_EXTRA: Duration = Duration::from_secs(15);
 const START_WAIT_SECONDS: u64 = 60;
 const MAX_WAIT_SECONDS: u64 = 300;
 const STOP_WAIT_SECONDS: u64 = 30;
@@ -249,39 +248,20 @@ async fn targets(session: &Session) -> ToolOutput {
 async fn bash(session: &Session, args: &Value, cancel: &CancellationToken) -> ToolResult {
     let target = require_str(args, "target")?;
     let command = require_str(args, "command")?;
-    let timeout_ms = optional_u64(args, "timeout_ms")
-        .unwrap_or(DEFAULT_BASH_TIMEOUT_MS)
-        .clamp(100, MAX_BASH_TIMEOUT_MS);
-
-    let mut params = vec![
-        ("command", ciborium::value::Value::Text(command.to_string())),
-        (
-            "timeout_ms",
-            ciborium::value::Value::Integer(timeout_ms.into()),
-        ),
-    ];
-    if let Some(cwd) = optional_str(args, "cwd") {
-        params.push(("cwd", ciborium::value::Value::Text(cwd.to_string())));
-    }
-    if let Some(stdin) = optional_str(args, "stdin") {
-        params.push(("stdin", ciborium::value::Value::Text(stdin.to_string())));
-    }
-    if let Some(max_output) = optional_u64(args, "max_output") {
-        params.push((
-            "max_output",
-            ciborium::value::Value::Integer(max_output.into()),
-        ));
-    }
+    let timeout = limits::bash_timeout_ms(optional_u64(args, "timeout_ms"));
+    let params = crate::proto::value::serialize(&BashParams {
+        command,
+        cwd: optional_str(args, "cwd"),
+        stdin: optional_str(args, "stdin"),
+        timeout_ms: Some(timeout.as_millis() as u64),
+        max_output: optional_u64(args, "max_output"),
+    })
+    .map_err(|err| describe(&err))?;
+    let deadline = limits::deadline("bash", &params);
 
     let started = Instant::now();
     let result = session
-        .call_cancel(
-            &target,
-            "bash",
-            crate::proto::value::map(params),
-            Duration::from_millis(timeout_ms) + BASH_DEADLINE_EXTRA,
-            cancel,
-        )
+        .call_cancel(&target, "bash", params, deadline, cancel)
         .await
         .map_err(|err| describe(&err.into()))?;
     let elapsed = started.elapsed().as_millis();
@@ -317,7 +297,7 @@ async fn bash(session: &Session, args: &Value, cancel: &CancellationToken) -> To
     if let Some(error) = &result.error {
         let _ = writeln!(out, "错误 [{}]: {}", error.code, error.message);
     } else if !result.ok {
-        match result.stopped {
+        match result.status {
             Some(EndStatus::Error) => {
                 let _ = writeln!(out, "错误 [timeout]: 远端超时，整个进程组已被杀掉");
             }

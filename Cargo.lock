@@ -412,7 +412,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "snow",
- "thiserror",
  "tokio",
  "tokio-util",
  "tracing",

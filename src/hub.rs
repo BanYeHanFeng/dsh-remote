@@ -4,30 +4,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use ciborium::value::Value;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock};
-use tokio::task::JoinHandle;
-use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
+use tokio::time::{interval, timeout, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::config::HubConfig;
-use crate::exec::transfer::transfer_limit;
-use crate::exec::{Executor, Settings, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS};
-use crate::net::{spawn_io, IoHandles, SecureConn, Sink};
+use crate::exec::{limits, Executor};
+use crate::net::link::{End, Link, HELLO_TIMEOUT};
+use crate::net::Sink;
 use crate::proto::value as cbor;
 use crate::proto::{
-    caps, now_ms, Msg, ProtoError, Role, TargetEventKind, TargetInfo, TargetKind, PROTO_VERSION,
+    now_ms, Msg, ProtoError, Role, TargetEventKind, TargetInfo, TargetKind, PROTO_VERSION,
 };
 
-const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
-const WRITER_DRAIN: Duration = Duration::from_secs(2);
-const CALL_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
-const CALL_TIMEOUT_EXTRA: Duration = Duration::from_secs(30);
+const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+const LOCAL_QUEUE: usize = 256;
 
 struct AgentEntry {
     info: TargetInfo,
@@ -36,25 +31,21 @@ struct AgentEntry {
     token: CancellationToken,
 }
 
-struct ServerEntry {
-    tx: Sink,
-}
-
 struct Pending {
     server_id: u64,
     server_tx: Sink,
     server_req_id: u64,
     agent_id: u64,
     agent_tx: Sink,
-    timer: JoinHandle<()>,
+    deadline: Instant,
 }
 
 struct HubState {
     cfg: HubConfig,
     started: u64,
     agents: RwLock<HashMap<String, AgentEntry>>,
-    servers: RwLock<HashMap<u64, ServerEntry>>,
-    pending: Arc<Mutex<HashMap<u64, Pending>>>,
+    servers: RwLock<HashMap<u64, Sink>>,
+    pending: Mutex<HashMap<u64, Pending>>,
     next_id: AtomicU64,
     next_call: AtomicU64,
     executor: Executor,
@@ -62,13 +53,13 @@ struct HubState {
 
 impl HubState {
     fn new(cfg: HubConfig) -> Self {
-        let executor = Executor::new(Settings::from_hub(&cfg));
+        let executor = Executor::new(cfg.target.clone());
         Self {
             cfg,
             started: now_ms(),
             agents: RwLock::new(HashMap::new()),
             servers: RwLock::new(HashMap::new()),
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             next_call: AtomicU64::new(1),
             executor,
@@ -83,18 +74,19 @@ impl HubState {
             arch: std::env::consts::ARCH.to_string(),
             version: crate::VERSION.to_string(),
             since: self.started,
-            roots: self.cfg.roots.clone(),
-            caps: caps(self.cfg.allow_bash),
+            roots: self.cfg.target.roots.clone(),
         }
     }
 
     async fn targets(&self) -> Vec<TargetInfo> {
-        let mut list = vec![self.hub_info()];
-        let agents = self.agents.read().await;
-        let mut entries: Vec<TargetInfo> =
-            agents.values().map(|entry| entry.info.clone()).collect();
-        entries.sort_by(|left, right| left.name.cmp(&right.name));
-        list.extend(entries);
+        let mut list: Vec<TargetInfo> = self
+            .agents
+            .read()
+            .await
+            .values()
+            .map(|entry| entry.info.clone())
+            .collect();
+        list.sort_by(|left, right| left.name.cmp(&right.name));
         list
     }
 
@@ -134,24 +126,11 @@ impl HubState {
     }
 
     async fn register_server(&self, conn_id: u64, tx: Sink) {
-        self.servers
-            .write()
-            .await
-            .insert(conn_id, ServerEntry { tx });
-    }
-
-    async fn remove_server(&self, conn_id: u64) {
-        self.servers.write().await.remove(&conn_id);
+        self.servers.write().await.insert(conn_id, tx);
     }
 
     async fn broadcast(&self, msg: Msg) {
-        let targets: Vec<Sink> = self
-            .servers
-            .read()
-            .await
-            .values()
-            .map(|entry| entry.tx.clone())
-            .collect();
+        let targets: Vec<Sink> = self.servers.read().await.values().cloned().collect();
         for tx in targets {
             let _ = tx.try_send(msg.clone());
         }
@@ -166,51 +145,38 @@ impl HubState {
         method: String,
         params: Value,
     ) {
-        if method == "targets" || target == self.cfg.name {
-            self.handle_local_call(server_id, server_tx, req_id, method, params)
-                .await;
-        } else {
-            self.route_call(server_id, server_tx, req_id, target, method, params)
-                .await;
-        }
-    }
-
-    async fn handle_local_call(
-        &self,
-        server_id: u64,
-        server_tx: Sink,
-        req_id: u64,
-        method: String,
-        params: Value,
-    ) {
         if method == "targets" {
-            match cbor::serialize(&self.targets().await) {
-                Ok(value) => {
-                    let _ = server_tx
-                        .send(Msg::Result {
-                            id: req_id,
-                            ok: true,
-                            value: Some(value),
-                            error: None,
-                        })
-                        .await;
-                }
-                Err(err) => {
-                    reply_error(
-                        &server_tx,
-                        req_id,
-                        "internal",
-                        format!("序列化目标列表失败: {err:#}"),
-                    )
-                    .await;
-                }
-            }
+            self.reply_targets(&server_tx, req_id).await;
             return;
         }
-        let call_id = self.next_call.fetch_add(1, Ordering::Relaxed);
-        self.executor
-            .dispatch(call_id, server_id, req_id, &method, params, server_tx)
+        self.route_call(server_id, server_tx, req_id, target, method, params)
             .await;
+    }
+
+    async fn reply_targets(&self, server_tx: &Sink, req_id: u64) {
+        let value = match cbor::serialize(&self.targets().await) {
+            Ok(value) => value,
+            Err(err) => {
+                reply_error(
+                    server_tx,
+                    req_id,
+                    "internal",
+                    format!("序列化目标列表失败: {err:#}"),
+                );
+                return;
+            }
+        };
+        if server_tx
+            .try_send(Msg::Result {
+                id: req_id,
+                ok: true,
+                value: Some(value),
+                error: None,
+            })
+            .is_err()
+        {
+            warn!(req_id, "回复目标列表失败");
+        }
     }
 
     async fn route_call(
@@ -234,37 +200,12 @@ impl HubState {
                 req_id,
                 "unknown_target",
                 format!("目标不在线: {target}"),
-            )
-            .await;
+            );
             return;
         };
 
         let call_id = self.next_call.fetch_add(1, Ordering::Relaxed);
-        let deadline = call_timeout(&method, &params);
-        let pending_map = self.pending.clone();
-        let timer = tokio::spawn(async move {
-            tokio::time::sleep(deadline).await;
-            let entry = pending_map.lock().await.remove(&call_id);
-            if let Some(entry) = entry {
-                let _ = entry
-                    .server_tx
-                    .send(Msg::Result {
-                        id: entry.server_req_id,
-                        ok: false,
-                        value: None,
-                        error: Some(ProtoError::new("timeout", "远端执行超时")),
-                    })
-                    .await;
-                let _ = entry
-                    .agent_tx
-                    .send(Msg::Cancel {
-                        id: call_id,
-                        reason: Some("timeout".into()),
-                    })
-                    .await;
-            }
-        });
-
+        let deadline = Instant::now() + limits::deadline(&method, &params);
         self.pending.lock().await.insert(
             call_id,
             Pending {
@@ -273,7 +214,7 @@ impl HubState {
                 server_req_id: req_id,
                 agent_id,
                 agent_tx: agent_tx.clone(),
-                timer,
+                deadline,
             },
         );
 
@@ -283,13 +224,10 @@ impl HubState {
             method,
             params,
         };
-        if agent_tx.send(call).await.is_err() {
-            let entry = self.pending.lock().await.remove(&call_id);
-            if let Some(entry) = entry {
-                entry.timer.abort();
-                drop(entry);
-                reply_error(&server_tx, req_id, "offline", "目标连接已断开").await;
-            }
+        if agent_tx.try_send(call).is_err() {
+            let removed = self.pending.lock().await.remove(&call_id);
+            drop(removed);
+            reply_error(&server_tx, req_id, "offline", "目标连接已断开或繁忙");
         }
     }
 
@@ -306,21 +244,20 @@ impl HubState {
             if entry.agent_id != agent_id {
                 return;
             }
-            let server_tx = entry.server_tx.clone();
-            let reply_id = entry.server_req_id;
+            let target = (entry.server_tx.clone(), entry.server_req_id);
             if terminal {
-                if let Some(entry) = pending.remove(&call_id) {
-                    entry.timer.abort();
-                }
+                pending.remove(&call_id);
             }
-            (server_tx, reply_id)
+            target
         };
-        let _ = forwarded.0.send(msg.with_id(forwarded.1)).await;
+        if forwarded.0.try_send(msg.with_id(forwarded.1)).is_err() {
+            debug!(call_id, "转发出站结果失败");
+        }
     }
 
-    async fn forward_from_server(&self, server_id: u64, msg: Msg) -> Option<Msg> {
+    async fn forward_from_server(&self, server_id: u64, msg: Msg) -> bool {
         let Some(req_id) = msg.id() else {
-            return Some(msg);
+            return false;
         };
         let target = {
             let pending = self.pending.lock().await;
@@ -330,16 +267,15 @@ impl HubState {
                 .map(|(call_id, entry)| (*call_id, entry.agent_tx.clone()))
         };
         let Some((call_id, agent_tx)) = target else {
-            return Some(msg);
+            return false;
         };
-        if agent_tx.send(msg.with_id(call_id)).await.is_err() {
+        if agent_tx.try_send(msg.with_id(call_id)).is_err() {
             debug!(req_id, "转发上行数据失败");
         }
-        None
+        true
     }
 
     async fn cancel_call(&self, server_id: u64, req_id: u64, reason: Option<String>) {
-        self.executor.cancel_by_reply(server_id, req_id);
         let found = {
             let pending = self.pending.lock().await;
             pending
@@ -348,19 +284,17 @@ impl HubState {
                 .map(|(call_id, entry)| (*call_id, entry.agent_tx.clone()))
         };
         if let Some((call_id, agent_tx)) = found {
-            let _ = agent_tx
-                .send(Msg::Cancel {
-                    id: call_id,
-                    reason,
-                })
-                .await;
+            let _ = agent_tx.try_send(Msg::Cancel {
+                id: call_id,
+                reason,
+            });
         }
     }
 
-    async fn cleanup_connection(&self, role: Role, info: &TargetInfo, tx: &Sink, conn_id: u64) {
+    async fn cleanup_connection(&self, role: Role, info: &TargetInfo, sink: &Sink, conn_id: u64) {
         match role {
             Role::Agent => {
-                let removed = self.remove_agent(&info.name, tx).await;
+                let removed = self.remove_agent(&info.name, sink).await;
                 let dropped: Vec<Pending> = {
                     let mut pending = self.pending.lock().await;
                     let ids: Vec<u64> = pending
@@ -373,19 +307,15 @@ impl HubState {
                         .collect()
                 };
                 for entry in dropped {
-                    entry.timer.abort();
-                    let _ = entry
-                        .server_tx
-                        .send(Msg::Result {
-                            id: entry.server_req_id,
-                            ok: false,
-                            value: None,
-                            error: Some(ProtoError::new(
-                                "offline",
-                                format!("目标 {} 已断开", info.name),
-                            )),
-                        })
-                        .await;
+                    let _ = entry.server_tx.try_send(Msg::Result {
+                        id: entry.server_req_id,
+                        ok: false,
+                        value: None,
+                        error: Some(ProtoError::new(
+                            "offline",
+                            format!("目标 {} 已断开", info.name),
+                        )),
+                    });
                 }
                 if removed {
                     self.broadcast(Msg::TargetEvent {
@@ -398,7 +328,6 @@ impl HubState {
             }
             Role::Server => {
                 self.remove_server(conn_id).await;
-                self.executor.cancel_by_server(conn_id);
                 let cancelled: Vec<(u64, Pending)> = {
                     let mut pending = self.pending.lock().await;
                     let ids: Vec<u64> = pending
@@ -411,17 +340,93 @@ impl HubState {
                         .collect()
                 };
                 for (call_id, entry) in cancelled {
-                    entry.timer.abort();
-                    let _ = entry
-                        .agent_tx
-                        .send(Msg::Cancel {
-                            id: call_id,
-                            reason: Some("server disconnected".into()),
-                        })
-                        .await;
+                    let _ = entry.agent_tx.try_send(Msg::Cancel {
+                        id: call_id,
+                        reason: Some("server disconnected".into()),
+                    });
                 }
             }
         }
+    }
+
+    async fn remove_server(&self, conn_id: u64) {
+        self.servers.write().await.remove(&conn_id);
+    }
+
+    async fn sweep(&self, shutdown: &CancellationToken) {
+        let mut ticker = interval(SWEEP_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+            let now = Instant::now();
+            let expired: Vec<(u64, Pending)> = {
+                let mut pending = self.pending.lock().await;
+                let ids: Vec<u64> = pending
+                    .iter()
+                    .filter(|(_, entry)| entry.deadline <= now)
+                    .map(|(id, _)| *id)
+                    .collect();
+                ids.into_iter()
+                    .filter_map(|id| pending.remove(&id).map(|entry| (id, entry)))
+                    .collect()
+            };
+            for (call_id, entry) in expired {
+                let _ = entry.server_tx.try_send(Msg::Result {
+                    id: entry.server_req_id,
+                    ok: false,
+                    value: None,
+                    error: Some(ProtoError::new("timeout", "远端执行超时")),
+                });
+                let _ = entry.agent_tx.try_send(Msg::Cancel {
+                    id: call_id,
+                    reason: Some("timeout".into()),
+                });
+            }
+        }
+    }
+
+    async fn spawn_local_agent(self: &Arc<Self>, shutdown: CancellationToken) {
+        let conn_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (hub_tx, mut from_hub) = Sink::pair(LOCAL_QUEUE);
+        let (agent_tx, mut to_hub) = Sink::pair(LOCAL_QUEUE);
+        let info = self.hub_info();
+        self.agents.write().await.insert(
+            info.name.clone(),
+            AgentEntry {
+                info,
+                tx: hub_tx,
+                conn_id,
+                token: CancellationToken::new(),
+            },
+        );
+        let state = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    msg = from_hub.recv() => match msg {
+                        Some(Msg::Call { id, method, params, .. }) => {
+                            state.executor.dispatch(id, &method, params, agent_tx.clone()).await;
+                        }
+                        Some(Msg::Cancel { id, .. }) => state.executor.cancel(id),
+                        Some(msg @ (Msg::Chunk { .. } | Msg::End { .. })) => {
+                            if !state.executor.feed(msg).await {
+                                debug!("本地传输消息没有归属");
+                            }
+                        }
+                        Some(other) => debug!(msg = ?other, "本地目标忽略消息"),
+                        None => break,
+                    },
+                    msg = to_hub.recv() => match msg {
+                        Some(msg) => state.forward_from_agent(conn_id, msg).await,
+                        None => break,
+                    },
+                }
+            }
+            state.executor.cancel_all();
+        });
     }
 }
 
@@ -445,6 +450,12 @@ pub async fn serve(
     shutdown: CancellationToken,
 ) -> Result<()> {
     let state = Arc::new(HubState::new(cfg));
+    HubState::spawn_local_agent(&state, shutdown.clone()).await;
+    {
+        let state = state.clone();
+        let token = shutdown.clone();
+        tokio::spawn(async move { state.sweep(&token).await });
+    }
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -472,44 +483,36 @@ async fn handle_conn(
     peer: SocketAddr,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let mut conn = SecureConn::accept(stream, &state.cfg.key)
+    let mut link = Link::accept(stream, &state.cfg.key)
         .await
         .context("握手失败")?;
-    let hello = timeout(HELLO_TIMEOUT, conn.recv())
+    let hello = timeout(HELLO_TIMEOUT, link.recv())
         .await
-        .map_err(|_| anyhow!("等待 Hello 超时"))??;
+        .map_err(|_| anyhow::anyhow!("等待 Hello 超时"))??;
     let (role, name, info) = match parse_hello(hello) {
         Ok(parsed) => parsed,
         Err(err) => {
             let mismatch = format!("{err:#}").contains("协议版本不匹配");
-            let _ = conn
-                .send(&Msg::Bye {
-                    code: if mismatch {
-                        "proto_mismatch"
-                    } else {
-                        "handshake"
-                    }
-                    .into(),
-                    message: format!("{err:#}"),
-                })
-                .await;
+            link.bye(
+                if mismatch {
+                    "proto_mismatch"
+                } else {
+                    "handshake"
+                },
+                format!("{err:#}"),
+            );
+            link.close().await;
             return Err(err);
         }
     };
     info!(%peer, ?role, name = %name, "握手完成");
 
-    let IoHandles {
-        mut inbound,
-        outbound,
-        reader,
-        writer,
-    } = spawn_io(conn);
     let conn_id = state.next_id.fetch_add(1, Ordering::Relaxed);
     let conn_token = CancellationToken::new();
 
     match role {
         Role::Agent => match state
-            .register_agent(&info, &outbound, conn_id, &conn_token)
+            .register_agent(&info, link.sink(), conn_id, &conn_token)
             .await
         {
             Ok(previous) => {
@@ -524,39 +527,29 @@ async fn handle_conn(
                 }
             }
             Err(err) => {
-                let _ = outbound.try_send(Msg::Bye {
-                    code: err.code,
-                    message: err.message,
-                });
-                drop(outbound);
-                let _ = timeout(WRITER_DRAIN, writer).await;
-                reader.abort();
+                link.bye(&err.code, err.message);
+                link.close().await;
                 return Ok(());
             }
         },
-        Role::Server => {
-            state.register_server(conn_id, outbound.clone()).await;
-        }
+        Role::Server => state.register_server(conn_id, link.sink().clone()).await,
     }
 
     let welcome = Msg::Welcome {
         proto: PROTO_VERSION,
         hub_name: state.cfg.name.clone(),
-        session: conn_id.to_string(),
         targets: state.targets().await,
         server_online: !state.servers.read().await.is_empty(),
     };
-    if outbound.try_send(welcome).is_err() {
+    if link.send(welcome).await.is_err() {
         state
-            .cleanup_connection(role, &info, &outbound, conn_id)
+            .cleanup_connection(role, &info, link.sink(), conn_id)
             .await;
-        drop(outbound);
-        let _ = timeout(WRITER_DRAIN, writer).await;
-        reader.abort();
+        link.close().await;
         return Ok(());
     }
 
-    if matches!(role, Role::Agent) {
+    if role == Role::Agent {
         state
             .broadcast(Msg::TargetEvent {
                 kind: TargetEventKind::Online,
@@ -566,95 +559,81 @@ async fn handle_conn(
         info!(name = %name, "目标上线");
     }
 
-    let mut ticker = interval(HEARTBEAT_INTERVAL);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut last_rx = Instant::now();
-
     loop {
-        tokio::select! {
-            _ = conn_token.cancelled() => {
-                let _ = outbound.try_send(Msg::Bye {
-                    code: "replaced".into(),
-                    message: format!("目标名 {} 已被新连接顶替", info.name),
-                });
+        match link.next(&shutdown, &conn_token).await {
+            Ok(msg) => {
+                if role == Role::Agent
+                    && matches!(
+                        msg,
+                        Msg::Result { .. } | Msg::Chunk { .. } | Msg::End { .. }
+                    )
+                {
+                    state.forward_from_agent(conn_id, msg).await;
+                    continue;
+                }
+                match msg {
+                    Msg::Ping { nonce } => {
+                        let _ = link.sink().try_send(Msg::Pong { nonce });
+                    }
+                    Msg::Pong { .. } => {}
+                    Msg::Bye { code, message } => {
+                        info!(name = %name, code = %code, message = %message, "对端关闭连接");
+                        break;
+                    }
+                    Msg::Call {
+                        id,
+                        target,
+                        method,
+                        params,
+                    } => {
+                        if role == Role::Server {
+                            state
+                                .handle_call(
+                                    conn_id,
+                                    link.sink().clone(),
+                                    id,
+                                    target,
+                                    method,
+                                    params,
+                                )
+                                .await;
+                        } else {
+                            warn!(name = %name, "被控端不能发起调用");
+                        }
+                    }
+                    Msg::Cancel { id, reason } => {
+                        if role == Role::Server {
+                            state.cancel_call(conn_id, id, reason).await;
+                        }
+                    }
+                    msg @ (Msg::Chunk { .. } | Msg::End { .. }) => {
+                        if role == Role::Server && !state.forward_from_server(conn_id, msg).await {
+                            debug!(name = %name, "丢弃没有对应调用的上行数据");
+                        }
+                    }
+                    other => debug!(name = %name, msg = ?other, "忽略消息"),
+                }
+            }
+            Err(End::Stopped) => {
+                link.bye("replaced", format!("目标名 {} 已被新连接顶替", info.name));
                 info!(name = %info.name, conn_id, "连接被同名目标顶替");
                 break;
             }
-            _ = shutdown.cancelled() => {
-                let _ = outbound.try_send(Msg::Bye {
-                    code: "shutdown".into(),
-                    message: "中继停止".into(),
-                });
+            Err(End::Shutdown) => {
+                link.bye("shutdown", "中继停止");
                 break;
             }
-            incoming = inbound.recv() => match incoming {
-                Some(msg) => {
-                    last_rx = Instant::now();
-                    if role == Role::Agent
-                        && matches!(msg, Msg::Result { .. } | Msg::Chunk { .. } | Msg::End { .. })
-                    {
-                        state.forward_from_agent(conn_id, msg).await;
-                        continue;
-                    }
-                    match msg {
-                        Msg::Ping { nonce } => {
-                            let _ = outbound.try_send(Msg::Pong { nonce });
-                        }
-                        Msg::Pong { .. } => {}
-                        Msg::Bye { code, message } => {
-                            info!(name = %name, code = %code, message = %message, "对端关闭连接");
-                            break;
-                        }
-                        Msg::Call { id, target, method, params } => {
-                            if role == Role::Server {
-                                state
-                                    .handle_call(conn_id, outbound.clone(), id, target, method, params)
-                                    .await;
-                            } else {
-                                warn!(name = %name, "被控端不能发起调用");
-                            }
-                        }
-                        Msg::Cancel { id, reason } => {
-                            if role == Role::Server {
-                                state.cancel_call(conn_id, id, reason).await;
-                            }
-                        }
-                        Msg::Chunk { .. } | Msg::End { .. } => {
-                            if role == Role::Server {
-                                if let Some(msg) = state.forward_from_server(conn_id, msg).await {
-                                    if !state.executor.feed_from_server(conn_id, msg).await {
-                                        debug!(name = %name, "丢弃没有对应调用的上行数据");
-                                    }
-                                }
-                            }
-                        }
-                        other => debug!(name = %name, msg = ?other, "忽略消息"),
-                    }
-                }
-                None => {
-                    debug!(name = %name, "连接读端关闭");
-                    break;
-                }
-            },
-            _ = ticker.tick() => {
-                if last_rx.elapsed() > IDLE_TIMEOUT {
-                    warn!(name = %name, "心跳超时");
-                    break;
-                }
-                let nonce = rand::random::<u64>();
-                if outbound.try_send(Msg::Ping { nonce }).is_err() {
-                    break;
-                }
+            Err(end) => {
+                debug!(name = %name, reason = end.reason(), "连接结束");
+                break;
             }
         }
     }
 
     state
-        .cleanup_connection(role, &info, &outbound, conn_id)
+        .cleanup_connection(role, &info, link.sink(), conn_id)
         .await;
-    drop(outbound);
-    let _ = timeout(WRITER_DRAIN, writer).await;
-    reader.abort();
+    link.close().await;
     info!(%peer, name = %name, "连接关闭");
     Ok(())
 }
@@ -667,7 +646,6 @@ fn parse_hello(msg: Msg) -> Result<(Role, String, TargetInfo)> {
         version,
         os,
         arch,
-        caps,
         roots,
     } = msg
     else {
@@ -691,32 +669,20 @@ fn parse_hello(msg: Msg) -> Result<(Role, String, TargetInfo)> {
         version,
         since: now_ms(),
         roots,
-        caps,
     };
     Ok((role, name, info))
 }
 
-fn call_timeout(method: &str, params: &Value) -> Duration {
-    match method {
-        "bash" => {
-            let requested = cbor::u64_value(params, "timeout_ms")
-                .unwrap_or(DEFAULT_TIMEOUT_MS)
-                .min(MAX_TIMEOUT_MS);
-            Duration::from_millis(requested) + CALL_TIMEOUT_EXTRA
-        }
-        "upload" => transfer_limit(cbor::u64_value(params, "size").unwrap_or_default()),
-        "download" => transfer_limit(cbor::u64_value(params, "max_size").unwrap_or_default()),
-        _ => CALL_TIMEOUT_FLOOR,
-    }
-}
-
-async fn reply_error(tx: &Sink, id: u64, code: &str, message: impl Into<String>) {
-    let _ = tx
-        .send(Msg::Result {
+fn reply_error(tx: &Sink, id: u64, code: &str, message: impl Into<String>) {
+    if tx
+        .try_send(Msg::Result {
             id,
             ok: false,
             value: None,
             error: Some(ProtoError::new(code, message)),
         })
-        .await;
+        .is_err()
+    {
+        warn!(id, code, "回复失败");
+    }
 }

@@ -8,6 +8,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -49,15 +50,17 @@ pub async fn serve(session: &Session, shutdown: CancellationToken) -> Result<()>
             if stdout.flush().await.is_err() {
                 break;
             }
-            debug!(method = %message.get("id").map(|id| id.to_string()).unwrap_or_default(), "已写出响应");
+            debug!(id = %message.get("id").map(|id| id.to_string()).unwrap_or_default(), "已写出响应");
         }
     });
 
     let pending = Arc::new(Mutex::new(HashMap::<String, CancellationToken>::new()));
+    let mut calls: JoinSet<()> = JoinSet::new();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
         let line = tokio::select! {
             _ = shutdown.cancelled() => break,
+            _ = calls.join_next(), if !calls.is_empty() => continue,
             line = lines.next_line() => match line {
                 Ok(Some(line)) => line,
                 Ok(None) => {
@@ -84,15 +87,12 @@ pub async fn serve(session: &Session, shutdown: CancellationToken) -> Result<()>
                 continue;
             }
         };
-        dispatch(session, &tx, &pending, message).await;
+        dispatch(session, &tx, &pending, &mut calls, message).await;
     }
 
-    let drain_deadline = tokio::time::Instant::now() + EOF_DRAIN;
-    while !pending.lock().map(|map| map.is_empty()).unwrap_or(true)
-        && tokio::time::Instant::now() < drain_deadline
-    {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let drain = async { while calls.join_next().await.is_some() {} };
+    let _ = timeout(EOF_DRAIN, drain).await;
+    calls.abort_all();
     if let Ok(mut pending) = pending.lock() {
         for (_, token) in pending.drain() {
             token.cancel();
@@ -107,6 +107,7 @@ async fn dispatch(
     session: &Session,
     tx: &mpsc::Sender<Value>,
     pending: &Arc<Mutex<HashMap<String, CancellationToken>>>,
+    calls: &mut JoinSet<()>,
     message: Value,
 ) {
     let Some(method) = message
@@ -161,7 +162,7 @@ async fn dispatch(
             let session = session.clone();
             let tx = tx.clone();
             let pending = pending.clone();
-            tokio::spawn(async move {
+            calls.spawn(async move {
                 let outcome = tools::call(&session, &params, &token).await;
                 if let Ok(mut map) = pending.lock() {
                     map.remove(&key);

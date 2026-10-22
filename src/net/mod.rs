@@ -1,4 +1,5 @@
 pub mod backoff;
+pub mod link;
 pub mod noise;
 
 use anyhow::{anyhow, Result};
@@ -27,6 +28,17 @@ fn ordered_with_data(msg: &Msg) -> bool {
 }
 
 impl Sink {
+    pub fn pair(capacity: usize) -> (Self, mpsc::Receiver<Msg>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Self {
+                control: tx.clone(),
+                data: tx,
+            },
+            rx,
+        )
+    }
+
     fn channel(&self, msg: &Msg) -> &mpsc::Sender<Msg> {
         if ordered_with_data(msg) {
             &self.data

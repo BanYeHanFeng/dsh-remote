@@ -9,8 +9,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::config::ClientConfig;
-use crate::exec::files::{EditReport, ListReport, ReadReport, MAX_WRITE_BYTES};
-use crate::exec::transfer::{transfer_limit, TransferReport, CHUNK_SIZE};
+use crate::exec::files::{EditReport, ReadReport, WriteReport, MAX_WRITE_BYTES};
+use crate::exec::limits;
+use crate::exec::transfer::{TransferReport, CHUNK_SIZE};
+use crate::proto::params::{DownloadParams, EditParams, ReadParams, UploadParams, WriteParams};
 use crate::proto::value;
 use crate::proto::{EndStatus, Msg, TargetInfo, STREAM_STDOUT};
 use crate::session::{CallHandle, Session};
@@ -71,20 +73,13 @@ pub async fn read(
     limit: u64,
     cancel: &CancellationToken,
 ) -> Result<ReadReport> {
-    let params = value::map(vec![
-        ("path", ciborium::value::Value::Text(path.to_string())),
-        ("offset", ciborium::value::Value::Integer(offset.into())),
-        ("limit", ciborium::value::Value::Integer(limit.into())),
-    ]);
-    let value = call_value(
-        session,
-        target,
-        "read",
-        params,
-        Duration::from_secs(60),
-        cancel,
-    )
-    .await?;
+    let params = value::serialize(&ReadParams {
+        path: path.to_string(),
+        offset,
+        limit: Some(limit),
+    })?;
+    let deadline = limits::deadline("read", &params);
+    let value = call_value(session, target, "read", params, deadline, cancel).await?;
     value::deserialize(&value)
 }
 
@@ -95,30 +90,20 @@ pub async fn write(
     content: &str,
     create_parents: bool,
     cancel: &CancellationToken,
-) -> Result<crate::exec::files::WriteReport> {
+) -> Result<WriteReport> {
     if content.len() > MAX_WRITE_BYTES {
         bail!(
             "内容 {} 字节超过 write 上限 {MAX_WRITE_BYTES} 字节，请改用 upload",
             content.len()
         );
     }
-    let params = value::map(vec![
-        ("path", ciborium::value::Value::Text(path.to_string())),
-        ("content", ciborium::value::Value::Text(content.to_string())),
-        (
-            "create_parents",
-            ciborium::value::Value::Bool(create_parents),
-        ),
-    ]);
-    let value = call_value(
-        session,
-        target,
-        "write",
-        params,
-        Duration::from_secs(60),
-        cancel,
-    )
-    .await?;
+    let params = value::serialize(&WriteParams {
+        path: path.to_string(),
+        content: content.to_string(),
+        create_parents,
+    })?;
+    let deadline = limits::deadline("write", &params);
+    let value = call_value(session, target, "write", params, deadline, cancel).await?;
     value::deserialize(&value)
 }
 
@@ -131,53 +116,14 @@ pub async fn edit(
     replace_all: bool,
     cancel: &CancellationToken,
 ) -> Result<EditReport> {
-    if old_string.len() + new_string.len() > MAX_WRITE_BYTES {
-        bail!("old_string 与 new_string 合计超过 {MAX_WRITE_BYTES} 字节");
-    }
-    let params = value::map(vec![
-        ("path", ciborium::value::Value::Text(path.to_string())),
-        (
-            "old_string",
-            ciborium::value::Value::Text(old_string.to_string()),
-        ),
-        (
-            "new_string",
-            ciborium::value::Value::Text(new_string.to_string()),
-        ),
-        ("replace_all", ciborium::value::Value::Bool(replace_all)),
-    ]);
-    let value = call_value(
-        session,
-        target,
-        "edit",
-        params,
-        Duration::from_secs(60),
-        cancel,
-    )
-    .await?;
-    value::deserialize(&value)
-}
-
-pub async fn list(
-    session: &Session,
-    target: &str,
-    path: &str,
-    depth: u64,
-    cancel: &CancellationToken,
-) -> Result<ListReport> {
-    let params = value::map(vec![
-        ("path", ciborium::value::Value::Text(path.to_string())),
-        ("depth", ciborium::value::Value::Integer(depth.into())),
-    ]);
-    let value = call_value(
-        session,
-        target,
-        "list",
-        params,
-        Duration::from_secs(60),
-        cancel,
-    )
-    .await?;
+    let params = value::serialize(&EditParams {
+        path: path.to_string(),
+        old_string: old_string.to_string(),
+        new_string: new_string.to_string(),
+        replace_all,
+    })?;
+    let deadline = limits::deadline("edit", &params);
+    let value = call_value(session, target, "edit", params, deadline, cancel).await?;
     value::deserialize(&value)
 }
 
@@ -205,18 +151,13 @@ pub async fn upload(
         );
     }
 
-    let params = value::map(vec![
-        (
-            "remote_path",
-            ciborium::value::Value::Text(remote.to_string()),
-        ),
-        ("size", ciborium::value::Value::Integer(meta.len().into())),
-        ("overwrite", ciborium::value::Value::Bool(overwrite)),
-        (
-            "create_parents",
-            ciborium::value::Value::Bool(create_parents),
-        ),
-    ]);
+    let params = value::serialize(&UploadParams {
+        remote_path: remote.to_string(),
+        size: Some(meta.len()),
+        overwrite,
+        create_parents,
+    })?;
+    let deadline = limits::deadline("upload", &params);
     let mut handle = session.begin(target, "upload", params).await?;
     let outcome = stream_upload(&mut handle, &mut file, meta.len(), local, cancel).await;
     let digest = match outcome {
@@ -238,7 +179,6 @@ pub async fn upload(
         })
         .await?;
 
-    let deadline = transfer_limit(meta.len()) + Duration::from_secs(10);
     let result = handle.finish(deadline, cancel).await?;
     let value = result.into_value()?;
     value::deserialize(&value)
@@ -327,16 +267,13 @@ pub async fn download(
     ));
 
     let max_file = session.max_file();
-    let params = value::map(vec![
-        (
-            "remote_path",
-            ciborium::value::Value::Text(remote.to_string()),
-        ),
-        ("max_size", ciborium::value::Value::Integer(max_file.into())),
-    ]);
+    let params = value::serialize(&DownloadParams {
+        remote_path: remote.to_string(),
+        max_size: Some(max_file),
+    })?;
+    let deadline = limits::deadline("download", &params);
     let mut handle = session.begin(target, "download", params).await?;
 
-    let deadline = transfer_limit(max_file) + Duration::from_secs(10);
     let mut created = false;
     let outcome = timeout(deadline, async {
         let mut file = tokio::fs::OpenOptions::new()
@@ -437,7 +374,7 @@ pub async fn download(
             if created {
                 let _ = tokio::fs::remove_file(&temp).await;
             }
-            bail!("下载超时")
+            bail!("下载超时");
         }
     }
 }

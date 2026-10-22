@@ -69,7 +69,6 @@ pub enum EndStatus {
     Ok,
     Error,
     Cancelled,
-    Truncated,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,14 +80,12 @@ pub struct TargetInfo {
     pub version: String,
     pub since: u64,
     pub roots: Vec<String>,
-    pub caps: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProtoError {
     pub code: String,
     pub message: String,
-    pub detail: Option<String>,
 }
 
 impl ProtoError {
@@ -96,7 +93,6 @@ impl ProtoError {
         Self {
             code: code.to_string(),
             message: message.into(),
-            detail: None,
         }
     }
 }
@@ -111,13 +107,11 @@ pub enum Msg {
         version: String,
         os: String,
         arch: String,
-        caps: Vec<String>,
         roots: Vec<String>,
     },
     Welcome {
         proto: u16,
         hub_name: String,
-        session: String,
         targets: Vec<TargetInfo>,
         server_online: bool,
     },
@@ -130,9 +124,6 @@ pub enum Msg {
     Bye {
         code: String,
         message: String,
-    },
-    TargetsSnapshot {
-        targets: Vec<TargetInfo>,
     },
     TargetEvent {
         kind: TargetEventKind,
@@ -183,54 +174,31 @@ impl Msg {
         }
     }
 
-    pub fn with_id(self, new_id: u64) -> Msg {
+    pub fn with_id(mut self, id: u64) -> Msg {
+        if let Some(slot) = self.id_mut() {
+            *slot = id;
+        }
+        self
+    }
+
+    fn id_mut(&mut self) -> Option<&mut u64> {
         match self {
-            Msg::Call {
-                target,
-                method,
-                params,
-                ..
-            } => Msg::Call {
-                id: new_id,
-                target,
-                method,
-                params,
-            },
-            Msg::Result {
-                ok, value, error, ..
-            } => Msg::Result {
-                id: new_id,
-                ok,
-                value,
-                error,
-            },
-            Msg::Chunk {
-                seq, stream, data, ..
-            } => Msg::Chunk {
-                id: new_id,
-                seq,
-                stream,
-                data,
-            },
-            Msg::End {
-                status,
-                exit_code,
-                size,
-                sha256,
-                truncated,
-                ..
-            } => Msg::End {
-                id: new_id,
-                status,
-                exit_code,
-                size,
-                sha256,
-                truncated,
-            },
-            Msg::Cancel { reason, .. } => Msg::Cancel { id: new_id, reason },
-            other => other,
+            Msg::Call { id, .. }
+            | Msg::Result { id, .. }
+            | Msg::Chunk { id, .. }
+            | Msg::End { id, .. }
+            | Msg::Cancel { id, .. } => Some(id),
+            _ => None,
         }
     }
+}
+
+pub fn target_names(targets: &[TargetInfo]) -> String {
+    targets
+        .iter()
+        .map(|target| target.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub fn now_ms() -> u64 {
@@ -238,14 +206,6 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default()
-}
-
-pub fn caps(allow_bash: bool) -> Vec<String> {
-    let mut caps = vec!["fs".to_string(), "transfer".to_string()];
-    if allow_bash {
-        caps.insert(0, "bash".to_string());
-    }
-    caps
 }
 
 #[cfg(test)]
@@ -261,7 +221,6 @@ mod tests {
             version: "0.1.0".into(),
             os: "linux".into(),
             arch: "x86_64".into(),
-            caps: caps(true),
             roots: vec!["/data".into()],
         };
         let bytes = crate::proto::frame::encode(&msg).unwrap();
@@ -281,10 +240,23 @@ mod tests {
                 version: "0.1.0".into(),
                 since: now_ms(),
                 roots: vec!["/".into()],
-                caps: caps(false),
             },
         };
         let bytes = crate::proto::frame::encode(&msg).unwrap();
         assert_eq!(msg, crate::proto::frame::decode(&bytes).unwrap());
+    }
+
+    #[test]
+    fn rewrites_id() {
+        let msg = Msg::End {
+            id: 7,
+            status: EndStatus::Ok,
+            exit_code: Some(0),
+            size: None,
+            sha256: None,
+            truncated: None,
+        };
+        assert_eq!(msg.with_id(9).id(), Some(9));
+        assert_eq!(Msg::Ping { nonce: 1 }.with_id(9).id(), None);
     }
 }
