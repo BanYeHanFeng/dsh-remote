@@ -8,7 +8,7 @@ CBOR（`ciborium`）编码，文档里的示例写成 JSON 方便阅读。
 ```text
 TCP
 └── Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s（每条连接独立握手）
-    └── 帧：u16 密文长度（大端）+ Noise 密文（明文 = u8 type + CBOR payload）
+    └── 帧：u16 密文长度（大端）+ Noise 密文（明文 = CBOR 编码的 Msg，`t` 标签即消息类型）
         └── 消息：Hello / Call / Result / Chunk / End / ...
 ```
 
@@ -43,22 +43,20 @@ initiator                          responder
 
 | type | 名称 | 方向 | 字段 |
 | --- | --- | --- | --- |
-| 0x01 | `Hello` | C→S | `proto, role, name, version, os, arch, caps[], roots[]` |
-| 0x02 | `Welcome` | S→C | `proto, hub_name, session, targets[], server_online` |
+| 0x01 | `Hello` | C→S | `proto, role, name, version, os, arch, roots[]` |
+| 0x02 | `Welcome` | S→C | `proto, hub_name, targets[], server_online` |
 | 0x03 | `Ping` | 双向 | `nonce` |
 | 0x04 | `Pong` | 双向 | `nonce` |
 | 0x05 | `Bye` | 双向 | `code, message` |
-| 0x20 | `TargetsSnapshot` | S→C | `targets[]` |
 | 0x21 | `TargetEvent` | S→C | `kind: online\|offline, target` |
 
-`role` 取 `server` / `agent`。`caps` 是字符串数组，如 `bash`、`fs`、`transfer`。
-`roots` 仅用于展示，实际限制在 agent 本地执行。
+`role` 取 `server` / `agent`。`roots` 仅用于展示，实际限制在目标本地执行。
 
 `Welcome.targets` 里 `hub` 自身也在列表中：
 
 ```json
 {"name":"hub","kind":"hub","os":"linux","arch":"x86_64","version":"0.1.0",
- "since":1730000000000,"roots":["/data"],"caps":["bash","fs","transfer"]}
+ "since":1730000000000,"roots":["/data"]}
 ```
 
 ### 3.2 调用
@@ -71,14 +69,14 @@ initiator                          responder
 | 0x13 | `End` | 双向 | `id, status, exit_code?, size?, sha256?, truncated?` |
 | 0x14 | `Cancel` | server→hub→agent | `id, reason?` |
 
-- `method` 取工具名：`bash`、`read`、`write`、`edit`、`list`、
+- `method` 取工具名：`bash`、`read`、`write`、`edit`、
   `upload`、`download`、`targets`、`shutdown`。`params` 是方法参数的 CBOR map，原样透传。
 - `shutdown` 只有 agent 处理：先回 `Result{ok:true, value:{stopping:true}}`，
   然后断开中继、退出进程；hub 自身回 `unsupported`（中继不能被远程关掉）。
-- 短结果用 `Result` 一次返回（`targets`、`read`、`write`、`edit`、`list`）。
+- 短结果用 `Result` 一次返回（`targets`、`read`、`write`、`edit`）。
 - 长结果用流：先若干 `Chunk`，最后 `End`。`bash` 的 stdout 用 `stream=1`，
   stderr 用 `stream=2`；文件传输只用 `stream=1`。
-- `End.status` 取 `ok` / `error` / `cancelled` / `truncated`；`exit_code` 只在
+- `End.status` 取 `ok` / `error` / `cancelled`；`exit_code` 只在
   `bash` 出现；文件传输带 `size` 与 `sha256`。下载的 `End` 是终态；上传的 `End`
   只是上行数据结束，agent 还会回一条 `Result`。
 - `seq` 在每个 `stream` 内独立从 0 递增，接收端按流分别拼接；重复或跳号即判定
@@ -143,7 +141,7 @@ agent  ── End{id, status:"ok", size, sha256} ──▶
 - `Chunk.data` 每片 60 KiB，`stream` 固定为 1；`seq` 从 0 连续递增。
 - 接收端按 `seq` 重排：连号即落盘并累计 sha256，超前分片先缓存（最多 512 片），
   收尾时仍有空洞就判定失败并丢弃临时文件。
-- `read`/`write`/`edit`/`list` 走单条 `Result`，编码后不超过 60 KiB。
+- `read`/`write`/`edit` 走单条 `Result`，编码后不超过 60 KiB。
 - `write` 内容上限 48 KiB，`read` 一次最多返回 32 KiB 文本；更大的数据用上传下载。
 
 ## 4. 路由
@@ -168,9 +166,14 @@ hub 内维护：
 8. agent 断开：其所有 `pending` 回 `offline`；server 断开：其所有 `pending` 给
    agent 发 `Cancel`。
 
-server 侧每个调用有独立的投递队列：连接读循环只做非阻塞入队，慢调用不会拖住
-其它调用；队列积压超过 256 条视为调用方停滞，回 `Cancel` 并放弃该调用。
+中继自身也是一个**进程内 agent**（目标名与中继同名，`kind: hub`）：它由一条内存
+通道接到同一个 `Executor` 上，因此本地调用与远程调用走同一条路由、同一套取消与
+超时逻辑，只是不需要网络。`targets` 例外，由中继直接读自己的注册表回答。
+
+server 侧每个调用有独立的有界投递队列：连接读循环只做非阻塞入队，慢调用不会拖住
+其它调用；队列积压超过 512 条视为调用方停滞，回 `Cancel` 并放弃该调用。
 连接断开时所有队列立即关闭，等待中的调用马上拿到“连接中断”而不是空等到超时。
+中继侧不为每条调用起计时器，而是由单个每秒扫描的任务清理超时项。
 
 hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`target`、`req_id`
 用于路由和审计。这正是“逐段加密”的边界。
@@ -183,11 +186,11 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 | 判定断线 | 45s 内无任何帧（含心跳） |
 | 握手超时 | 10s |
 | `Hello` 超时 | 5s |
-| 默认调用超时 | 60s；`bash` 为 `timeout_ms + 30s`；文件传输为 `300s + 大小/256KiB`，封顶 1 小时 |
+| 默认调用超时 | 60s；`bash` 为 `timeout_ms + 30s`；文件传输为 `300s + 大小/256KiB + 10s`，封顶 1 小时（三端共用 `exec::limits` 一处定义） |
 | 重连退避 | 1s 起翻倍到 30s，加 0–20% 抖动 |
 
 - server 与 agent 断线后无限重连；进程不退出（除非 stdin EOF / SIGTERM）。
-- 重连成功后重新 `Hello`，hub 重建注册表并推送 `TargetsSnapshot`。
+- 重连成功后重新 `Hello`，`Welcome.targets` 覆盖本地快照。
 - server 重连时若发现同名 agent 已换连接，后续调用直接走新连接，无需重启。
 - 同名 agent 重连时顶替旧连接：hub 先接受新连接并注册，再给仍被认为是
   在线（TCP 未关但已失联）的旧连接发 `Bye{code:"replaced"}` 并立即回收，
@@ -216,13 +219,12 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 | `unsupported` | 目标不支持该方法（例如 agent 上的 `targets`） |
 | `internal` | 未分类错误 |
 
-`Result.error` 结构：`{code, message, detail?}`。`message` 面向模型，中文；
-`detail` 只进日志，不回给模型（避免泄露绝对路径等）。
+`Result.error` 结构：`{code, message}`。`message` 面向模型，中文，不回显绝对路径。
 
 ## 7. MCP 映射
 
 对外只有 MCP 一种入口（`dsh-remote server`），工具名与内部 `Call.method` 一一对应，
-参数用 JSON 名称，内部再转 CBOR（内部 `list` 只供 CLI `file list` 使用，不暴露为 MCP 工具）：
+参数用 JSON 名称，服务端解析成 CBOR 参数结构后透传（CLI 只保留 `targets` 用于连通性自检）：
 
 | 工具 | 内部 method | 终态消息 | MCP 侧超时 |
 | --- | --- | --- | --- |
