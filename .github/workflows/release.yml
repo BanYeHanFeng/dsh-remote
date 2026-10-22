@@ -59,6 +59,8 @@ jobs:
         run: cargo fmt --check
       - name: 运行测试
         if: matrix.arch == 'amd64'
+        env:
+          RUSTFLAGS: ""
         run: cargo test --locked
       - name: 编译静态 musl
         run: cargo build --locked --release --target ${{ matrix.target }}
