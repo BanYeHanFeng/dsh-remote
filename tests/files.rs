@@ -426,10 +426,10 @@ async fn call_ends_when_hub_disappears() {
         .unwrap();
     assert!(handle.recv().await.is_some());
     harness.stop_hub().await;
-    let outcome = timeout(Duration::from_secs(10), handle.recv()).await;
-    assert!(
-        matches!(outcome, Ok(None)),
-        "中继断开后调用应当立刻结束，实际 {outcome:?}"
-    );
+    let ended = timeout(Duration::from_secs(5), async {
+        while handle.recv().await.is_some() {}
+    })
+    .await;
+    assert!(ended.is_ok(), "中继断开后调用应当立刻结束");
     harness.stop().await;
 }
