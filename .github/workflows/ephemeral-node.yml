@@ -40,7 +40,7 @@ on:
         default: latest
         type: string
 
-run-name: 临时被控端
+run-name: 临时被控端 Actions-${{ inputs.arch || 'amd64' }}
 
 permissions:
   contents: read
