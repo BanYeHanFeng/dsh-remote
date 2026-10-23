@@ -26,6 +26,14 @@ on:
         required: false
         default: /
         type: string
+      arch:
+        description: 节点架构（amd64 跑 ubuntu-latest，arm64 跑 ubuntu-24.04-arm）
+        required: false
+        default: amd64
+        type: choice
+        options:
+          - amd64
+          - arm64
       version:
         description: 二进制来源：latest 用最新发布、source 现场编译、或具体 tag
         required: false
@@ -49,11 +57,12 @@ env:
   ROOTS: ${{ inputs.roots || '/' }}
   ALLOW_BASH: ${{ inputs.allow_bash || '1' }}
   VERSION: ${{ inputs.version || 'latest' }}
+  ARCH: ${{ inputs.arch || 'amd64' }}
 
 jobs:
   node:
-    name: 临时节点
-    runs-on: ubuntu-latest
+    name: 临时节点 ${{ inputs.arch || 'amd64' }}
+    runs-on: ${{ inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     timeout-minutes: 360
     env:
       KEY: ${{ secrets.DSH_REMOTE_KEY }}
@@ -81,28 +90,39 @@ jobs:
           esac
           [ "$DURATION" -ge 1 ] && [ "$DURATION" -le 350 ] || fail "duration 需要在 1-350 之间，收到 $DURATION"
           [ -n "$ROOTS" ] || fail "roots 不能为空"
+          case "$ARCH" in
+            amd64|arm64) ;;
+            *) fail "arch 只支持 amd64 或 arm64，收到 $ARCH" ;;
+          esac
           case "$NODE_NAME" in
             *[!A-Za-z0-9._-]*) fail "目标名只能包含字母、数字、点、下划线和短横线：$NODE_NAME" ;;
           esac
           [ "${#NODE_NAME}" -le 64 ] || fail "目标名最长 64 字节"
-          echo "目标名 $NODE_NAME｜保持 $DURATION 分钟｜bash=$ALLOW_BASH｜目录 $ROOTS"
+          echo "目标名 $NODE_NAME｜架构 $ARCH｜保持 $DURATION 分钟｜bash=$ALLOW_BASH｜目录 $ROOTS"
       - name: 准备二进制
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ "$VERSION" = source ]; then
-            rustup target add x86_64-unknown-linux-musl
-            RUSTFLAGS="-C linker=rust-lld" cargo build --locked --release --target x86_64-unknown-linux-musl
-            cp target/x86_64-unknown-linux-musl/release/dsh-remote ./dsh-remote
+            case "$ARCH" in
+              arm64) target=aarch64-unknown-linux-musl ;;
+              *) target=x86_64-unknown-linux-musl ;;
+            esac
+            rustup target add "$target"
+            RUSTFLAGS="-C linker=rust-lld" cargo build --locked --release --target "$target"
+            cp "target/$target/release/dsh-remote" ./dsh-remote
           else
             tag="$VERSION"
             if [ "$tag" = latest ]; then
               tag=$(gh release list -R "$GITHUB_REPOSITORY" --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName')
             fi
             [ -n "$tag" ] || { echo "没有找到可用的发布，试试 version=source" >&2; exit 1; }
-            echo "下载 $tag 的 amd64 构建"
-            gh release download "$tag" -R "$GITHUB_REPOSITORY" --pattern dsh-remote-linux-amd64 --output ./dsh-remote
+            echo "下载 $tag 的 $ARCH 构建"
+            if ! gh release download "$tag" -R "$GITHUB_REPOSITORY" --pattern "dsh-remote-linux-$ARCH" --output ./dsh-remote; then
+              echo "发布 $tag 里没有 dsh-remote-linux-$ARCH：换 arch，或用 version=source 现场编译" >&2
+              exit 1
+            fi
           fi
           chmod 755 ./dsh-remote
           ./dsh-remote --version
