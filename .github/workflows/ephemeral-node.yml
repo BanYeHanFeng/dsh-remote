@@ -52,7 +52,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   HUB: ${{ secrets.DSH_REMOTE_HUB || vars.DSH_REMOTE_HUB || inputs.hub }}
-  NODE_NAME: Actions
+  NODE_NAME: Actions-${{ inputs.arch || 'amd64' }}
   DURATION: ${{ inputs.duration || '60' }}
   ROOTS: ${{ inputs.roots || '/' }}
   ALLOW_BASH: ${{ inputs.allow_bash || '1' }}
