@@ -6,7 +6,9 @@ use serde_json::{json, Value};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::actions::{GhClient, StartRequest, DEFAULT_DURATION_MINUTES, MAX_DURATION_MINUTES};
+use crate::actions::{
+    GhClient, StartRequest, DEFAULT_ARCH, DEFAULT_DURATION_MINUTES, MAX_DURATION_MINUTES,
+};
 use crate::call;
 use crate::exec::limits;
 use crate::proto::params::BashParams;
@@ -162,6 +164,7 @@ pub fn list() -> Value {
                     "allow_bash": { "type": "boolean", "description": "start 时是否允许 bash 工具，默认 true" },
                     "roots": { "type": "string", "description": "start 时允许访问的目录，冒号分隔，默认 /" },
                     "version": { "type": "string", "description": "start 时的二进制来源：latest 用最新发布、source 现场编译、或具体 tag" },
+                    "arch": { "type": "string", "enum": ["amd64", "arm64"], "description": format!("start 时的节点架构：amd64 走 ubuntu-latest，arm64 走 ubuntu-24.04-arm（公共仓库免费），默认 {DEFAULT_ARCH}") },
                     "hub": { "type": "string", "description": "start 时覆盖中继地址，默认用本会话连接的中继" },
                     "sync_key": { "type": "boolean", "description": "start 前把房间 Key 写入仓库密钥，默认 true；关掉则要求仓库里已有该密钥" },
                     "sync_hub": { "type": "boolean", "description": "start 前把中继地址写入仓库密钥（日志里不会出现），默认 true；关掉则要求仓库里已有该密钥" },
@@ -463,6 +466,7 @@ async fn actions(session: &Session, args: &Value, cancel: &CancellationToken) ->
             }
             let roots = optional_str(args, "roots").unwrap_or_else(|| "/".to_string());
             let version = optional_str(args, "version").unwrap_or_else(|| "latest".to_string());
+            let arch = optional_str(args, "arch").unwrap_or_else(|| DEFAULT_ARCH.to_string());
             let request = StartRequest {
                 hub: &hub,
                 duration_minutes: optional_u64(args, "duration_minutes")
@@ -470,6 +474,7 @@ async fn actions(session: &Session, args: &Value, cancel: &CancellationToken) ->
                 allow_bash: optional_bool(args, "allow_bash").unwrap_or(true),
                 roots: &roots,
                 version: &version,
+                arch: &arch,
                 sync_key: optional_bool(args, "sync_key").unwrap_or(true),
                 sync_hub: optional_bool(args, "sync_hub").unwrap_or(true),
             };

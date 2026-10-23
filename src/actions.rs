@@ -21,6 +21,7 @@ const STOP_POLL: Duration = Duration::from_secs(5);
 pub const DEFAULT_DURATION_MINUTES: u64 = 60;
 pub const MAX_DURATION_MINUTES: u64 = 350;
 pub const DEFAULT_NODE_NAME: &str = "Actions";
+pub const DEFAULT_ARCH: &str = "amd64";
 pub const RUN_NAME_PREFIX: &str = "临时被控端 ";
 
 pub struct GhClient {
@@ -52,6 +53,7 @@ pub struct StartRequest<'a> {
     pub allow_bash: bool,
     pub roots: &'a str,
     pub version: &'a str,
+    pub arch: &'a str,
     pub sync_key: bool,
     pub sync_hub: bool,
 }
@@ -126,6 +128,8 @@ impl GhClient {
         if request.roots.trim().is_empty() {
             bail!("roots 不能为空");
         }
+        let arch = normalize_arch(request.arch)
+            .ok_or_else(|| anyhow!("arch 只支持 amd64 或 arm64，收到 {}", request.arch.trim()))?;
         if !is_safe_token(&self.cfg.git_ref) {
             bail!("GH_REF 含非法字符: {}", self.cfg.git_ref);
         }
@@ -167,6 +171,7 @@ impl GhClient {
             ),
             ("roots", request.roots.trim().to_string()),
             ("version", request.version.trim().to_string()),
+            ("arch", arch.to_string()),
         ];
         for (name, value) in inputs {
             args.push("-f".to_string());
@@ -189,6 +194,7 @@ impl GhClient {
         );
         let _ = writeln!(out, "运行     #{} 状态 {}", run.id, describe_status(&run));
         let _ = writeln!(out, "节点名   {node}");
+        let _ = writeln!(out, "架构     {arch}");
         let _ = writeln!(
             out,
             "中继     已写入仓库密钥 {}（不在运行日志里出现）",
@@ -549,6 +555,14 @@ fn describe_status(run: &RunSummary) -> String {
     }
 }
 
+fn normalize_arch(text: &str) -> Option<&'static str> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "" | "amd64" | "x86" | "x86_64" | "x64" => Some(DEFAULT_ARCH),
+        "arm64" | "aarch64" => Some("arm64"),
+        _ => None,
+    }
+}
+
 fn is_safe_token(text: &str) -> bool {
     !text.is_empty()
         && text
@@ -640,5 +654,15 @@ mod tests {
         assert!(!is_safe_token(""));
         assert!(!is_safe_token("a b"));
         assert!(!is_safe_token("a;rm"));
+    }
+
+    #[test]
+    fn normalizes_arch_aliases() {
+        assert_eq!(normalize_arch(""), Some(DEFAULT_ARCH));
+        assert_eq!(normalize_arch("amd64"), Some("amd64"));
+        assert_eq!(normalize_arch("X86_64"), Some("amd64"));
+        assert_eq!(normalize_arch(" aarch64 "), Some("arm64"));
+        assert_eq!(normalize_arch("arm64"), Some("arm64"));
+        assert_eq!(normalize_arch("riscv64"), None);
     }
 }

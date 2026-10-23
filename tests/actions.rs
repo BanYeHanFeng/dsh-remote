@@ -80,6 +80,7 @@ fn request<'a>(hub: &'a str) -> StartRequest<'a> {
         allow_bash: true,
         roots: "/",
         version: "latest",
+        arch: "amd64",
         sync_key: true,
         sync_hub: true,
     }
@@ -106,6 +107,7 @@ async fn dispatches_syncs_and_stops_gracefully() {
     let out = &started.text;
     assert!(out.contains("#2222"), "{out}");
     assert!(out.contains("15 分钟后自动下线"), "{out}");
+    assert!(out.contains("amd64"), "{out}");
 
     let secrets = fs::read_to_string(dir.join("secret.txt")).unwrap();
     assert!(secrets.contains("room-key-123456"), "{secrets}");
@@ -121,6 +123,7 @@ async fn dispatches_syncs_and_stops_gracefully() {
     assert!(calls.contains("inputs[duration]=15"));
     assert!(calls.contains("inputs[allow_bash]=1"));
     assert!(calls.contains("inputs[version]=latest"));
+    assert!(calls.contains("inputs[arch]=amd64"));
 
     let online = vec!["Actions".to_string()];
     let status = client.status(10, &online, &cancel).await.unwrap();
@@ -181,6 +184,7 @@ async fn requires_repo_and_sane_duration() {
         allow_bash: true,
         roots: "/",
         version: "latest",
+        arch: "amd64",
         sync_key: false,
         sync_hub: false,
     };
@@ -189,5 +193,21 @@ async fn requires_repo_and_sane_duration() {
         .await
         .unwrap_err();
     assert!(format!("{err:#}").contains("duration_minutes"), "{err:#}");
+
+    let bad_arch = StartRequest {
+        hub: "1.2.3.4:7000",
+        duration_minutes: 15,
+        allow_bash: true,
+        roots: "/",
+        version: "latest",
+        arch: "mips",
+        sync_key: false,
+        sync_hub: false,
+    };
+    let err = client
+        .start(&bad_arch, "room-key-123456", &cancel)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("arch"), "{err:#}");
     fs::remove_dir_all(&dir).ok();
 }
