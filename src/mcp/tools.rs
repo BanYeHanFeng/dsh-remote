@@ -526,7 +526,7 @@ async fn actions(session: &Session, args: &Value, cancel: &CancellationToken) ->
                     )
                     .await;
                 match result {
-                    Ok(_) => {
+                    Ok(reply) if reply.ok => {
                         online.push(target.node.clone());
                         pending.push(target.run_id);
                         let _ = writeln!(
@@ -534,6 +534,19 @@ async fn actions(session: &Session, args: &Value, cancel: &CancellationToken) ->
                             "已通知节点 {}（#{}）自行退出",
                             target.node, target.run_id
                         );
+                    }
+                    Ok(reply) => {
+                        let reason = reply
+                            .error
+                            .as_ref()
+                            .map(|err| format!("{} {}", err.code, err.message))
+                            .unwrap_or_else(|| "节点没有接受关停指令".to_string());
+                        let _ = writeln!(
+                            text,
+                            "节点 {}（#{}）没接受关停指令（{reason}），直接取消运行",
+                            target.node, target.run_id
+                        );
+                        let _ = client.cancel_run(target.run_id, cancel).await;
                     }
                     Err(err) => {
                         let _ = writeln!(
