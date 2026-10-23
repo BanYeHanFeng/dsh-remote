@@ -182,7 +182,7 @@ impl GhClient {
             .context("派发工作流失败（确认工作流文件已在 GH_REF 分支上）")?;
 
         let run = self.wait_new_run(&repo, before, cancel).await?;
-        let node = default_node_name();
+        let node = run.node_name();
 
         let mut out = String::new();
         let _ = writeln!(out, "已派发 Actions 临时被控端");
