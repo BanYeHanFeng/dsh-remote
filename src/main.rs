@@ -1,4 +1,5 @@
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
@@ -10,13 +11,25 @@ use dsh_remote::proto::{TargetInfo, TargetKind};
 use dsh_remote::session::Session;
 use dsh_remote::{agent, call, config, hub, logging, server};
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    if let Err(err) = run().await {
-        eprintln!("错误: {err:#}");
-        return ExitCode::FAILURE;
-    }
-    ExitCode::SUCCESS
+const RUNTIME_DRAIN: Duration = Duration::from_secs(1);
+
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("错误: 初始化运行时失败: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = match runtime.block_on(run()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("错误: {err:#}");
+            ExitCode::FAILURE
+        }
+    };
+    runtime.shutdown_timeout(RUNTIME_DRAIN);
+    code
 }
 
 async fn run() -> Result<()> {
