@@ -66,7 +66,7 @@ pub fn list() -> Value {
         },
         {
             "name": "bash",
-            "description": "在目标上同一个持久的 bash 里执行命令：当前目录、导出的环境变量等状态在调用之间保留。命令超过目标配置的超时（默认 300 秒）会杀掉整个进程组并重置 Shell；返回内容超过字符上限会被截断。交互式程序（vim、top）不可用。",
+            "description": "在目标上同一个持久的 bash 里执行命令：当前目录、导出的环境变量等状态在调用之间保留。调用这个工具时，command 参数的内容不需要做 XML 转义。想查看文件的某一段行区间（例如第 10-25 行）时，试 sed -n 10,25p /path/to/the/file。命令超过目标的 SHELL_TIMEOUT_MS（默认 300 秒）或 Shell 退出会重置 Shell；返回内容超过字符上限会被截断。交互式程序（vim、top）不可用。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
