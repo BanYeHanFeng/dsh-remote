@@ -286,7 +286,7 @@ impl Filesystem for Fs {
 
     fn create(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -305,6 +305,7 @@ impl Filesystem for Fs {
         let inner = self.inner.clone();
         let ttl = self.inner.ttl();
         let name = name.to_string();
+        let (uid, gid) = (req.uid(), req.gid());
         self.offload(async move {
             let outcome = async {
                 let parent_path = inner
@@ -324,8 +325,8 @@ impl Filesystem for Fs {
                     atime_ms: now_ms(),
                     ctime_ms: now_ms(),
                     perm: mode & !umask & 0o7777,
-                    uid: 0,
-                    gid: 0,
+                    uid,
+                    gid,
                     nlink: 1,
                 };
                 drop(guard);
