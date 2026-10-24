@@ -15,9 +15,10 @@ TCP
 - 握手与传输阶段都用 `u16` 长度前缀；Noise 单条消息上限 65535 字节，明文最大 65519。
 - 应用层分片：`Chunk.data` 每片 60 KiB，CBOR 里编码为字节串（不是整数数组），
   连同头部仍小于明文上限；接收端按 `seq` 拼接，允许乱序到达后重排。
-- 版本字段 `proto: 3` 放在 `Hello`/`Welcome`；不匹配由 hub 回 `Bye{code:"proto_mismatch"}`
-  后断开。3 删掉了 `read`/`write`/`edit`，`bash` 改成单条 `Result`，不互通，三端需要
-  一起升级。
+- 版本字段 `proto: 4` 放在 `Hello`/`Welcome`；不匹配由 hub 回 `Bye{code:"proto_mismatch"}`
+  后断开。3 删掉了 `read`/`write`/`edit`，`bash` 改成单条 `Result`；4 给 `Chunk`
+  加了 `packed`，`Chunk.data` 可能是压缩块，旧端会把压缩块当原文写下去，
+  所以必须升版本，三端一起升级。
 - 每条连接有两条出站队列：`Chunk`/`End`/`Result` 走数据队列并按入队顺序发送，
   `Ping`/`Pong`/`Bye`/`Cancel` 等走控制队列优先发送。写线程按批合并帧
   （一次 `write_all` + 一次 `flush`），心跳不会排在成兆的数据后面。
@@ -66,7 +67,7 @@ initiator                          responder
 | --- | --- | --- | --- |
 | 0x10 | `Call` | server→hub | `id, target, method, params` |
 | 0x11 | `Result` | hub→server | `id, ok, value?, error?` |
-| 0x12 | `Chunk` | 双向 | `id, seq, stream: 1\|2, data` |
+| 0x12 | `Chunk` | 双向 | `id, seq, stream: 1\|2, packed?, data` |
 | 0x13 | `End` | 双向 | `id, status, size?, sha256?` |
 | 0x14 | `Cancel` | server→hub→agent | `id, reason?` |
 
@@ -76,6 +77,9 @@ initiator                          responder
   然后断开中继、退出进程；hub 自身回 `unsupported`（中继不能被远程关掉）。
 - 短结果用 `Result` 一次返回（`targets`、`bash`、`fs`）。
 - 长结果用流：先若干 `Chunk`，最后 `End`；目前只有文件传输用流，且只用 `stream=1`。
+- `Chunk.packed`（默认 false）表示 `data` 是 zstd 帧：发送端按 `PACK` 开关尝试压，
+  压缩后省不到 `PACK_GAIN`（默认 12%）就发原文；接收端先解压再按 `seq` 拼接，
+  `size` 与 `sha256` 始终按解压后的原文计算。
 - `End.status` 取 `ok` / `error` / `cancelled`；文件传输带 `size` 与 `sha256`。
   下载的 `End` 是终态；上传的 `End` 只是上行数据结束，agent 还会回一条 `Result`。
 - `seq` 在每个 `stream` 内独立从 0 递增，接收端按流分别拼接；重复或跳号即判定
@@ -118,7 +122,7 @@ server ── Call{id, target, method:"upload",
              params:{remote_path,size,overwrite,create_parents?}} ──▶
 server ── Chunk{id, seq, stream:1} ... ──▶
 server ── End{id, status:"ok", size, sha256} ──▶
-agent  ── Result{ok:true, value:{path,size,sha256}} ──▶
+agent  ── Result{ok:true, value:{path,size,sha256,entry?}} ──▶
 ```
 
 - hub 为 server 发来的 `Chunk`/`End` 按 `(server_id, id)` 找到 `call_id` 后转发；
@@ -129,7 +133,8 @@ agent  ── Result{ok:true, value:{path,size,sha256}} ──▶
 - `Call.params.size` 用于提前拒绝超过 `MAX_FILE` 的请求；`End.size` 与
   `End.sha256` 是最终校验依据。校验失败或取消时删除临时文件。
 - 校验通过后 `rename` 到目标路径；`overwrite=false` 时目标已存在直接回
-  `conflict`。
+  `conflict`。回包里的 `entry` 是改名后 `symlink_metadata` 的属性，挂载回传时
+  直接拿它更新本地缓存，省掉一次 `fs stat` 往返。
 
 下载（agent → hub → server）：
 
@@ -155,7 +160,7 @@ hub    ── Call{src_call, target:source, method:"download",
              params:{remote_path:source_path,max_size}} ──▶
 source ── Chunk{src_call, seq, stream:1} ──▶ hub ── Chunk{dest_call, seq} ──▶ dest
 source ── End{src_call, status:"ok", size, sha256} ──▶ hub ── End{dest_call, …} ──▶ dest
-dest   ── Result{ok:true, value:{path,size,sha256}} ──▶ hub ── Result ──▶ server
+dest   ── Result{ok:true, value:{path,size,sha256,entry?}} ──▶ hub ── Result ──▶ server
 ```
 
 - `transfer` 只有 hub 处理，agent 收到回 `unsupported`。hub 把它拼成两条普通调用，
@@ -330,7 +335,9 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 - 新增消息类型不改变已有语义；未知 type 记录日志后忽略，连接不断开。
 - 新增 `Call.method` 同理：旧被控端对 `fs` 回 `unsupported`，`proto` 不升版本，
   所以 `mount` 可以只升级本机一端。
-- `Hello.proto` 只做“同主版本可通信”的粗校验；字段用 CBOR 可选字段扩展。
+- `Hello.proto` 只做“同主版本可通信”的粗校验；只增不删的字段用 CBOR 可选字段追加，
+  一旦新字段改变已有字段的解释方式（例如 `Chunk.packed` 改变 `Chunk.data` 的含义），
+  就必须升 `proto`。
 - 端到端加密演进：把 `Call.params` 与 `Chunk.data` 换成 server 与 agent 协商的
   不透明密文，hub 只保留 `target`、`req_id`、`method` 用于路由；消息表不推翻。
 - MCP 层协议版本走 MCP 自己的 `initialize` 协商，与内部协议版本无关。
