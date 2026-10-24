@@ -166,6 +166,9 @@ pub async fn call(
         Some(Value::Null) | None => json!({}),
         Some(_) => return ToolOutput::error("arguments 必须是对象"),
     };
+    if name != "mount" && name != "targets" {
+        mounts.settle().await;
+    }
     let result = match name {
         "targets" => Ok(targets(session).await),
         "bash" => bash(session, &args, cancel).await,
