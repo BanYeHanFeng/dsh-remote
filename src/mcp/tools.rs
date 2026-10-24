@@ -82,49 +82,6 @@ pub fn list() -> Value {
             }
         },
         {
-            "name": "read",
-            "description": "读取远端文本文件，带行号返回，便于后续 edit。二进制文件只返回大小与 mtime，内容请用 download。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string", "description": TARGET_SCHEMA },
-                    "path": { "type": "string", "description": "远端文件路径，必须在 ROOTS 内" },
-                    "offset": { "type": "integer", "description": "跳过前 N 行，续读时传上次返回的 next_offset" },
-                    "limit": { "type": "integer", "description": "最多读取的行数，默认 2000，上限 5000" }
-                },
-                "required": ["target", "path"]
-            }
-        },
-        {
-            "name": "write",
-            "description": "整体写入远端文本文件：先写临时文件再原子替换，适合新建或小文件覆盖，内容上限 48 KiB，更大的文件用 upload。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string", "description": TARGET_SCHEMA },
-                    "path": { "type": "string", "description": "远端文件路径，必须在 ROOTS 内" },
-                    "content": { "type": "string", "description": "完整文件内容，上限 48 KiB" },
-                    "create_parents": { "type": "boolean", "description": "自动创建缺失的父目录" }
-                },
-                "required": ["target", "path", "content"]
-            }
-        },
-        {
-            "name": "edit",
-            "description": "在远端文本文件里做字面替换：默认要求 old_string 唯一匹配；replace_all 为真时替换全部。适合改配置项，避免整文件覆盖。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string", "description": TARGET_SCHEMA },
-                    "path": { "type": "string", "description": "远端文件路径，必须在 ROOTS 内" },
-                    "old_string": { "type": "string", "description": "要替换的原文，必须与文件内容逐字一致" },
-                    "new_string": { "type": "string", "description": "替换后的文本，可为空字符串" },
-                    "replace_all": { "type": "boolean", "description": "替换所有匹配，默认只替换唯一匹配" }
-                },
-                "required": ["target", "path", "old_string", "new_string"]
-            }
-        },
-        {
             "name": "upload",
             "description": "把 DSH 本机的文件分块上传到远端：先写 .part，按总字节数与 sha256 校验后原子改名。默认拒绝覆盖已有文件。",
             "inputSchema": {
@@ -190,9 +147,6 @@ pub async fn call(session: &Session, params: &Value, cancel: &CancellationToken)
     let result = match name {
         "targets" => Ok(targets(session).await),
         "bash" => bash(session, &args, cancel).await,
-        "read" => read(session, &args, cancel).await,
-        "write" => write(session, &args, cancel).await,
-        "edit" => edit(session, &args, cancel).await,
         "upload" => upload(session, &args, cancel).await,
         "download" => download(session, &args, cancel).await,
         "actions" => actions(session, &args, cancel).await,
@@ -313,95 +267,6 @@ async fn bash(session: &Session, args: &Value, cancel: &CancellationToken) -> To
 
     let failed = !result.ok || result.exit_code.map(|code| code != 0).unwrap_or(false);
     Ok(ToolOutput::ok(out).mark(failed))
-}
-
-async fn read(session: &Session, args: &Value, cancel: &CancellationToken) -> ToolResult {
-    let target = require_str(args, "target")?;
-    let path = require_str(args, "path")?;
-    let offset = optional_u64(args, "offset").unwrap_or(0);
-    let limit = optional_u64(args, "limit").unwrap_or(2000).max(1);
-    let report = call::read(session, &target, &path, offset, limit, cancel)
-        .await
-        .map_err(|err| describe(&err))?;
-
-    if report.binary {
-        return Ok(ToolOutput::ok(format!(
-            "{} 是二进制文件（{}，mtime {}），只返回元信息。需要内容请用 download 拉到本地再读。",
-            report.path,
-            human_size(report.size),
-            format_time(report.mtime)
-        )));
-    }
-
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "{}（{}，从第 {} 行起，最多 {} 行）",
-        report.path,
-        human_size(report.size),
-        offset + 1,
-        limit
-    );
-    if report.lines.is_empty() {
-        let _ = writeln!(out, "（文件末尾，没有内容）");
-    }
-    for (index, line) in report.lines.iter().enumerate() {
-        let _ = writeln!(out, "{:>6}\t{line}", offset + index as u64 + 1);
-    }
-    if report.truncated {
-        let _ = writeln!(out, "[有超长行被截断]");
-    }
-    if !report.eof {
-        let _ = writeln!(
-            out,
-            "[还有更多内容，继续读取用 offset={}]",
-            report.next_offset
-        );
-    }
-    Ok(ToolOutput::ok(out))
-}
-
-async fn write(session: &Session, args: &Value, cancel: &CancellationToken) -> ToolResult {
-    let target = require_str(args, "target")?;
-    let path = require_str(args, "path")?;
-    let content = required_str(args, "content")?;
-    let create_parents = optional_bool(args, "create_parents").unwrap_or(false);
-    let report = call::write(session, &target, &path, &content, create_parents, cancel)
-        .await
-        .map_err(|err| describe(&err))?;
-    Ok(ToolOutput::ok(format!(
-        "已写入 {}（{}，sha256 {}，{}）",
-        report.path,
-        human_size(report.size),
-        short_hash(&report.sha256),
-        if report.created { "新建" } else { "覆盖" }
-    )))
-}
-
-async fn edit(session: &Session, args: &Value, cancel: &CancellationToken) -> ToolResult {
-    let target = require_str(args, "target")?;
-    let path = require_str(args, "path")?;
-    let old_string = required_str(args, "old_string")?;
-    let new_string = required_str(args, "new_string")?;
-    let replace_all = optional_bool(args, "replace_all").unwrap_or(false);
-    let report = call::edit(
-        session,
-        &target,
-        &path,
-        &old_string,
-        &new_string,
-        replace_all,
-        cancel,
-    )
-    .await
-    .map_err(|err| describe(&err))?;
-    Ok(ToolOutput::ok(format!(
-        "已编辑 {}（替换 {} 处，{}，sha256 {}）",
-        report.path,
-        report.replacements,
-        human_size(report.size),
-        short_hash(&report.sha256)
-    )))
 }
 
 async fn upload(session: &Session, args: &Value, cancel: &CancellationToken) -> ToolResult {
@@ -737,30 +602,20 @@ fn human_duration(ms: u64) -> String {
     format!("{}d{}h", hours / 24, hours % 24)
 }
 
-fn format_time(ms: u64) -> String {
-    crate::time::format_epoch((ms / 1000) as i64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_has_eight_entries() {
+    fn tools_list_covers_every_tool() {
         let tools = list();
         let entries = tools.as_array().unwrap();
-        assert_eq!(entries.len(), 8);
+        assert_eq!(entries.len(), 5);
         for entry in entries {
             assert!(entry.get("name").is_some());
             assert!(entry.get("description").is_some());
             assert_eq!(entry["inputSchema"]["type"], "object");
         }
-    }
-
-    #[test]
-    fn formats_time() {
-        assert_eq!(format_time(0), "1970-01-01 00:00:00 UTC");
-        assert_eq!(format_time(1_700_000_000_000), "2023-11-14 22:13:20 UTC");
     }
 
     #[test]

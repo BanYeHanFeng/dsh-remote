@@ -21,15 +21,13 @@ const EOF_DRAIN: Duration = Duration::from_secs(5);
 
 const INSTRUCTIONS: &str = "\
 这些工具作用于远端主机：先用 targets 查看在线目标（中继自身与各被控端），把返回的\
-名字作为后续工具的 target 参数。bash 通过 sh -c 一次性执行命令，超过 timeout_ms \
-会杀掉整个进程组；read/write/edit 只能访问目标上的 ROOTS 白名单目录，\
-越界与符号链接逃逸都会被拒绝；超过 48 KiB 的内容用 upload/download 传文件，不要\
-用 write。远端首次排错建议顺序：targets → bash（uname -a、ps、systemctl status）→ \
-read（看配置文件）。工具失败时 isError 为真，错误码说明原因（unknown_target、\
-offline、timeout、denied、too_large、busy、io、protocol）。需要临时算力时用 \
-actions 在 GitHub Actions 上开一个一次性被控端（目标名 Actions，注册进房间后\
-即可当普通 target 用），用完 actions stop 关掉（直接向节点发 shutdown，节点自行退出，\
-运行保持成功），别让它白烧额度。";
+名字作为后续工具的 target 参数。bash 在目标上执行命令，超过超时会杀掉整个进程组；\
+文件只能在该目标上的 ROOTS 白名单目录内读写，越界与符号链接逃逸都会被拒绝；\
+本机与远端、远端与远端之间搬文件用 upload/download。工具失败时 isError 为真，\
+错误码说明原因（unknown_target、offline、timeout、denied、too_large、busy、io、\
+protocol）。需要临时算力时用 actions 在 GitHub Actions 上开一个一次性被控端\
+（目标名 Actions，注册进房间后即可当普通 target 用），用完 actions stop 关掉\
+（直接向节点发 shutdown，节点自行退出，运行保持成功），别让它白烧额度。";
 
 pub async fn serve(session: &Session, shutdown: CancellationToken) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<Value>(64);

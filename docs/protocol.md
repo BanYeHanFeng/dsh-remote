@@ -69,11 +69,11 @@ initiator                          responder
 | 0x13 | `End` | 双向 | `id, status, exit_code?, size?, sha256?, truncated?` |
 | 0x14 | `Cancel` | server→hub→agent | `id, reason?` |
 
-- `method` 取工具名：`bash`、`read`、`write`、`edit`、
-  `upload`、`download`、`targets`、`shutdown`。`params` 是方法参数的 CBOR map，原样透传。
+- `method` 取工具名：`bash`、`upload`、`download`、`targets`、`shutdown`。
+  `params` 是方法参数的 CBOR map，原样透传。
 - `shutdown` 只有 agent 处理：先回 `Result{ok:true, value:{stopping:true}}`，
   然后断开中继、退出进程；hub 自身回 `unsupported`（中继不能被远程关掉）。
-- 短结果用 `Result` 一次返回（`targets`、`read`、`write`、`edit`）。
+- 短结果用 `Result` 一次返回（`targets`）。
 - 长结果用流：先若干 `Chunk`，最后 `End`。`bash` 的 stdout 用 `stream=1`，
   stderr 用 `stream=2`；文件传输只用 `stream=1`。
 - `End.status` 取 `ok` / `error` / `cancelled`；`exit_code` 只在
@@ -141,8 +141,7 @@ agent  ── End{id, status:"ok", size, sha256} ──▶
 - `Chunk.data` 每片 60 KiB，`stream` 固定为 1；`seq` 从 0 连续递增。
 - 接收端按 `seq` 重排：连号即落盘并累计 sha256，超前分片先缓存（最多 512 片），
   收尾时仍有空洞就判定失败并丢弃临时文件。
-- `read`/`write`/`edit` 走单条 `Result`，编码后不超过 60 KiB。
-- `write` 内容上限 48 KiB，`read` 一次最多返回 32 KiB 文本；更大的数据用上传下载。
+- `Result` 编码后不超过 60 KiB；更大的数据用上传下载。
 
 ## 4. 路由
 
@@ -210,8 +209,8 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 | `timeout` | hub 或本地执行超时 |
 | `cancelled` | 调用方主动取消 |
 | `denied` | 路径越界、bash 被禁用、权限不足 |
-| `not_found` | 路径不存在、`edit` 没有匹配 |
-| `conflict` | 目标已存在且未允许覆盖、`edit` 匹配到多处 |
+| `not_found` | 路径不存在 |
+| `conflict` | 目标已存在且未允许覆盖 |
 | `too_large` | 输出或文件超上限 |
 | `busy` | 并发执行数达到上限 |
 | `io` | 本地文件/进程 IO 错误 |
@@ -230,9 +229,6 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 | --- | --- | --- | --- |
 | `targets` | `targets`（发给 hub） | `Result` | 用本地快照，断线也应答 |
 | `bash` | `bash` | `Chunk` + `End` | `timeout_ms + 15s`，上限 600s |
-| `read` | `read` | `Result` | 60s |
-| `write` | `write` | `Result` | 60s |
-| `edit` | `edit` | `Result` | 60s |
 | `upload` | `upload` | 上行 `Chunk`+`End`，回程 `Result` | `300s + 大小/256KiB` |
 | `download` | `download` | 下行 `Chunk`+`End` | `300s + 大小/256KiB` |
 | `actions stop`（内部） | `shutdown`（发给目标节点） | `Result` | 10s |

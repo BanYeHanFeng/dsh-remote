@@ -174,7 +174,7 @@ async fn initialize_and_tools_list() {
         .collect();
     assert_eq!(
         names,
-        vec!["targets", "bash", "read", "write", "edit", "upload", "download", "actions"]
+        vec!["targets", "bash", "upload", "download", "actions"]
     );
     let bash = &listing["result"]["tools"][1];
     assert_eq!(
@@ -237,38 +237,6 @@ async fn tools_run_against_agent_and_hub() {
         "超时调用应快速返回，实际 {:?}",
         started.elapsed()
     );
-
-    let path = harness.remote("notes.txt");
-    let (text, is_error) = mcp
-        .tool(
-            "write",
-            json!({ "target": "nas", "path": path, "content": "alpha\nbeta\n" }),
-        )
-        .await;
-    assert!(!is_error, "{text}");
-    assert!(text.contains("已写入"), "{text}");
-
-    let (text, is_error) = mcp
-        .tool("read", json!({ "target": "nas", "path": path }))
-        .await;
-    assert!(!is_error, "{text}");
-    assert!(text.contains("alpha") && text.contains("beta"), "{text}");
-    assert!(text.contains("     1\t"), "应有行号: {text}");
-
-    let (text, is_error) = mcp
-        .tool(
-            "edit",
-            json!({ "target": "nas", "path": path, "old_string": "beta", "new_string": "gamma" }),
-        )
-        .await;
-    assert!(!is_error, "{text}");
-    assert!(text.contains("替换 1 处"), "{text}");
-
-    let (text, is_error) = mcp
-        .tool("read", json!({ "target": "nas", "path": "/etc/passwd" }))
-        .await;
-    assert!(is_error, "{text}");
-    assert!(text.contains("denied"), "{text}");
 
     mcp.close().await;
     harness.stop().await;

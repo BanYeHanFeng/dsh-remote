@@ -1,7 +1,6 @@
 pub mod bash;
 pub mod download;
 pub mod error;
-pub mod files;
 pub mod limits;
 pub mod paths;
 pub mod transfer;
@@ -18,9 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::net::Sink;
-use crate::proto::params::{
-    BashParams, DownloadParams, EditParams, ReadParams, UploadParams, WriteParams,
-};
+use crate::proto::params::{BashParams, DownloadParams, UploadParams};
 use crate::proto::value;
 use crate::proto::{Msg, ProtoError};
 use error::{ToolError, ToolResult};
@@ -74,7 +71,6 @@ impl Executor {
         debug!(call_id, method, "执行工具");
         match method {
             "bash" => self.dispatch_bash(call_id, params, sink).await,
-            "read" | "write" | "edit" => self.dispatch_file(call_id, method, params, sink).await,
             "upload" => self.dispatch_upload(call_id, params, sink).await,
             "download" => self.dispatch_download(call_id, params, sink).await,
             "shutdown" => self.dispatch_shutdown(call_id, sink).await,
@@ -172,42 +168,6 @@ impl Executor {
                     let message = format!("执行命令失败: {err:#}");
                     warn!(error = %message, "执行命令失败");
                     reply_error(&sink, call_id, "io", message).await;
-                }
-            }
-            remove_running(&running, call_id);
-            drop(permit);
-        });
-    }
-
-    async fn dispatch_file(&self, call_id: u64, method: &str, params: Value, sink: Sink) {
-        let permit = match self.slots.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                reply_error(&sink, call_id, "busy", "并发执行数已达上限").await;
-                return;
-            }
-        };
-        let roots = self.settings.roots.clone();
-        let max_file = self.settings.max_file;
-        let method = method.to_string();
-        self.track(call_id, CancellationToken::new(), None);
-        let running = self.running.clone();
-
-        tokio::spawn(async move {
-            let joined =
-                tokio::task::spawn_blocking(move || run_file(&method, &roots, max_file, &params))
-                    .await;
-            match joined {
-                Ok(Ok(report)) => reply_value(&sink, call_id, report).await,
-                Ok(Err(err)) => reply_error(&sink, call_id, err.code, err.message).await,
-                Err(err) => {
-                    reply_error(
-                        &sink,
-                        call_id,
-                        "internal",
-                        format!("文件操作任务失败: {err}"),
-                    )
-                    .await;
                 }
             }
             remove_running(&running, call_id);
@@ -358,55 +318,6 @@ impl Executor {
 
 fn parse<T: DeserializeOwned>(params: &Value) -> ToolResult<T> {
     value::deserialize(params).map_err(|err| ToolError::protocol(format!("参数不合法: {err:#}")))
-}
-
-fn run_file(method: &str, roots: &[String], max_file: u64, params: &Value) -> ToolResult<Value> {
-    match method {
-        "read" => {
-            let params: ReadParams = parse(params)?;
-            ensure_path(&params.path)?;
-            let limit = params.limit.unwrap_or(files::DEFAULT_READ_LINES);
-            serialize(&files::read(roots, &params.path, params.offset, limit)?)
-        }
-        "write" => {
-            let params: WriteParams = parse(params)?;
-            ensure_path(&params.path)?;
-            serialize(&files::write(
-                roots,
-                &params.path,
-                &params.content,
-                params.create_parents,
-                max_file,
-            )?)
-        }
-        "edit" => {
-            let params: EditParams = parse(params)?;
-            ensure_path(&params.path)?;
-            serialize(&files::edit(
-                roots,
-                &params.path,
-                &params.old_string,
-                &params.new_string,
-                params.replace_all,
-                max_file,
-            )?)
-        }
-        other => Err(ToolError::new(
-            "unsupported",
-            format!("不支持的文件方法: {other}"),
-        )),
-    }
-}
-
-fn ensure_path(path: &str) -> ToolResult<()> {
-    if path.trim().is_empty() {
-        return Err(ToolError::protocol("缺少 path 参数"));
-    }
-    Ok(())
-}
-
-fn serialize<T: serde::Serialize>(value: &T) -> ToolResult<Value> {
-    value::serialize(value).map_err(|err| ToolError::internal(format!("序列化结果失败: {err:#}")))
 }
 
 fn remove_running(running: &Arc<Mutex<HashMap<u64, Running>>>, call_id: u64) {

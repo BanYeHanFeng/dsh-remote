@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn unknown_method_gets_floor() {
-        assert_eq!(deadline("read", &value::empty_map()), CALL_TIMEOUT_FLOOR);
+        assert_eq!(deadline("targets", &value::empty_map()), CALL_TIMEOUT_FLOOR);
     }
 
     #[test]

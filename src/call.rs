@@ -9,10 +9,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::config::ClientConfig;
-use crate::exec::files::{EditReport, ReadReport, WriteReport, MAX_WRITE_BYTES};
 use crate::exec::limits;
 use crate::exec::transfer::{TransferReport, CHUNK_SIZE};
-use crate::proto::params::{DownloadParams, EditParams, ReadParams, UploadParams, WriteParams};
+use crate::proto::params::{DownloadParams, UploadParams};
 use crate::proto::value;
 use crate::proto::{EndStatus, Msg, TargetInfo, STREAM_STDOUT};
 use crate::session::{CallHandle, Session};
@@ -49,82 +48,6 @@ pub async fn call(
     session
         .call_cancel(target, method, params, limit, cancel)
         .await
-}
-
-async fn call_value(
-    session: &Session,
-    target: &str,
-    method: &str,
-    params: ciborium::value::Value,
-    limit: Duration,
-    cancel: &CancellationToken,
-) -> Result<ciborium::value::Value> {
-    let result = session
-        .call_cancel(target, method, params, limit, cancel)
-        .await?;
-    result.into_value().map_err(Into::into)
-}
-
-pub async fn read(
-    session: &Session,
-    target: &str,
-    path: &str,
-    offset: u64,
-    limit: u64,
-    cancel: &CancellationToken,
-) -> Result<ReadReport> {
-    let params = value::serialize(&ReadParams {
-        path: path.to_string(),
-        offset,
-        limit: Some(limit),
-    })?;
-    let deadline = limits::deadline("read", &params);
-    let value = call_value(session, target, "read", params, deadline, cancel).await?;
-    value::deserialize(&value)
-}
-
-pub async fn write(
-    session: &Session,
-    target: &str,
-    path: &str,
-    content: &str,
-    create_parents: bool,
-    cancel: &CancellationToken,
-) -> Result<WriteReport> {
-    if content.len() > MAX_WRITE_BYTES {
-        bail!(
-            "内容 {} 字节超过 write 上限 {MAX_WRITE_BYTES} 字节，请改用 upload",
-            content.len()
-        );
-    }
-    let params = value::serialize(&WriteParams {
-        path: path.to_string(),
-        content: content.to_string(),
-        create_parents,
-    })?;
-    let deadline = limits::deadline("write", &params);
-    let value = call_value(session, target, "write", params, deadline, cancel).await?;
-    value::deserialize(&value)
-}
-
-pub async fn edit(
-    session: &Session,
-    target: &str,
-    path: &str,
-    old_string: &str,
-    new_string: &str,
-    replace_all: bool,
-    cancel: &CancellationToken,
-) -> Result<EditReport> {
-    let params = value::serialize(&EditParams {
-        path: path.to_string(),
-        old_string: old_string.to_string(),
-        new_string: new_string.to_string(),
-        replace_all,
-    })?;
-    let deadline = limits::deadline("edit", &params);
-    let value = call_value(session, target, "edit", params, deadline, cancel).await?;
-    value::deserialize(&value)
 }
 
 pub async fn upload(
