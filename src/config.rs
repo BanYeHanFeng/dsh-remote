@@ -5,13 +5,15 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::cli::{ClientArgs, CommonArgs, HubArgs};
+use crate::cli::{ClientArgs, CommonArgs, HubArgs, MountArgs};
 use crate::exec::Settings;
 use crate::key::KeyMaterial;
 
 const DEFAULT_MAX_OUTPUT_CHARS: usize = 16_000;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_MAX_FILE: u64 = 67_108_864;
+const DEFAULT_ATTR_TTL_MS: u64 = 2_000;
+const DEFAULT_SPOOL_LIMIT: u64 = 536_870_912;
 
 #[derive(Clone, Debug)]
 pub struct HubConfig {
@@ -30,6 +32,19 @@ pub struct ClientConfig {
     pub target: Settings,
     pub log: String,
     pub github: GithubConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct MountConfig {
+    pub client: ClientConfig,
+    pub target: String,
+    pub mountpoint: std::path::PathBuf,
+    pub remote_root: String,
+    pub read_only: bool,
+    pub allow_other: bool,
+    pub attr_ttl: Duration,
+    pub spool_dir: Option<std::path::PathBuf>,
+    pub spool_limit: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +130,38 @@ pub fn client_config(args: &ClientArgs) -> Result<ClientConfig> {
         target: resolve_settings(&args.common, &raw)?,
         log: resolve_log(&args.common, &raw),
         github: resolve_github(&raw),
+    })
+}
+
+pub fn mount_config(args: &MountArgs) -> Result<MountConfig> {
+    let client = client_config(&ClientArgs {
+        common: args.common.clone(),
+        hub: args.hub.clone(),
+    })?;
+    if args.target.trim().is_empty() {
+        bail!("缺少目标名：用 --target");
+    }
+    let raw = RawConfig::load(args.common.config.as_deref())?;
+    let remote_root =
+        pick(args.remote_root.clone(), &raw, "REMOTE_ROOT").unwrap_or_else(|| "/".to_string());
+    let attr_ttl_ms = number(args.attr_ttl_ms, &raw, "ATTR_TTL_MS", DEFAULT_ATTR_TTL_MS)?;
+    if attr_ttl_ms == 0 {
+        bail!("ATTR_TTL_MS 必须是正整数");
+    }
+    let spool_limit = number(args.spool_limit, &raw, "SPOOL_LIMIT", DEFAULT_SPOOL_LIMIT)?;
+    if spool_limit < DEFAULT_MAX_FILE {
+        bail!("SPOOL_LIMIT 不能小于单文件上限 {DEFAULT_MAX_FILE} 字节");
+    }
+    Ok(MountConfig {
+        client,
+        target: args.target.clone(),
+        mountpoint: args.mountpoint.clone(),
+        remote_root,
+        read_only: args.read_only,
+        allow_other: args.allow_other,
+        attr_ttl: Duration::from_millis(attr_ttl_ms),
+        spool_dir: args.spool_dir.clone(),
+        spool_limit,
     })
 }
 

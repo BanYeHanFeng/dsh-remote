@@ -25,6 +25,8 @@ pub enum Command {
     Server(Box<ClientArgs>),
     #[command(about = "列出房间内的在线目标")]
     Targets(Box<ClientArgs>),
+    #[command(about = "把远端目录挂到本机，交给本地工具直接读写")]
+    Mount(Box<MountArgs>),
 }
 
 #[derive(Args, Debug, Clone, Default)]
@@ -67,6 +69,33 @@ pub struct HubArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+pub struct MountArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    #[arg(long, value_name = "IP:端口", help = "中继地址")]
+    pub hub: Option<String>,
+    #[arg(long, value_name = "名字", help = "要挂载的目标名")]
+    pub target: String,
+    #[arg(long, value_name = "路径", help = "本机挂载点，必须是已存在的目录")]
+    pub mountpoint: PathBuf,
+    #[arg(long, value_name = "路径", help = "目标上的挂载根，默认 /")]
+    pub remote_root: Option<String>,
+    #[arg(long, help = "只读挂载")]
+    pub read_only: bool,
+    #[arg(long, value_name = "毫秒", help = "属性与目录缓存时间，默认 2000")]
+    pub attr_ttl_ms: Option<u64>,
+    #[arg(long, value_name = "字节", help = "影子文件缓存上限，默认 512MiB")]
+    pub spool_limit: Option<u64>,
+    #[arg(long, value_name = "路径", help = "影子文件目录，默认系统临时目录")]
+    pub spool_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "允许其它用户访问挂载点（需 /etc/fuse.conf 允许 user_allow_other）"
+    )]
+    pub allow_other: bool,
+}
+
+#[derive(Args, Debug, Clone)]
 pub struct ClientArgs {
     #[command(flatten)]
     pub common: CommonArgs,
@@ -97,6 +126,33 @@ mod tests {
                 assert_eq!(args.hub.as_deref(), Some("127.0.0.1:1"));
             }
             other => panic!("期望 targets，收到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_mount() {
+        let cli = Cli::try_parse_from([
+            "dsh-remote",
+            "mount",
+            "--hub",
+            "127.0.0.1:1",
+            "--key",
+            "0123456789abcdef",
+            "--target",
+            "nas",
+            "--mountpoint",
+            "/mnt/nas",
+            "--read-only",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Mount(args) => {
+                assert_eq!(args.target, "nas");
+                assert_eq!(args.mountpoint, std::path::PathBuf::from("/mnt/nas"));
+                assert!(args.read_only);
+                assert_eq!(args.hub.as_deref(), Some("127.0.0.1:1"));
+            }
+            other => panic!("期望 mount，收到 {other:?}"),
         }
     }
 

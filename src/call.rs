@@ -2,6 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -12,7 +13,9 @@ use crate::config::ClientConfig;
 use crate::exec::limits;
 use crate::exec::shell;
 use crate::exec::transfer::{TransferReport, CHUNK_SIZE};
-use crate::proto::params::{BashParams, DownloadParams, TransferParams, UploadParams};
+use crate::proto::params::{
+    BashParams, DownloadParams, FsEntry, FsLink, FsList, FsParams, TransferParams, UploadParams,
+};
 use crate::proto::value;
 use crate::proto::{EndStatus, Msg, TargetInfo, STREAM_STDOUT};
 use crate::session::{CallHandle, Session};
@@ -49,6 +52,71 @@ pub async fn call(
     session
         .call_cancel(target, method, params, limit, cancel)
         .await
+}
+
+pub async fn fs_call(
+    session: &Session,
+    target: &str,
+    params: FsParams,
+    cancel: &CancellationToken,
+) -> RemoteResult<CallResult> {
+    let encoded = value::serialize(&params)
+        .map_err(|err| RemoteError::new("internal", format!("序列化 fs 参数失败: {err:#}")))?;
+    let deadline = limits::deadline("fs", &encoded);
+    session
+        .call_cancel(target, "fs", encoded, deadline, cancel)
+        .await
+}
+
+fn fs_decode<T: DeserializeOwned>(result: CallResult) -> RemoteResult<T> {
+    let value = result.into_value()?;
+    value::deserialize(&value)
+        .map_err(|err| RemoteError::new("protocol", format!("响应格式不符: {err:#}")))
+}
+
+pub async fn fs_stat(
+    session: &Session,
+    target: &str,
+    path: &str,
+    cancel: &CancellationToken,
+) -> RemoteResult<FsEntry> {
+    let params = FsParams {
+        op: "stat".to_string(),
+        path: path.to_string(),
+        ..FsParams::default()
+    };
+    fs_decode(fs_call(session, target, params, cancel).await?)
+}
+
+pub async fn fs_list(
+    session: &Session,
+    target: &str,
+    path: &str,
+    offset: u64,
+    cancel: &CancellationToken,
+) -> RemoteResult<FsList> {
+    let params = FsParams {
+        op: "list".to_string(),
+        path: path.to_string(),
+        offset: Some(offset),
+        limit: Some(512),
+        ..FsParams::default()
+    };
+    fs_decode(fs_call(session, target, params, cancel).await?)
+}
+
+pub async fn fs_readlink(
+    session: &Session,
+    target: &str,
+    path: &str,
+    cancel: &CancellationToken,
+) -> RemoteResult<FsLink> {
+    let params = FsParams {
+        op: "readlink".to_string(),
+        path: path.to_string(),
+        ..FsParams::default()
+    };
+    fs_decode(fs_call(session, target, params, cancel).await?)
 }
 
 pub async fn bash(

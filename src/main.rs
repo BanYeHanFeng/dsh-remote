@@ -9,7 +9,7 @@ use dsh_remote::cli::{Cli, ClientArgs, Command};
 use dsh_remote::key::KeyMaterial;
 use dsh_remote::proto::{TargetInfo, TargetKind};
 use dsh_remote::session::Session;
-use dsh_remote::{agent, call, config, hub, logging, server};
+use dsh_remote::{agent, call, config, hub, logging, mount, server};
 
 const RUNTIME_DRAIN: Duration = Duration::from_secs(1);
 
@@ -53,6 +53,11 @@ async fn run() -> Result<()> {
             let cfg = config::client_config(&args)?;
             logging::init(&cfg.log)?;
             server::run(cfg, shutdown_token()).await
+        }
+        Command::Mount(args) => {
+            let cfg = config::mount_config(&args)?;
+            logging::init(&cfg.client.log)?;
+            mount::run(cfg, shutdown_token()).await
         }
         Command::Targets(args) => {
             let session = connect(&args).await?;

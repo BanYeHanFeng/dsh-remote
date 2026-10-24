@@ -13,6 +13,7 @@ pub mod hub;
 pub mod key;
 pub mod logging;
 pub mod mcp;
+pub mod mount;
 pub mod net;
 pub mod proto;
 pub mod server;
