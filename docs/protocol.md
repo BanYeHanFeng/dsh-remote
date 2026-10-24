@@ -15,8 +15,9 @@ TCP
 - 握手与传输阶段都用 `u16` 长度前缀；Noise 单条消息上限 65535 字节，明文最大 65519。
 - 应用层分片：`Chunk.data` 每片 60 KiB，CBOR 里编码为字节串（不是整数数组），
   连同头部仍小于明文上限；接收端按 `seq` 拼接，允许乱序到达后重排。
-- 版本字段 `proto: 2` 放在 `Hello`/`Welcome`；不匹配由 hub 回 `Bye{code:"proto_mismatch"}`
-  后断开。2 与 1 的分片编码不同，不互通，三端需要一起升级。
+- 版本字段 `proto: 3` 放在 `Hello`/`Welcome`；不匹配由 hub 回 `Bye{code:"proto_mismatch"}`
+  后断开。3 删掉了 `read`/`write`/`edit`，`bash` 改成单条 `Result`，不互通，三端需要
+  一起升级。
 - 每条连接有两条出站队列：`Chunk`/`End`/`Result` 走数据队列并按入队顺序发送，
   `Ping`/`Pong`/`Bye`/`Cancel` 等走控制队列优先发送。写线程按批合并帧
   （一次 `write_all` + 一次 `flush`），心跳不会排在成兆的数据后面。
