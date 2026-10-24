@@ -11,6 +11,7 @@ pub const BASH_MAX_TIMEOUT_MS: u64 = 600_000;
 const BASH_MIN_TIMEOUT_MS: u64 = 100;
 const BASH_MARGIN: Duration = Duration::from_secs(30);
 const TRANSFER_MARGIN: Duration = Duration::from_secs(10);
+const FS_TIMEOUT: Duration = Duration::from_secs(30);
 const CALL_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
 
 pub fn bash_timeout_ms(requested: Option<u64>) -> Duration {
@@ -42,6 +43,7 @@ pub fn deadline(method: &str, params: &Value) -> Duration {
                 .unwrap_or_default();
             transfer_limit(size) + TRANSFER_MARGIN
         }
+        "fs" => FS_TIMEOUT,
         "transfer" => {
             let size = value::deserialize::<TransferParams>(params)
                 .ok()
@@ -73,6 +75,11 @@ mod tests {
             bash_timeout_ms(None),
             Duration::from_millis(BASH_DEFAULT_TIMEOUT_MS)
         );
+    }
+
+    #[test]
+    fn fs_deadline_is_fixed() {
+        assert_eq!(deadline("fs", &value::empty_map()), Duration::from_secs(30));
     }
 
     #[test]
