@@ -11,7 +11,7 @@ use crate::actions::{
 };
 use crate::call;
 use crate::mount::registry::Mounts;
-use crate::mount::{MountSpec, DEFAULT_ATTR_TTL_MS};
+use crate::mount::{root_allowed, MountSpec, DEFAULT_ATTR_TTL_MS};
 use crate::proto::now_ms;
 use crate::proto::params::TransferParams;
 use crate::session::{RemoteError, Session};
@@ -337,13 +337,13 @@ async fn mount(session: &Session, mounts: &Mounts, args: &Value) -> ToolResult {
         "mount" => {
             let target = require_str(args, "target")?;
             let mountpoint = require_str(args, "mountpoint")?;
-            if !session
+            let Some(online) = session
                 .targets_snapshot()
-                .iter()
-                .any(|info| info.name == target)
-            {
+                .into_iter()
+                .find(|info| info.name == target)
+            else {
                 return Err(format!("目标 {target} 不在线，先用 targets 看看"));
-            }
+            };
             let mut spec = MountSpec::new(&target, &mountpoint);
             if let Some(root) = optional_str(args, "remote_root") {
                 spec.remote_root = root;
@@ -363,6 +363,14 @@ async fn mount(session: &Session, mounts: &Mounts, args: &Value) -> ToolResult {
                 info.mountpoint.display(),
                 if info.read_only { "只读" } else { "读写" }
             );
+            if !root_allowed(&online.roots, &info.remote_root) {
+                let _ = write!(
+                    text,
+                    "\n注意：{} 不在目标允许的目录里（{}），读写会被告知越界。",
+                    info.remote_root,
+                    online.roots.join(":")
+                );
+            }
             let _ = write!(text, "\n用完 action=unmount 加 mountpoint 卸载。");
             Ok(ToolOutput::ok(text))
         }

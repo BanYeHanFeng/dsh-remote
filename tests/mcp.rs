@@ -446,11 +446,12 @@ async fn mount_tool_mounts_lists_and_unmounts() {
                 "action": "mount",
                 "target": "nas",
                 "mountpoint": mount_text,
-                "remote_root": remote_root,
+                "remote_root": "/etc",
             }),
         )
         .await;
     assert!(!is_error, "{text}");
+    assert!(text.contains("不在目标允许的目录里"), "{text}");
     assert!(wait_until(|| is_mounted(&mount_text)).await, "再次挂载失败");
 
     mcp.close().await;

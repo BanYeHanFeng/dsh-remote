@@ -328,19 +328,21 @@ async fn check_target(session: &Session, cfg: &MountConfig) {
         roots = %target.roots.join(":"),
         "目标在线"
     );
-    let allowed = target.roots.iter().any(|root| {
-        let root = root.trim_end_matches('/');
-        root.is_empty()
-            || cfg.remote_root == root
-            || cfg.remote_root.starts_with(&format!("{root}/"))
-    });
-    if !allowed {
+    if !root_allowed(&target.roots, &cfg.remote_root) {
         warn!(
             root = %cfg.remote_root,
             roots = %target.roots.join(":"),
             "挂载根不在目标的允许目录里，读写会被告知越界"
         );
     }
+}
+
+pub fn root_allowed(roots: &[String], path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    roots.iter().any(|root| {
+        let root = root.trim_end_matches('/');
+        root.is_empty() || path == root || path.starts_with(&format!("{root}/"))
+    })
 }
 
 fn detach_stale(mountpoint: &Path) -> Result<()> {
@@ -898,4 +900,22 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_allowed_matches_prefixes() {
+        let roots = vec!["/data".to_string(), "/home/ops/".to_string()];
+        assert!(root_allowed(&roots, "/data"));
+        assert!(root_allowed(&roots, "/data/"));
+        assert!(root_allowed(&roots, "/data/projects"));
+        assert!(root_allowed(&roots, "/home/ops"));
+        assert!(!root_allowed(&roots, "/database"));
+        assert!(!root_allowed(&roots, "/home/ops2"));
+        assert!(root_allowed(&["/".to_string()], "/data"));
+        assert!(root_allowed(&[String::new()], "/data"));
+    }
 }
