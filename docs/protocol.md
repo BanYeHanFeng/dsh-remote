@@ -70,11 +70,11 @@ initiator                          responder
 | 0x13 | `End` | 双向 | `id, status, size?, sha256?` |
 | 0x14 | `Cancel` | server→hub→agent | `id, reason?` |
 
-- `method` 取工具名：`bash`、`upload`、`download`、`transfer`、`targets`、`shutdown`。
+- `method` 取工具名：`bash`、`fs`、`upload`、`download`、`transfer`、`targets`、`shutdown`。
   `params` 是方法参数的 CBOR map，原样透传。
 - `shutdown` 只有 agent 处理：先回 `Result{ok:true, value:{stopping:true}}`，
   然后断开中继、退出进程；hub 自身回 `unsupported`（中继不能被远程关掉）。
-- 短结果用 `Result` 一次返回（`targets`、`bash`）。
+- 短结果用 `Result` 一次返回（`targets`、`bash`、`fs`）。
 - 长结果用流：先若干 `Chunk`，最后 `End`；目前只有文件传输用流，且只用 `stream=1`。
 - `End.status` 取 `ok` / `error` / `cancelled`；文件传输带 `size` 与 `sha256`。
   下载的 `End` 是终态；上传的 `End` 只是上行数据结束，agent 还会回一条 `Result`。
@@ -175,6 +175,44 @@ dest   ── Result{ok:true, value:{path,size,sha256}} ──▶ hub ── Res
   收尾时仍有空洞就判定失败并丢弃临时文件。
 - `Result` 编码后不超过 60 KiB；更大的数据用上传下载。
 
+### 3.4 目录与属性
+
+挂载（`dsh-remote mount`）需要的元数据都走同一个方法 `fs`，一次一个操作，`Result`
+一次返回；内容不在这里传，仍然走 `upload` / `download`，所以这一族只有属性。
+
+| op | 参数 | 结果 | 说明 |
+| --- | --- | --- | --- |
+| `stat` | `path` | `FsEntry` | 末段不跟随符号链接 |
+| `list` | `path, offset?, limit?` | `{entries[], next?}` | 按名字排序，装不下时用 `next` 续 |
+| `readlink` | `path` | `{target}` | 目标原样返回，跟随与否由调用方决定 |
+| `symlink` | `path, target` | `FsEntry` | 建符号链接，已存在回 `conflict` |
+| `mkdir` | `path, mode?, create_parents?` | `FsEntry` | 已存在回 `conflict` |
+| `remove` | `path` | `FsEntry` | 文件删文件、空目录删目录，非空回 `not_empty` |
+| `rename` | `path, to_path, overwrite?, create_parents?` | `FsEntry` | 目标已存在且不覆盖回 `conflict` |
+| `setattr` | `path, mode?, mtime_ms?, atime_ms?` | `FsEntry` | 符号链接本身不改属性 |
+
+`FsEntry` 字段：`name, kind(file|dir|symlink|other), size, mtime_ms, atime_ms,
+ctime_ms, perm, uid, gid, nlink`。
+
+```json
+{"id":21,"target":"nas","method":"fs",
+ "params":{"op":"list","path":"/data/projects","limit":256}}
+```
+
+```json
+{"id":21,"ok":true,"value":{
+  "entries":[{"name":"README.md","kind":"file","size":1843,"mtime_ms":1730000000000,
+              "perm":420,"uid":1000,"gid":1000,"nlink":1}],
+  "next":null}}
+```
+
+- 白名单与 `upload` / `download` 相同，但 `stat`、`readlink`、`remove`、`rename`
+  只解析到父目录、末段不跟随符号链接：指着白名单外的符号链接本身仍然可读可删，
+  要不要跟随由调用方（本机内核）决定，所以挂载点上的符号链接语义和本机一致。
+- `list` 受单条 `Result` 60 KiB 限制：从 `offset` 起按名字顺序连续取，累计条目
+  预算用满就截断，剩下的用 `next` 续取，大目录不会撞上限。
+- 一条 `fs` 调用超时 30 秒（`exec::limits` 一处定义），与 `bash`/传输的超时互不影响。
+
 ## 4. 路由
 
 hub 内维护：
@@ -243,6 +281,7 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 | `denied` | 路径越界、bash 被禁用、权限不足 |
 | `not_found` | 路径不存在 |
 | `conflict` | 目标已存在且未允许覆盖 |
+| `not_empty` | 目录非空，不能按空目录删除 |
 | `too_large` | 输出或文件超上限 |
 | `busy` | 并发执行数达到上限 |
 | `io` | 本地文件/进程 IO 错误 |
@@ -269,6 +308,9 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
   默认 300 秒），单次返回的字符上限也来自目标配置（`MAX_OUTPUT_CHARS`，默认 16000）。
 - `upload` / `download` 各有两种用法：给 `local_path` 时走 DSH 本机磁盘，
   给 `from` / `to` 时改发 `transfer`，由中继在两个节点之间直接搬。
+- `mount` 不是 MCP 工具，而是一条 CLI 子命令（`dsh-remote mount`）：它用上面这族
+  `fs` 调用做元数据，用 `upload` / `download` 搬内容，把目标上的一个目录挂成本机
+  路径，于是本机的编辑器、`git`、AI 的文件工具都能直接读写远端文件。
 - `req_id` 由 server 侧的 `Session` 单调分配，一条连接内并发任意多路；
   收到 `End`/`Result` 即释放。
 - MCP 的 `notifications/cancelled` → 内部 `Cancel{id}`，hub 再转发给 agent：
@@ -281,6 +323,8 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 ## 8. 演进
 
 - 新增消息类型不改变已有语义；未知 type 记录日志后忽略，连接不断开。
+- 新增 `Call.method` 同理：旧被控端对 `fs` 回 `unsupported`，`proto` 不升版本，
+  所以 `mount` 可以只升级本机一端。
 - `Hello.proto` 只做“同主版本可通信”的粗校验；字段用 CBOR 可选字段扩展。
 - 端到端加密演进：把 `Call.params` 与 `Chunk.data` 换成 server 与 agent 协商的
   不透明密文，hub 只保留 `target`、`req_id`、`method` 用于路由；消息表不推翻。

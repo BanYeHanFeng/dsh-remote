@@ -24,7 +24,8 @@ const INSTRUCTIONS: &str = "\
 名字作为后续工具的 target 参数。bash 在目标上执行命令，超过超时会杀掉整个进程组；\
 文件只能在该目标上的 ROOTS 白名单目录里读写，越界与符号链接逃逸都会被拒绝；\
 搬文件用 upload/download：给 local_path 时走本机，给 from/to 时让中继在两个节点之间\
-直接搬（不经过本机磁盘）。工具失败时 isError 为真，\
+直接搬（不经过本机磁盘）。如果本机用 dsh-remote mount 挂过某个目标，远端目录会以\
+本地路径出现，读改文件可以直接用本地文件工具；搜索与构建仍然用 bash 更划算。工具失败时 isError 为真，\
 错误码说明原因（unknown_target、offline、timeout、denied、too_large、busy、io、\
 protocol）。需要临时算力时用 actions 在 GitHub Actions 上开一个一次性被控端\
 （目标名 Actions，注册进房间后即可当普通 target 用），用完 actions stop 关掉\
