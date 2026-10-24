@@ -291,10 +291,16 @@ impl Mount {
             } else {
                 let join = tokio::task::spawn_blocking(move || worker.join());
                 if tokio::time::timeout(SHUTDOWN_WAIT, join).await.is_err() {
-                    warn!(
-                        mountpoint = %self.mountpoint.display(),
-                        "FUSE 线程没按时退出，挂载点可能还占着"
-                    );
+                    match outcome {
+                        UnmountOutcome::Clean => debug!(
+                            mountpoint = %self.mountpoint.display(),
+                            "挂载点已离开挂载表，FUSE 线程等占用释放后自己退出"
+                        ),
+                        _ => warn!(
+                            mountpoint = %self.mountpoint.display(),
+                            "FUSE 线程没按时退出，挂载点可能还占着"
+                        ),
+                    }
                 }
             }
         }
