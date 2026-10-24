@@ -26,6 +26,7 @@ const LIST_CAP: usize = 50_000;
 const UPLOAD_BATCH_MAX: usize = 32;
 const UPLOAD_BATCH_WINDOW: Duration = Duration::from_millis(20);
 const UPLOAD_CONCURRENCY: usize = 4;
+const UPLOAD_BARRIER_LIMIT: Duration = Duration::from_secs(300);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const CONNECT_LIMIT: Duration = Duration::from_secs(10);
 const MOUNT_SOURCE_PREFIX: &str = "dsh-remote:";
@@ -939,7 +940,7 @@ impl Inner {
                 }
             }
         };
-        let _ = tokio::time::timeout(SHUTDOWN_WAIT * 6, waiting).await;
+        let _ = tokio::time::timeout(UPLOAD_BARRIER_LIMIT, waiting).await;
         let failure = lock(&self.upload_errors).pop();
         match failure {
             Some(err) => Err(err),
@@ -959,7 +960,7 @@ impl Inner {
                 }
             }
         };
-        let _ = tokio::time::timeout(SHUTDOWN_WAIT * 6, waiting).await;
+        let _ = tokio::time::timeout(UPLOAD_BARRIER_LIMIT, waiting).await;
         let failure = lock(&self.upload_errors).pop();
         match failure {
             Some(err) => Err(err),
