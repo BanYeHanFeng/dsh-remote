@@ -148,6 +148,30 @@ pub async fn upload(
     create_parents: bool,
     cancel: &CancellationToken,
 ) -> Result<TransferReport> {
+    upload_checked(
+        session,
+        target,
+        local,
+        remote,
+        overwrite,
+        create_parents,
+        None,
+        cancel,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_checked(
+    session: &Session,
+    target: &str,
+    local: &Path,
+    remote: &str,
+    overwrite: bool,
+    create_parents: bool,
+    expect: Option<(u64, u64)>,
+    cancel: &CancellationToken,
+) -> Result<TransferReport> {
     let mut file = tokio::fs::File::open(local)
         .await
         .with_context(|| format!("打开本地文件失败: {}", local.display()))?;
@@ -168,6 +192,8 @@ pub async fn upload(
         size: Some(meta.len()),
         overwrite,
         create_parents,
+        expect_mtime_ms: expect.map(|(mtime, _)| mtime),
+        expect_size: expect.map(|(_, size)| size),
     })?;
     let deadline = limits::deadline("upload", &params);
     let mut handle = session.begin(target, "upload", params).await?;

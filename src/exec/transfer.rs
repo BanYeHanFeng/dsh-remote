@@ -75,11 +75,17 @@ pub struct Incoming {
     next_seq: u64,
     pending: BTreeMap<u64, Vec<u8>>,
     permissions: Option<std::fs::Permissions>,
+    expect: Option<(u64, u64)>,
     committed: bool,
 }
 
 impl Incoming {
-    pub async fn open(final_path: PathBuf, overwrite: bool, max_file: u64) -> ToolResult<Self> {
+    pub async fn open(
+        final_path: PathBuf,
+        overwrite: bool,
+        max_file: u64,
+        expect: Option<(u64, u64)>,
+    ) -> ToolResult<Self> {
         let mut permissions = None;
         match tokio::fs::symlink_metadata(&final_path).await {
             Ok(meta) => {
@@ -140,6 +146,7 @@ impl Incoming {
                         next_seq: 0,
                         pending: BTreeMap::new(),
                         permissions,
+                        expect,
                         committed: false,
                     });
                 }
@@ -246,6 +253,7 @@ impl Incoming {
             .sync_all()
             .await
             .map_err(|err| ToolError::io(format!("同步临时文件失败: {err}")))?;
+        self.check_baseline().await?;
         if let Some(permissions) = self.permissions.clone() {
             let _ = tokio::fs::set_permissions(&self.temp_path, permissions).await;
         }
@@ -268,6 +276,33 @@ impl Incoming {
             sha256: digest,
             entry,
         })
+    }
+
+    async fn check_baseline(&self) -> ToolResult<()> {
+        let Some((mtime_ms, size)) = self.expect else {
+            return Ok(());
+        };
+        let meta = match tokio::fs::symlink_metadata(&self.final_path).await {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ToolError::new(
+                    "stale",
+                    format!("远端文件在传输期间被删除: {}", self.final_path.display()),
+                ))
+            }
+            Err(err) => return Err(ToolError::io(format!("读取目标属性失败: {err}"))),
+        };
+        let current = crate::exec::fs::named(&self.final_path, &meta);
+        if current.mtime_ms != mtime_ms || current.size != size {
+            return Err(ToolError::new(
+                "stale",
+                format!(
+                    "远端文件在传输期间被改动（基线 {mtime_ms}/{size}，当前 {}/{}），未覆盖",
+                    current.mtime_ms, current.size
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn abort(&mut self) {

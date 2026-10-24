@@ -11,6 +11,7 @@ use crate::proto::{EndStatus, Msg, STREAM_STDOUT};
 pub struct Request {
     pub path: PathBuf,
     pub overwrite: bool,
+    pub expect: Option<(u64, u64)>,
     pub expected_size: Option<u64>,
     pub max_file: u64,
     pub reply_id: u64,
@@ -23,6 +24,7 @@ pub async fn run(request: Request) {
     let Request {
         path,
         overwrite,
+        expect,
         expected_size,
         max_file,
         reply_id,
@@ -44,7 +46,7 @@ pub async fn run(request: Request) {
         }
     }
 
-    let mut incoming = match Incoming::open(path, overwrite, max_file).await {
+    let mut incoming = match Incoming::open(path, overwrite, max_file, expect).await {
         Ok(incoming) => incoming,
         Err(err) => {
             super::reply_error(&sink, reply_id, err.code, err.message).await;

@@ -242,6 +242,10 @@ impl Executor {
             upload::run(upload::Request {
                 path,
                 overwrite: params.overwrite,
+                expect: match (params.expect_mtime_ms, params.expect_size) {
+                    (Some(mtime), Some(size)) => Some((mtime, size)),
+                    _ => None,
+                },
                 expected_size: params.size,
                 max_file,
                 reply_id: call_id,

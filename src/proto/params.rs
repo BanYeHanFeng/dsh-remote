@@ -14,6 +14,8 @@ pub struct UploadParams {
     pub size: Option<u64>,
     pub overwrite: bool,
     pub create_parents: bool,
+    pub expect_mtime_ms: Option<u64>,
+    pub expect_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

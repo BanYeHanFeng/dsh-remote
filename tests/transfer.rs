@@ -53,6 +53,54 @@ async fn transfers_between_hub_and_agent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upload_with_baseline_refuses_changed_remote() {
+    let harness = Harness::start("upload-stale", true, true, None).await;
+    let session = harness.session().await;
+    let token = no_cancel();
+    let remote = harness.remote("target.txt");
+    std::fs::write(&remote, b"one").unwrap();
+    let baseline = call::fs_stat(&session, AGENT, &remote, &token)
+        .await
+        .unwrap();
+
+    let local = harness.local("source.txt");
+    std::fs::write(&local, b"two").unwrap();
+    let expect = Some((baseline.mtime_ms, baseline.size));
+
+    std::fs::write(&remote, b"changed-elsewhere").unwrap();
+    let error = call::upload_checked(
+        &session, AGENT, &local, &remote, true, false, expect, &token,
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error}").contains("stale"), "应报 stale: {error}");
+    assert_eq!(std::fs::read(&remote).unwrap(), b"changed-elsewhere");
+
+    let fresh = call::fs_stat(&session, AGENT, &remote, &token)
+        .await
+        .unwrap();
+    let report = call::upload_checked(
+        &session,
+        AGENT,
+        &local,
+        &remote,
+        true,
+        false,
+        Some((fresh.mtime_ms, fresh.size)),
+        &token,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.size, 3);
+    assert_eq!(std::fs::read(&remote).unwrap(), b"two");
+    let entry = report.entry.expect("上传结果应带回文件属性");
+    assert_eq!(entry.size, 3);
+    assert_eq!(entry.kind, "file");
+
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transfers_within_one_agent() {
     let harness = Harness::start("transfer", true, true, None).await;
     let session = harness.session().await;
