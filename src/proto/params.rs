@@ -23,6 +23,18 @@ pub struct DownloadParams {
     pub max_size: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransferParams {
+    pub source: String,
+    pub source_path: String,
+    pub dest: String,
+    pub dest_path: String,
+    pub overwrite: bool,
+    pub create_parents: bool,
+    pub max_size: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

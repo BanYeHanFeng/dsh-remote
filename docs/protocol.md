@@ -70,7 +70,7 @@ initiator                          responder
 | 0x13 | `End` | 双向 | `id, status, size?, sha256?` |
 | 0x14 | `Cancel` | server→hub→agent | `id, reason?` |
 
-- `method` 取工具名：`bash`、`upload`、`download`、`targets`、`shutdown`。
+- `method` 取工具名：`bash`、`upload`、`download`、`transfer`、`targets`、`shutdown`。
   `params` 是方法参数的 CBOR map，原样透传。
 - `shutdown` 只有 agent 处理：先回 `Result{ok:true, value:{stopping:true}}`，
   然后断开中继、退出进程；hub 自身回 `unsupported`（中继不能被远程关掉）。
@@ -144,6 +144,30 @@ agent  ── End{id, status:"ok", size, sha256} ──▶
   rename；失败、取消或超时删除 `.part`。
 - agent 在打开文件前检查自身的 `MAX_FILE` 与请求里的 `max_size`，取较小值。
 
+节点互传（源目标 → hub → 目的目标）：
+
+```text
+server ── Call{id, method:"transfer",
+             params:{source,source_path,dest,dest_path,overwrite?,create_parents?,max_size?}} ──▶
+hub    ── Call{dest_call, target:dest, method:"upload",
+             params:{remote_path:dest_path,size:max_size,overwrite?,create_parents?}} ──▶
+hub    ── Call{src_call, target:source, method:"download",
+             params:{remote_path:source_path,max_size}} ──▶
+source ── Chunk{src_call, seq, stream:1} ──▶ hub ── Chunk{dest_call, seq} ──▶ dest
+source ── End{src_call, status:"ok", size, sha256} ──▶ hub ── End{dest_call, …} ──▶ dest
+dest   ── Result{ok:true, value:{path,size,sha256}} ──▶ hub ── Result ──▶ server
+```
+
+- `transfer` 只有 hub 处理，agent 收到回 `unsupported`。hub 把它拼成两条普通调用，
+  自己不落盘、不缓存整文件，只按 `seq` 重编号后转发分块，所以 DSH 本机完全不参与数据。
+- 先后顺序：先给目的端发 `upload`（它会先校验路径、覆盖策略并创建 `.part`），
+  再给源端发 `download`，这样目的端失败时不会有数据被白读。
+- 任一腿失败或取消，hub 取消另一条腿并回一条 `Result{ok:false}`，请求不会悬挂。
+- 分块有背压：hub 给一侧投递超过 10 秒不成功即判定这次传输失败并取消两条腿
+  （`busy`），不会静默丢块。
+- `max_size` 同时用作源端读取上限与目的端 `Call.params.size`（提前拒绝超限 + 估算超时）。
+- 源端或目的端可以就是 hub 自己，此时那一条腿走进程内执行器，路由与取消逻辑不变。
+
 分块与结果上限：
 
 - `Chunk.data` 每片 60 KiB，`stream` 固定为 1；`seq` 从 0 连续递增。
@@ -157,8 +181,8 @@ hub 内维护：
 
 - `agents: Map<name, Conn>`，注册时查重；断开即移除并广播 `TargetEvent{offline}`。
 - `servers: Set<Conn>`，允许多个并存（DSH 探测进程、多个 DSH 实例），事件广播给全部。
-- `pending: Map<call_id, Pending{server_id, server_req_id, agent_id, deadline}>`，
-  回程按 `call_id` 找到发起方，再改回 `server_req_id`。
+- `routes: Map<call_id, Pending>` + `legs: Map<leg_call_id, 根 call_id>`：
+  单路调用只有一条腿，互传有源和目的两条腿，回程先按腿找到根、再改回 `server_req_id`。
 
 处理一条 `Call`：
 
@@ -193,7 +217,7 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 | 判定断线 | 45s 内无任何帧（含心跳） |
 | 握手超时 | 10s |
 | `Hello` 超时 | 5s |
-| 默认调用超时 | 60s；`bash` 为 `timeout_ms + 30s`；文件传输为 `300s + 大小/256KiB + 10s`，封顶 1 小时（三端共用 `exec::limits` 一处定义） |
+| 默认调用超时 | 60s；`bash` 为 `timeout_ms + 30s`；文件传输与节点互传为 `300s + 大小/256KiB + 10s`，封顶 1 小时（三端共用 `exec::limits` 一处定义） |
 | 重连退避 | 1s 起翻倍到 30s，加 0–20% 抖动 |
 
 - server 与 agent 断线后无限重连；进程不退出（除非 stdin EOF / SIGTERM）。
@@ -237,8 +261,8 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 | --- | --- | --- | --- |
 | `targets` | `targets`（发给 hub） | `Result` | 用本地快照，断线也应答 |
 | `bash` | `bash` | `Result` | `300s + 30s`（目标可用 `SHELL_TIMEOUT_MS` 调小） |
-| `upload` | `upload` | 上行 `Chunk`+`End`，回程 `Result` | `300s + 大小/256KiB` |
-| `download` | `download` | 下行 `Chunk`+`End` | `300s + 大小/256KiB` |
+| `upload` | `upload`（本机→节点）或 `transfer`（`from` 节点互传） | 上行 `Chunk`+`End`，回程 `Result` | `300s + 大小/256KiB` |
+| `download` | `download`（节点→本机）或 `transfer`（`to` 节点互传） | 下行 `Chunk`+`End`，或互传的 `Result` | `300s + 大小/256KiB` |
 | `actions stop`（内部） | `shutdown`（发给目标节点） | `Result` | 10s |
 
 - `req_id` 由 server 侧的 `Session` 单调分配，一条连接内并发任意多路；

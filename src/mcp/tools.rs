@@ -11,6 +11,7 @@ use crate::actions::{
 };
 use crate::call;
 use crate::proto::now_ms;
+use crate::proto::params::TransferParams;
 use crate::session::{RemoteError, Session};
 
 const START_WAIT_SECONDS: u64 = 60;
@@ -77,31 +78,35 @@ pub fn list() -> Value {
         },
         {
             "name": "upload",
-            "description": "把 DSH 本机的文件分块上传到远端：先写 .part，按总字节数与 sha256 校验后原子改名。默认拒绝覆盖已有文件。",
+            "description": "把文件传到 target 节点：给 local_path 时从本机上传；给 from 时改成节点互传，由中继把 from 节点上的文件直接搬到 target 上（不经过本机磁盘）。两种方式都会先写 .part，按总字节数与 sha256 校验后原子改名，默认拒绝覆盖已有文件。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": TARGET_SCHEMA },
-                    "local_path": { "type": "string", "description": "本机（运行 server 的机器）上的源文件路径" },
-                    "remote_path": { "type": "string", "description": "远端目标路径，必须在 ROOTS 内" },
-                    "overwrite": { "type": "boolean", "description": "允许覆盖远端已有文件" },
-                    "create_parents": { "type": "boolean", "description": "自动创建远端父目录" }
+                    "target": { "type": "string", "description": "目的节点名" },
+                    "remote_path": { "type": "string", "description": "目的节点上的路径，必须在它的 ROOTS 内" },
+                    "local_path": { "type": "string", "description": "本机（运行 server 的机器）上的源文件，与 from 二选一" },
+                    "from": { "type": "string", "description": "源节点名：给了它就改成节点互传，忽略 local_path" },
+                    "source_path": { "type": "string", "description": "源节点上的文件路径，配合 from 使用" },
+                    "overwrite": { "type": "boolean", "description": "允许覆盖目的地已有文件" },
+                    "create_parents": { "type": "boolean", "description": "自动创建目的地父目录" }
                 },
-                "required": ["target", "local_path", "remote_path"]
+                "required": ["target", "remote_path"]
             }
         },
         {
             "name": "download",
-            "description": "把远端文件分块下载到 DSH 本机：先写 .part，按总字节数与 sha256 校验后原子改名。默认拒绝覆盖本地已有文件。",
+            "description": "从 target 节点取文件：给 local_path 时下载到本机；给 to 时改成节点互传，由中继把 target 上的文件直接搬到 to 节点（不经过本机磁盘）。默认拒绝覆盖目的地已有文件。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": TARGET_SCHEMA },
-                    "remote_path": { "type": "string", "description": "远端源文件路径，必须在 ROOTS 内" },
-                    "local_path": { "type": "string", "description": "本机上的目标路径，父目录必须已存在" },
-                    "overwrite": { "type": "boolean", "description": "允许覆盖本地已有文件" }
+                    "target": { "type": "string", "description": "源节点名" },
+                    "remote_path": { "type": "string", "description": "源节点上的文件路径，必须在它的 ROOTS 内" },
+                    "local_path": { "type": "string", "description": "本机上的目标路径，父目录必须已存在；与 to 二选一" },
+                    "to": { "type": "string", "description": "目的节点名：给了它就改成节点互传，忽略 local_path" },
+                    "dest_path": { "type": "string", "description": "目的节点上的路径，配合 to 使用" },
+                    "overwrite": { "type": "boolean", "description": "允许覆盖目的地已有文件" }
                 },
-                "required": ["target", "remote_path", "local_path"]
+                "required": ["target", "remote_path"]
             }
         },
         {
@@ -208,10 +213,34 @@ async fn bash(session: &Session, args: &Value, cancel: &CancellationToken) -> To
 
 async fn upload(session: &Session, args: &Value, cancel: &CancellationToken) -> ToolResult {
     let target = require_str(args, "target")?;
-    let local = require_str(args, "local_path")?;
     let remote = require_str(args, "remote_path")?;
     let overwrite = optional_bool(args, "overwrite").unwrap_or(false);
     let create_parents = optional_bool(args, "create_parents").unwrap_or(false);
+    if let Some(from) = optional_str(args, "from") {
+        let source_path = require_str(args, "source_path")?;
+        let report = call::transfer(
+            session,
+            TransferParams {
+                source: from.clone(),
+                source_path: source_path.clone(),
+                dest: target.clone(),
+                dest_path: remote.clone(),
+                overwrite,
+                create_parents,
+                max_size: Some(session.max_file()),
+            },
+            cancel,
+        )
+        .await
+        .map_err(|err| describe(&err))?;
+        return Ok(ToolOutput::ok(format!(
+            "已传输 {from}:{source_path} → {target}:{}（{}，sha256 {}）",
+            report.path,
+            human_size(report.size),
+            short_hash(&report.sha256)
+        )));
+    }
+    let local = require_str(args, "local_path")?;
     let report = call::upload(
         session,
         &target,
@@ -234,8 +263,32 @@ async fn upload(session: &Session, args: &Value, cancel: &CancellationToken) -> 
 async fn download(session: &Session, args: &Value, cancel: &CancellationToken) -> ToolResult {
     let target = require_str(args, "target")?;
     let remote = require_str(args, "remote_path")?;
-    let local = require_str(args, "local_path")?;
     let overwrite = optional_bool(args, "overwrite").unwrap_or(false);
+    if let Some(to) = optional_str(args, "to") {
+        let dest_path = require_str(args, "dest_path")?;
+        let report = call::transfer(
+            session,
+            TransferParams {
+                source: target.clone(),
+                source_path: remote.clone(),
+                dest: to.clone(),
+                dest_path: dest_path.clone(),
+                overwrite,
+                create_parents: optional_bool(args, "create_parents").unwrap_or(false),
+                max_size: Some(session.max_file()),
+            },
+            cancel,
+        )
+        .await
+        .map_err(|err| describe(&err))?;
+        return Ok(ToolOutput::ok(format!(
+            "已传输 {target}:{remote} → {to}:{}（{}，sha256 {}）",
+            report.path,
+            human_size(report.size),
+            short_hash(&report.sha256)
+        )));
+    }
+    let local = require_str(args, "local_path")?;
     let report = call::download(
         session,
         &target,

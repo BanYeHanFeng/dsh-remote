@@ -12,7 +12,7 @@ use crate::config::ClientConfig;
 use crate::exec::limits;
 use crate::exec::shell;
 use crate::exec::transfer::{TransferReport, CHUNK_SIZE};
-use crate::proto::params::{BashParams, DownloadParams, UploadParams};
+use crate::proto::params::{BashParams, DownloadParams, TransferParams, UploadParams};
 use crate::proto::value;
 use crate::proto::{EndStatus, Msg, TargetInfo, STREAM_STDOUT};
 use crate::session::{CallHandle, Session};
@@ -179,6 +179,21 @@ fn early_failure(msg: Msg) -> Option<anyhow::Error> {
         Msg::End { status, .. } if status != EndStatus::Ok => Some(anyhow!("上传中断: {status:?}")),
         _ => None,
     }
+}
+
+pub async fn transfer(
+    session: &Session,
+    params: TransferParams,
+    cancel: &CancellationToken,
+) -> Result<TransferReport> {
+    let params = value::serialize(&params)?;
+    let deadline = limits::deadline("transfer", &params);
+    let hub = session.hub_name().unwrap_or_else(|| "hub".to_string());
+    let result = session
+        .call_cancel(&hub, "transfer", params, deadline, cancel)
+        .await?;
+    let value = result.into_value()?;
+    value::deserialize(&value)
 }
 
 pub async fn download(

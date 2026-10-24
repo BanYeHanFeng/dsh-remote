@@ -16,13 +16,16 @@ use crate::config::HubConfig;
 use crate::exec::{limits, Executor};
 use crate::net::link::{End, Link, HELLO_TIMEOUT};
 use crate::net::Sink;
+use crate::proto::params::{DownloadParams, TransferParams, UploadParams};
 use crate::proto::value as cbor;
 use crate::proto::{
-    now_ms, Msg, ProtoError, Role, TargetEventKind, TargetInfo, TargetKind, PROTO_VERSION,
+    now_ms, EndStatus, Msg, ProtoError, Role, TargetEventKind, TargetInfo, TargetKind,
+    PROTO_VERSION,
 };
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 const LOCAL_QUEUE: usize = 256;
+const PUMP_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct AgentEntry {
     info: TargetInfo,
@@ -31,13 +34,133 @@ struct AgentEntry {
     token: CancellationToken,
 }
 
-struct Pending {
+struct Leg {
+    agent_id: u64,
+    agent_tx: Sink,
+    call_id: u64,
+}
+
+struct CallRoute {
     server_id: u64,
     server_tx: Sink,
     server_req_id: u64,
-    agent_id: u64,
-    agent_tx: Sink,
+    leg: Leg,
     deadline: Instant,
+}
+
+struct TransferRoute {
+    server_id: u64,
+    server_tx: Sink,
+    server_req_id: u64,
+    source: Leg,
+    dest: Leg,
+    deadline: Instant,
+    next_seq: u64,
+    committing: bool,
+}
+
+enum Pending {
+    Call(CallRoute),
+    Transfer(TransferRoute),
+}
+
+enum Decision {
+    Nothing,
+    Send {
+        tx: Sink,
+        msg: Msg,
+    },
+    SendThenCancel {
+        tx: Sink,
+        msg: Msg,
+        cancels: Vec<(Sink, u64, &'static str)>,
+    },
+    Fail {
+        server_tx: Sink,
+        server_req_id: u64,
+        code: &'static str,
+        message: String,
+        cancels: Vec<(Sink, u64, &'static str)>,
+        ends: Vec<(Sink, Msg)>,
+    },
+}
+
+impl Pending {
+    fn server(&self) -> (u64, &Sink, u64) {
+        match self {
+            Pending::Call(call) => (call.server_id, &call.server_tx, call.server_req_id),
+            Pending::Transfer(transfer) => (
+                transfer.server_id,
+                &transfer.server_tx,
+                transfer.server_req_id,
+            ),
+        }
+    }
+
+    fn deadline(&self) -> Instant {
+        match self {
+            Pending::Call(call) => call.deadline,
+            Pending::Transfer(transfer) => transfer.deadline,
+        }
+    }
+
+    fn touches_agent(&self, conn_id: u64) -> bool {
+        match self {
+            Pending::Call(call) => call.leg.agent_id == conn_id,
+            Pending::Transfer(transfer) => {
+                transfer.source.agent_id == conn_id || transfer.dest.agent_id == conn_id
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct Routes {
+    pending: HashMap<u64, Pending>,
+    legs: HashMap<u64, u64>,
+}
+
+impl Routes {
+    fn track(&mut self, root: u64, pending: Pending) {
+        match &pending {
+            Pending::Call(call) => {
+                self.legs.insert(call.leg.call_id, root);
+            }
+            Pending::Transfer(transfer) => {
+                self.legs.insert(transfer.source.call_id, root);
+                self.legs.insert(transfer.dest.call_id, root);
+            }
+        }
+        self.pending.insert(root, pending);
+    }
+
+    fn take(&mut self, root: u64) -> Option<Pending> {
+        let removed = self.pending.remove(&root)?;
+        match &removed {
+            Pending::Call(call) => {
+                self.legs.remove(&call.leg.call_id);
+            }
+            Pending::Transfer(transfer) => {
+                self.legs.remove(&transfer.source.call_id);
+                self.legs.remove(&transfer.dest.call_id);
+            }
+        }
+        Some(removed)
+    }
+
+    fn root_of(&self, leg_id: u64) -> Option<u64> {
+        self.legs.get(&leg_id).copied()
+    }
+
+    fn owned_by_server(&self, server_id: u64, req_id: u64) -> Option<u64> {
+        self.pending
+            .iter()
+            .find(|(_, entry)| {
+                let (owner, _, request) = entry.server();
+                owner == server_id && request == req_id
+            })
+            .map(|(root, _)| *root)
+    }
 }
 
 struct HubState {
@@ -45,7 +168,7 @@ struct HubState {
     started: u64,
     agents: RwLock<HashMap<String, AgentEntry>>,
     servers: RwLock<HashMap<u64, Sink>>,
-    pending: Mutex<HashMap<u64, Pending>>,
+    routes: Mutex<Routes>,
     next_id: AtomicU64,
     next_call: AtomicU64,
     executor: Executor,
@@ -59,7 +182,7 @@ impl HubState {
             started: now_ms(),
             agents: RwLock::new(HashMap::new()),
             servers: RwLock::new(HashMap::new()),
-            pending: Mutex::new(HashMap::new()),
+            routes: Mutex::new(Routes::default()),
             next_id: AtomicU64::new(1),
             next_call: AtomicU64::new(1),
             executor,
@@ -149,6 +272,11 @@ impl HubState {
             self.reply_targets(&server_tx, req_id).await;
             return;
         }
+        if method == "transfer" {
+            self.route_transfer(server_id, server_tx, req_id, params)
+                .await;
+            return;
+        }
         self.route_call(server_id, server_tx, req_id, target, method, params)
             .await;
     }
@@ -188,12 +316,7 @@ impl HubState {
         method: String,
         params: Value,
     ) {
-        let agent = self
-            .agents
-            .read()
-            .await
-            .get(&target)
-            .map(|entry| (entry.tx.clone(), entry.conn_id));
+        let agent = self.agent_leg(&target).await;
         let Some((agent_tx, agent_id)) = agent else {
             reply_error(
                 &server_tx,
@@ -206,16 +329,19 @@ impl HubState {
 
         let call_id = self.next_call.fetch_add(1, Ordering::Relaxed);
         let deadline = Instant::now() + limits::deadline(&method, &params);
-        self.pending.lock().await.insert(
+        self.routes.lock().await.track(
             call_id,
-            Pending {
+            Pending::Call(CallRoute {
                 server_id,
                 server_tx: server_tx.clone(),
                 server_req_id: req_id,
-                agent_id,
-                agent_tx: agent_tx.clone(),
+                leg: Leg {
+                    agent_id,
+                    agent_tx: agent_tx.clone(),
+                    call_id,
+                },
                 deadline,
-            },
+            }),
         );
 
         let call = Msg::Call {
@@ -225,33 +351,398 @@ impl HubState {
             params,
         };
         if agent_tx.try_send(call).is_err() {
-            let removed = self.pending.lock().await.remove(&call_id);
+            let removed = self.routes.lock().await.take(call_id);
             drop(removed);
             reply_error(&server_tx, req_id, "offline", "目标连接已断开或繁忙");
         }
     }
 
-    async fn forward_from_agent(&self, agent_id: u64, msg: Msg) {
-        let Some(call_id) = msg.id() else {
+    async fn route_transfer(&self, server_id: u64, server_tx: Sink, req_id: u64, params: Value) {
+        let parsed: TransferParams = match cbor::deserialize(&params) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                reply_error(
+                    &server_tx,
+                    req_id,
+                    "protocol",
+                    format!("transfer 参数不合法: {err:#}"),
+                );
+                return;
+            }
+        };
+        if parsed.source.trim().is_empty() || parsed.dest.trim().is_empty() {
+            reply_error(
+                &server_tx,
+                req_id,
+                "protocol",
+                "transfer 需要 source 与 dest",
+            );
+            return;
+        }
+        if parsed.source_path.trim().is_empty() || parsed.dest_path.trim().is_empty() {
+            reply_error(
+                &server_tx,
+                req_id,
+                "protocol",
+                "transfer 需要 source_path 与 dest_path",
+            );
+            return;
+        }
+        let Some((source_tx, source_id)) = self.agent_leg(&parsed.source).await else {
+            reply_error(
+                &server_tx,
+                req_id,
+                "unknown_target",
+                format!("源目标不在线: {}", parsed.source),
+            );
             return;
         };
-        let terminal = matches!(msg, Msg::End { .. } | Msg::Result { .. });
-        let forwarded = {
-            let mut pending = self.pending.lock().await;
-            let Some(entry) = pending.get(&call_id) else {
+        let Some((dest_tx, dest_id)) = self.agent_leg(&parsed.dest).await else {
+            reply_error(
+                &server_tx,
+                req_id,
+                "unknown_target",
+                format!("目的目标不在线: {}", parsed.dest),
+            );
+            return;
+        };
+
+        let upload = match cbor::serialize(&UploadParams {
+            remote_path: parsed.dest_path.clone(),
+            size: parsed.max_size,
+            overwrite: parsed.overwrite,
+            create_parents: parsed.create_parents,
+        }) {
+            Ok(value) => value,
+            Err(err) => {
+                reply_error(
+                    &server_tx,
+                    req_id,
+                    "internal",
+                    format!("序列化上传参数失败: {err:#}"),
+                );
+                return;
+            }
+        };
+        let download = match cbor::serialize(&DownloadParams {
+            remote_path: parsed.source_path.clone(),
+            max_size: parsed.max_size,
+        }) {
+            Ok(value) => value,
+            Err(err) => {
+                reply_error(
+                    &server_tx,
+                    req_id,
+                    "internal",
+                    format!("序列化下载参数失败: {err:#}"),
+                );
+                return;
+            }
+        };
+
+        let source_call = self.next_call.fetch_add(1, Ordering::Relaxed);
+        let dest_call = self.next_call.fetch_add(1, Ordering::Relaxed);
+        let deadline = Instant::now() + limits::deadline("transfer", &params);
+        self.routes.lock().await.track(
+            source_call,
+            Pending::Transfer(TransferRoute {
+                server_id,
+                server_tx: server_tx.clone(),
+                server_req_id: req_id,
+                source: Leg {
+                    agent_id: source_id,
+                    agent_tx: source_tx.clone(),
+                    call_id: source_call,
+                },
+                dest: Leg {
+                    agent_id: dest_id,
+                    agent_tx: dest_tx.clone(),
+                    call_id: dest_call,
+                },
+                deadline,
+                next_seq: 0,
+                committing: false,
+            }),
+        );
+
+        let upload_call = Msg::Call {
+            id: dest_call,
+            target: parsed.dest.clone(),
+            method: "upload".to_string(),
+            params: upload,
+        };
+        let download_call = Msg::Call {
+            id: source_call,
+            target: parsed.source.clone(),
+            method: "download".to_string(),
+            params: download,
+        };
+        let started =
+            dest_tx.try_send(upload_call).is_ok() && source_tx.try_send(download_call).is_ok();
+        if !started {
+            let removed = self.routes.lock().await.take(source_call);
+            drop(removed);
+            for (tx, id) in [(&dest_tx, dest_call), (&source_tx, source_call)] {
+                let _ = tx.try_send(Msg::Cancel {
+                    id,
+                    reason: Some("transfer aborted".to_string()),
+                });
+            }
+            reply_error(&server_tx, req_id, "offline", "目标连接已断开或繁忙");
+            return;
+        }
+        info!(
+            source = %parsed.source,
+            dest = %parsed.dest,
+            "开始节点互传"
+        );
+    }
+
+    async fn agent_leg(&self, name: &str) -> Option<(Sink, u64)> {
+        self.agents
+            .read()
+            .await
+            .get(name)
+            .map(|entry| (entry.tx.clone(), entry.conn_id))
+    }
+
+    async fn forward_from_agent(&self, agent_id: u64, msg: Msg) {
+        let Some(leg_id) = msg.id() else {
+            return;
+        };
+        let decision = {
+            let mut routes = self.routes.lock().await;
+            let Some(root) = routes.root_of(leg_id) else {
                 return;
             };
-            if entry.agent_id != agent_id {
+            let Some(entry) = routes.take(root) else {
                 return;
+            };
+            match entry {
+                Pending::Call(call) => {
+                    if call.leg.agent_id != agent_id {
+                        routes.track(root, Pending::Call(call));
+                        return;
+                    }
+                    let terminal = matches!(msg, Msg::End { .. } | Msg::Result { .. });
+                    let out = Decision::Send {
+                        tx: call.server_tx.clone(),
+                        msg: msg.with_id(call.server_req_id),
+                    };
+                    if !terminal {
+                        routes.track(root, Pending::Call(call));
+                    }
+                    out
+                }
+                Pending::Transfer(mut transfer) => {
+                    if leg_id == transfer.source.call_id {
+                        if transfer.source.agent_id != agent_id {
+                            routes.track(root, Pending::Transfer(transfer));
+                            return;
+                        }
+                        match msg {
+                            Msg::Chunk { stream, data, .. } if !transfer.committing => {
+                                let seq = transfer.next_seq;
+                                transfer.next_seq += 1;
+                                let out = Decision::Send {
+                                    tx: transfer.dest.agent_tx.clone(),
+                                    msg: Msg::Chunk {
+                                        id: transfer.dest.call_id,
+                                        seq,
+                                        stream,
+                                        data,
+                                    },
+                                };
+                                routes.track(root, Pending::Transfer(transfer));
+                                out
+                            }
+                            Msg::End {
+                                status,
+                                size,
+                                sha256,
+                                ..
+                            } => {
+                                if status == EndStatus::Ok {
+                                    transfer.committing = true;
+                                    let out = Decision::Send {
+                                        tx: transfer.dest.agent_tx.clone(),
+                                        msg: Msg::End {
+                                            id: transfer.dest.call_id,
+                                            status,
+                                            size,
+                                            sha256,
+                                        },
+                                    };
+                                    routes.track(root, Pending::Transfer(transfer));
+                                    out
+                                } else {
+                                    let message = match status {
+                                        EndStatus::Cancelled => "源端取消了这次传输",
+                                        _ => "源端读取文件失败",
+                                    };
+                                    Decision::Fail {
+                                        server_tx: transfer.server_tx.clone(),
+                                        server_req_id: transfer.server_req_id,
+                                        code: "io",
+                                        message: message.to_string(),
+                                        cancels: Vec::new(),
+                                        ends: vec![(
+                                            transfer.dest.agent_tx.clone(),
+                                            Msg::End {
+                                                id: transfer.dest.call_id,
+                                                status,
+                                                size: None,
+                                                sha256: None,
+                                            },
+                                        )],
+                                    }
+                                }
+                            }
+                            Msg::Result { ok, error, .. } if !ok => {
+                                let (code, message) = match error {
+                                    Some(error) => (remote_code(&error.code), error.message),
+                                    None => ("io", "源端读取文件失败".to_string()),
+                                };
+                                Decision::Fail {
+                                    server_tx: transfer.server_tx.clone(),
+                                    server_req_id: transfer.server_req_id,
+                                    code,
+                                    message,
+                                    cancels: vec![(
+                                        transfer.dest.agent_tx.clone(),
+                                        transfer.dest.call_id,
+                                        "transfer aborted",
+                                    )],
+                                    ends: Vec::new(),
+                                }
+                            }
+                            other => {
+                                debug!(msg = ?other, "互传的源端回了意外消息");
+                                routes.track(root, Pending::Transfer(transfer));
+                                Decision::Nothing
+                            }
+                        }
+                    } else {
+                        if transfer.dest.agent_id != agent_id {
+                            routes.track(root, Pending::Transfer(transfer));
+                            return;
+                        }
+                        match msg {
+                            Msg::Result {
+                                ok, value, error, ..
+                            } => {
+                                let cancels = if ok {
+                                    Vec::new()
+                                } else {
+                                    vec![(
+                                        transfer.source.agent_tx.clone(),
+                                        transfer.source.call_id,
+                                        "transfer aborted",
+                                    )]
+                                };
+                                Decision::SendThenCancel {
+                                    tx: transfer.server_tx.clone(),
+                                    msg: Msg::Result {
+                                        id: transfer.server_req_id,
+                                        ok,
+                                        value,
+                                        error,
+                                    },
+                                    cancels,
+                                }
+                            }
+                            other => {
+                                debug!(msg = ?other, "互传的目的端回了意外消息");
+                                routes.track(root, Pending::Transfer(transfer));
+                                Decision::Nothing
+                            }
+                        }
+                    }
+                }
             }
-            let target = (entry.server_tx.clone(), entry.server_req_id);
-            if terminal {
-                pending.remove(&call_id);
-            }
-            target
         };
-        if forwarded.0.try_send(msg.with_id(forwarded.1)).is_err() {
-            debug!(call_id, "转发出站结果失败");
+        self.deliver(decision).await;
+    }
+
+    async fn deliver(&self, decision: Decision) {
+        match decision {
+            Decision::Nothing => {}
+            Decision::Send { tx, msg } => self.forward(tx, msg).await,
+            Decision::SendThenCancel { tx, msg, cancels } => {
+                self.forward(tx, msg).await;
+                for (tx, id, reason) in cancels {
+                    let _ = tx.try_send(Msg::Cancel {
+                        id,
+                        reason: Some(reason.to_string()),
+                    });
+                }
+            }
+            Decision::Fail {
+                server_tx,
+                server_req_id,
+                code,
+                message,
+                cancels,
+                ends,
+            } => {
+                for (tx, msg) in ends {
+                    self.forward(tx, msg).await;
+                }
+                for (tx, id, reason) in cancels {
+                    let _ = tx.try_send(Msg::Cancel {
+                        id,
+                        reason: Some(reason.to_string()),
+                    });
+                }
+                reply_error(&server_tx, server_req_id, code, message);
+            }
+        }
+    }
+
+    async fn forward(&self, tx: Sink, msg: Msg) {
+        let id = msg.id();
+        match timeout(PUMP_SEND_TIMEOUT, tx.send(msg)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => debug!(leg = ?id, "转发出站消息失败"),
+            Err(_) => {
+                warn!(leg = ?id, "目的端长时间不接受数据，放弃该调用");
+                if let Some(leg) = id {
+                    self.abort_leg(leg, "busy", "目的端长时间不接受数据").await;
+                }
+            }
+        }
+    }
+
+    async fn abort_leg(&self, leg_id: u64, code: &'static str, message: impl Into<String>) {
+        let taken = {
+            let mut routes = self.routes.lock().await;
+            let Some(root) = routes.root_of(leg_id) else {
+                return;
+            };
+            routes.take(root)
+        };
+        let message = message.into();
+        match taken {
+            Some(Pending::Call(call)) => {
+                let _ = call.leg.agent_tx.try_send(Msg::Cancel {
+                    id: call.leg.call_id,
+                    reason: Some(message.clone()),
+                });
+                reply_error(&call.server_tx, call.server_req_id, code, message);
+            }
+            Some(Pending::Transfer(transfer)) => {
+                let reason = Some(message.clone());
+                let _ = transfer.source.agent_tx.try_send(Msg::Cancel {
+                    id: transfer.source.call_id,
+                    reason: reason.clone(),
+                });
+                let _ = transfer.dest.agent_tx.try_send(Msg::Cancel {
+                    id: transfer.dest.call_id,
+                    reason,
+                });
+                reply_error(&transfer.server_tx, transfer.server_req_id, code, message);
+            }
+            None => {}
         }
     }
 
@@ -260,13 +751,17 @@ impl HubState {
             return false;
         };
         let target = {
-            let pending = self.pending.lock().await;
-            pending
-                .iter()
-                .find(|(_, entry)| entry.server_id == server_id && entry.server_req_id == req_id)
-                .map(|(call_id, entry)| (*call_id, entry.agent_tx.clone()))
+            let routes = self.routes.lock().await;
+            routes.owned_by_server(server_id, req_id).and_then(|root| {
+                match routes.pending.get(&root) {
+                    Some(Pending::Call(call)) => {
+                        Some((call.leg.agent_tx.clone(), call.leg.call_id))
+                    }
+                    _ => None,
+                }
+            })
         };
-        let Some((call_id, agent_tx)) = target else {
+        let Some((agent_tx, call_id)) = target else {
             return false;
         };
         if agent_tx.try_send(msg.with_id(call_id)).is_err() {
@@ -276,18 +771,32 @@ impl HubState {
     }
 
     async fn cancel_call(&self, server_id: u64, req_id: u64, reason: Option<String>) {
-        let found = {
-            let pending = self.pending.lock().await;
-            pending
-                .iter()
-                .find(|(_, entry)| entry.server_id == server_id && entry.server_req_id == req_id)
-                .map(|(call_id, entry)| (*call_id, entry.agent_tx.clone()))
+        let reason = reason.unwrap_or_else(|| "cancelled".to_string());
+        let taken = {
+            let mut routes = self.routes.lock().await;
+            let Some(root) = routes.owned_by_server(server_id, req_id) else {
+                return;
+            };
+            routes.take(root)
         };
-        if let Some((call_id, agent_tx)) = found {
-            let _ = agent_tx.try_send(Msg::Cancel {
-                id: call_id,
-                reason,
-            });
+        match taken {
+            Some(Pending::Call(call)) => {
+                let _ = call.leg.agent_tx.try_send(Msg::Cancel {
+                    id: call.leg.call_id,
+                    reason: Some(reason),
+                });
+            }
+            Some(Pending::Transfer(transfer)) => {
+                let _ = transfer.source.agent_tx.try_send(Msg::Cancel {
+                    id: transfer.source.call_id,
+                    reason: Some(reason.clone()),
+                });
+                let _ = transfer.dest.agent_tx.try_send(Msg::Cancel {
+                    id: transfer.dest.call_id,
+                    reason: Some(reason),
+                });
+            }
+            None => {}
         }
     }
 
@@ -295,27 +804,10 @@ impl HubState {
         match role {
             Role::Agent => {
                 let removed = self.remove_agent(&info.name, sink).await;
-                let dropped: Vec<Pending> = {
-                    let mut pending = self.pending.lock().await;
-                    let ids: Vec<u64> = pending
-                        .iter()
-                        .filter(|(_, entry)| entry.agent_id == conn_id)
-                        .map(|(id, _)| *id)
-                        .collect();
-                    ids.into_iter()
-                        .filter_map(|id| pending.remove(&id))
-                        .collect()
-                };
+                let dropped = self.take_where(|entry| entry.touches_agent(conn_id)).await;
                 for entry in dropped {
-                    let _ = entry.server_tx.try_send(Msg::Result {
-                        id: entry.server_req_id,
-                        ok: false,
-                        value: None,
-                        error: Some(ProtoError::new(
-                            "offline",
-                            format!("目标 {} 已断开", info.name),
-                        )),
-                    });
+                    self.drop_entry(entry, "offline", format!("目标 {} 已断开", info.name))
+                        .await;
                 }
                 if removed {
                     self.broadcast(Msg::TargetEvent {
@@ -328,23 +820,46 @@ impl HubState {
             }
             Role::Server => {
                 self.remove_server(conn_id).await;
-                let cancelled: Vec<(u64, Pending)> = {
-                    let mut pending = self.pending.lock().await;
-                    let ids: Vec<u64> = pending
-                        .iter()
-                        .filter(|(_, entry)| entry.server_id == conn_id)
-                        .map(|(id, _)| *id)
-                        .collect();
-                    ids.into_iter()
-                        .filter_map(|id| pending.remove(&id).map(|entry| (id, entry)))
-                        .collect()
-                };
-                for (call_id, entry) in cancelled {
-                    let _ = entry.agent_tx.try_send(Msg::Cancel {
-                        id: call_id,
-                        reason: Some("server disconnected".into()),
-                    });
+                let dropped = self.take_where(|entry| entry.server().0 == conn_id).await;
+                for entry in dropped {
+                    self.drop_entry(entry, "offline", "发起方已断开".to_string())
+                        .await;
                 }
+            }
+        }
+    }
+
+    async fn take_where(&self, keep: impl Fn(&Pending) -> bool) -> Vec<Pending> {
+        let mut routes = self.routes.lock().await;
+        let ids: Vec<u64> = routes
+            .pending
+            .iter()
+            .filter(|(_, entry)| keep(entry))
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter().filter_map(|id| routes.take(id)).collect()
+    }
+
+    async fn drop_entry(&self, entry: Pending, code: &'static str, message: String) {
+        match entry {
+            Pending::Call(call) => {
+                let _ = call.leg.agent_tx.try_send(Msg::Cancel {
+                    id: call.leg.call_id,
+                    reason: Some(message.clone()),
+                });
+                reply_error(&call.server_tx, call.server_req_id, code, message);
+            }
+            Pending::Transfer(transfer) => {
+                let reason = Some(message.clone());
+                let _ = transfer.source.agent_tx.try_send(Msg::Cancel {
+                    id: transfer.source.call_id,
+                    reason: reason.clone(),
+                });
+                let _ = transfer.dest.agent_tx.try_send(Msg::Cancel {
+                    id: transfer.dest.call_id,
+                    reason,
+                });
+                reply_error(&transfer.server_tx, transfer.server_req_id, code, message);
             }
         }
     }
@@ -361,28 +876,10 @@ impl HubState {
                 _ = ticker.tick() => {}
             }
             let now = Instant::now();
-            let expired: Vec<(u64, Pending)> = {
-                let mut pending = self.pending.lock().await;
-                let ids: Vec<u64> = pending
-                    .iter()
-                    .filter(|(_, entry)| entry.deadline <= now)
-                    .map(|(id, _)| *id)
-                    .collect();
-                ids.into_iter()
-                    .filter_map(|id| pending.remove(&id).map(|entry| (id, entry)))
-                    .collect()
-            };
-            for (call_id, entry) in expired {
-                let _ = entry.server_tx.try_send(Msg::Result {
-                    id: entry.server_req_id,
-                    ok: false,
-                    value: None,
-                    error: Some(ProtoError::new("timeout", "远端执行超时")),
-                });
-                let _ = entry.agent_tx.try_send(Msg::Cancel {
-                    id: call_id,
-                    reason: Some("timeout".into()),
-                });
+            let expired = self.take_where(|entry| entry.deadline() <= now).await;
+            for entry in expired {
+                self.drop_entry(entry, "timeout", "远端执行超时".to_string())
+                    .await;
             }
         }
     }
@@ -671,6 +1168,18 @@ fn parse_hello(msg: Msg) -> Result<(Role, String, TargetInfo)> {
         roots,
     };
     Ok((role, name, info))
+}
+
+fn remote_code(code: &str) -> &'static str {
+    match code {
+        "not_found" => "not_found",
+        "denied" => "denied",
+        "too_large" => "too_large",
+        "conflict" => "conflict",
+        "timeout" => "timeout",
+        "cancelled" => "cancelled",
+        _ => "io",
+    }
 }
 
 fn reply_error(tx: &Sink, id: u64, code: &str, message: impl Into<String>) {

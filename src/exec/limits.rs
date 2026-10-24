@@ -3,7 +3,7 @@ use std::time::Duration;
 use ciborium::value::Value;
 
 use crate::exec::transfer::transfer_limit;
-use crate::proto::params::{BashParams, DownloadParams, UploadParams};
+use crate::proto::params::{BashParams, DownloadParams, TransferParams, UploadParams};
 use crate::proto::value;
 
 pub const BASH_DEFAULT_TIMEOUT_MS: u64 = 300_000;
@@ -37,6 +37,13 @@ pub fn deadline(method: &str, params: &Value) -> Duration {
         }
         "download" => {
             let size = value::deserialize::<DownloadParams>(params)
+                .ok()
+                .and_then(|params| params.max_size)
+                .unwrap_or_default();
+            transfer_limit(size) + TRANSFER_MARGIN
+        }
+        "transfer" => {
+            let size = value::deserialize::<TransferParams>(params)
                 .ok()
                 .and_then(|params| params.max_size)
                 .unwrap_or_default();

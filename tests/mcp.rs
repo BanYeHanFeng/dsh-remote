@@ -286,6 +286,57 @@ async fn upload_and_download_through_mcp() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upload_and_download_between_nodes_through_mcp() {
+    let harness = Harness::start("mcp", true, true, None).await;
+    let mut mcp = connect(&harness).await;
+
+    let source = harness.local("node-source.txt");
+    std::fs::write(&source, b"node to node").unwrap();
+    let source_text = source.to_string_lossy().to_string();
+    let dest = harness.remote("node-copy.txt");
+
+    let (text, is_error) = mcp
+        .tool(
+            "upload",
+            json!({ "target": "nas", "remote_path": dest, "from": "hub", "source_path": source_text }),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains("已传输"), "{text}");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"node to node");
+
+    let back = harness.local("node-back.txt");
+    let back_text = back.to_string_lossy().to_string();
+    let (text, is_error) = mcp
+        .tool(
+            "download",
+            json!({ "target": "nas", "remote_path": dest, "to": "hub", "dest_path": back_text }),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains("已传输"), "{text}");
+    assert_eq!(std::fs::read(&back).unwrap(), b"node to node");
+
+    let (text, is_error) = mcp
+        .tool(
+            "upload",
+            json!({ "target": "nas", "remote_path": dest, "from": "hub" }),
+        )
+        .await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("source_path"), "{text}");
+
+    let (text, is_error) = mcp
+        .tool("uppload", json!({ "target": "nas", "remote_path": dest }))
+        .await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("未知工具"), "{text}");
+
+    mcp.close().await;
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_call_returns_quickly() {
     let harness = Harness::start("mcp", true, true, None).await;
     let mut mcp = connect(&harness).await;
