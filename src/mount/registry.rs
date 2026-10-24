@@ -43,10 +43,7 @@ impl Mounts {
                 info.remote_root
             ));
         }
-        let spec = MountSpec {
-            mountpoint,
-            ..spec
-        };
+        let spec = MountSpec { mountpoint, ..spec };
         let mount = Mount::start(session, spec)
             .await
             .map_err(|err| format!("{err:#}"))?;

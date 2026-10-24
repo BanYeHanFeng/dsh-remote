@@ -271,11 +271,13 @@ impl Mount {
             }
         }
         if let Some(worker) = self.worker.take() {
-            let _ = tokio::time::timeout(
-                SHUTDOWN_WAIT,
-                tokio::task::spawn_blocking(move || worker.join()),
-            )
-            .await;
+            let join = tokio::task::spawn_blocking(move || worker.join());
+            if tokio::time::timeout(SHUTDOWN_WAIT, join).await.is_err() {
+                warn!(
+                    mountpoint = %self.mountpoint.display(),
+                    "FUSE 线程没按时退出，挂载点可能还占着"
+                );
+            }
         }
         self.inner.shutdown().await;
         let _ = std::fs::remove_dir_all(&self.spool_dir);
