@@ -232,7 +232,7 @@ fn from_ms(value: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(value)
 }
 
-fn named(path: &Path, meta: &fs::Metadata) -> FsEntry {
+pub(crate) fn named(path: &Path, meta: &fs::Metadata) -> FsEntry {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())

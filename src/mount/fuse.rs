@@ -154,11 +154,11 @@ impl Filesystem for Fs {
                 let path = inner
                     .path(ino)
                     .ok_or_else(|| MountError::new(libc::ESTALE, "未知 inode"))?;
-                let spool = inner.ensure_spool(&path, create).await?;
-                if truncate && writing {
-                    let mut guard = spool.lock().await;
-                    guard.truncate(0)?;
-                }
+                let spool = if truncate && writing {
+                    inner.replace_spool(&path).await?
+                } else {
+                    inner.ensure_spool(&path, create).await?
+                };
                 let mut guard = spool.lock().await;
                 guard.opened += 1;
                 drop(guard);
@@ -314,7 +314,7 @@ impl Filesystem for Fs {
                 let path = inner
                     .child(&parent_path, &name)
                     .ok_or_else(|| MountError::new(libc::EINVAL, "名称不合法"))?;
-                let spool = inner.create_file(&path).await?;
+                let spool = inner.replace_spool(&path).await?;
                 let mut guard = spool.lock().await;
                 guard.opened += 1;
                 let entry = FsEntry {

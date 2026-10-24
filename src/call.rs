@@ -381,6 +381,7 @@ pub async fn download(
                         path: local.display().to_string(),
                         size: received,
                         sha256: digest,
+                        entry: None,
                     });
                 }
                 Msg::Result { ok, error, .. } => {

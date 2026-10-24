@@ -759,18 +759,34 @@ impl Inner {
     }
 
     pub async fn flush(&self, spool: &Arc<AsyncMutex<Spool>>) -> Result<(), MountError> {
-        let (path, pending_mode) = {
+        let (path, pending_mode, entry) = {
             let mut guard = spool.lock().await;
             if !guard.dirty {
                 return Ok(());
             }
             let path = guard.path.clone();
-            guard
+            let entry = guard
                 .flush(&self.session, &self.target, &self.cancel)
                 .await
                 .map_err(MountError::from)?;
-            (path, guard.pending_mode.take())
+            (path, guard.pending_mode.take(), entry)
         };
+        let synced = match entry {
+            Some(entry) => Some(entry),
+            None => match self.remote_stat(&path).await {
+                Ok(entry) => Some(entry),
+                Err(err) => {
+                    warn!(path, error = %err.message, "回传后读取属性失败");
+                    None
+                }
+            },
+        };
+        if let Some(entry) = synced {
+            let mut guard = spool.lock().await;
+            guard.mark_synced(&entry);
+            drop(guard);
+            self.insert_child(&self.parent(&path), entry);
+        }
         if let Some(mode) = pending_mode {
             let params = FsParams {
                 op: "setattr".to_string(),
@@ -786,16 +802,6 @@ impl Inner {
                 }
                 Err(err) => warn!(path, error = %err, "回传后设置权限失败"),
             }
-        }
-        match self.remote_stat(&path).await {
-            Ok(entry) => {
-                let mut guard = spool.lock().await;
-                guard.mark_synced(&entry);
-                let parent = self.parent(&path);
-                drop(guard);
-                self.insert_child(&parent, entry);
-            }
-            Err(err) => warn!(path, error = %err.message, "回传后读取属性失败"),
         }
         Ok(())
     }
@@ -817,25 +823,29 @@ impl Inner {
         Ok(self.record(path, entry))
     }
 
-    pub async fn create_file(&self, path: &str) -> Result<Arc<AsyncMutex<Spool>>, MountError> {
+    pub async fn replace_spool(&self, path: &str) -> Result<Arc<AsyncMutex<Spool>>, MountError> {
+        if let Some(entry) = self.cached_attr(path) {
+            if entry.is_dir() {
+                return Err(MountError::new(libc::EISDIR, "目标是目录"));
+            }
+            if entry.is_symlink() {
+                return Err(MountError::new(libc::ELOOP, "目标是符号链接"));
+            }
+        }
         let spool = match self.spool(path) {
             Some(spool) => spool,
             None => {
-                let exists = self.stat(path).await.is_ok();
-                if exists {
-                    self.ensure_spool(path, false).await?
-                } else {
-                    let seq = self.spool_seq.fetch_add(1, Ordering::Relaxed);
-                    let local = self.spool_dir.join(format!("{seq}.part"));
-                    let spool = Arc::new(AsyncMutex::new(Spool::empty(path, local)));
-                    self.store_spool(path, spool.clone(), 0);
-                    spool
-                }
+                let seq = self.spool_seq.fetch_add(1, Ordering::Relaxed);
+                let local = self.spool_dir.join(format!("{seq}.part"));
+                let spool = Arc::new(AsyncMutex::new(Spool::empty(path, local)));
+                self.store_spool(path, spool.clone(), 0);
+                spool
             }
         };
-        let mut guard = spool.lock().await;
-        guard.truncate(0)?;
-        drop(guard);
+        {
+            let mut guard = spool.lock().await;
+            guard.truncate(0)?;
+        }
         Ok(spool)
     }
 

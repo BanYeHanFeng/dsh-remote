@@ -111,19 +111,19 @@ impl Spool {
         session: &Session,
         target: &str,
         cancel: &CancellationToken,
-    ) -> Result<(), RemoteError> {
+    ) -> Result<Option<FsEntry>, RemoteError> {
         if !self.dirty {
-            return Ok(());
+            return Ok(None);
         }
         self.file()
             .map_err(local_error)?
             .sync_data()
             .map_err(local_error)?;
-        call::upload(session, target, &self.local, &self.path, true, true, cancel)
+        let report = call::upload(session, target, &self.local, &self.path, true, true, cancel)
             .await
             .map_err(remote_error)?;
         self.dirty = false;
-        Ok(())
+        Ok(report.entry)
     }
 
     pub fn cleanup(&mut self) {

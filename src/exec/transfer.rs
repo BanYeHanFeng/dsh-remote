@@ -10,6 +10,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
 use crate::exec::error::{ToolError, ToolResult};
+use crate::proto::params::FsEntry;
 
 pub const CHUNK_SIZE: usize = 60 * 1024;
 pub const MAX_CHUNK_SIZE: usize = 64 * 1024;
@@ -51,6 +52,8 @@ pub struct TransferReport {
     pub path: String,
     pub size: u64,
     pub sha256: String,
+    #[serde(default)]
+    pub entry: Option<FsEntry>,
 }
 
 pub fn transfer_limit(size: u64) -> Duration {
@@ -255,10 +258,15 @@ impl Incoming {
                 ))
             })?;
         self.committed = true;
+        let entry = match tokio::fs::symlink_metadata(&self.final_path).await {
+            Ok(meta) => Some(crate::exec::fs::named(&self.final_path, &meta)),
+            Err(_) => None,
+        };
         Ok(TransferReport {
             path: self.final_path.display().to_string(),
             size: self.received,
             sha256: digest,
+            entry,
         })
     }
 
