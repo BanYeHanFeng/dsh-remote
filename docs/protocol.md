@@ -177,8 +177,9 @@ dest   ── Result{ok:true, value:{path,size,sha256}} ──▶ hub ── Res
 
 ### 3.4 目录与属性
 
-挂载（`dsh-remote mount`）需要的元数据都走同一个方法 `fs`，一次一个操作，`Result`
-一次返回；内容不在这里传，仍然走 `upload` / `download`，所以这一族只有属性。
+挂载（`dsh-remote mount` 或 MCP 的 `mount` 工具）需要的元数据都走同一个方法 `fs`，
+一次一个操作，`Result` 一次返回；内容不在这里传，仍然走 `upload` / `download`，
+所以这一族只有属性。
 
 | op | 参数 | 结果 | 说明 |
 | --- | --- | --- | --- |
@@ -302,15 +303,19 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 | `bash` | `bash` | `Result` | `300s + 30s`（目标可用 `SHELL_TIMEOUT_MS` 调小） |
 | `upload` | `upload`（本机→节点）或 `transfer`（`from` 节点互传） | 上行 `Chunk`+`End`，回程 `Result` | `300s + 大小/256KiB` |
 | `download` | `download`（节点→本机）或 `transfer`（`to` 节点互传） | 下行 `Chunk`+`End`，或互传的 `Result` | `300s + 大小/256KiB` |
+| `mount`（本机 FUSE） | `fs` 一族，内容用 `upload` / `download` | `Result` | 单次 `fs` 30s，传输按大小 |
 | `actions stop`（内部） | `shutdown`（发给目标节点） | `Result` | 10s |
 
 - `bash` 只有 `target` 与 `command` 两个参数：超时来自目标配置（`SHELL_TIMEOUT_MS`，
   默认 300 秒），单次返回的字符上限也来自目标配置（`MAX_OUTPUT_CHARS`，默认 16000）。
 - `upload` / `download` 各有两种用法：给 `local_path` 时走 DSH 本机磁盘，
   给 `from` / `to` 时改发 `transfer`，由中继在两个节点之间直接搬。
-- `mount` 不是 MCP 工具，而是一条 CLI 子命令（`dsh-remote mount`）：它用上面这族
-  `fs` 调用做元数据，用 `upload` / `download` 搬内容，把目标上的一个目录挂成本机
-  路径，于是本机的编辑器、`git`、AI 的文件工具都能直接读写远端文件。
+- `mount` 有两个入口：CLI 的 `dsh-remote mount` 与 MCP 的 `mount` 工具
+  （`action` 取 `mount` / `unmount` / `list`）。两者都把目标上的一个目录挂成本机
+  路径，于是本机的编辑器、`git`、AI 的文件工具都能直接读写远端文件。MCP 入口把
+  挂载登记在 server 进程里、和 session 共用一条连接：`unmount` 按挂载点卸载
+  （省略 mountpoint 就全部卸载），server 退出时全部自动卸载；`list` 只看得到本进程
+  挂的目录，CLI 那端挂在别的进程里。挂载点必须已存在，重复挂同一个点会直接报错。
 - `req_id` 由 server 侧的 `Session` 单调分配，一条连接内并发任意多路；
   收到 `End`/`Result` 即释放。
 - MCP 的 `notifications/cancelled` → 内部 `Cancel{id}`，hub 再转发给 agent：
