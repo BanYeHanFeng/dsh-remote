@@ -3,7 +3,7 @@ pub mod registry;
 pub mod spool;
 pub mod tree;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -22,6 +23,9 @@ use spool::Spool;
 use tree::Tree;
 
 const LIST_CAP: usize = 50_000;
+const UPLOAD_BATCH_MAX: usize = 32;
+const UPLOAD_BATCH_WINDOW: Duration = Duration::from_millis(20);
+const UPLOAD_CONCURRENCY: usize = 4;
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const CONNECT_LIMIT: Duration = Duration::from_secs(10);
 const MOUNT_SOURCE_PREFIX: &str = "dsh-remote:";
@@ -207,7 +211,7 @@ impl Mount {
             .with_context(|| format!("创建影子目录失败: {}", spool_dir.display()))?;
 
         let cancel = CancellationToken::new();
-        let inner = Arc::new(Inner::new(
+        let (inner, queue) = Inner::new(
             session.clone(),
             spec.target.clone(),
             spec.remote_root.clone(),
@@ -218,7 +222,9 @@ impl Mount {
             spec.attr_ttl,
             spec.read_only,
             cancel.clone(),
-        ));
+        );
+        let inner = Arc::new(inner);
+        inner.spawn_uploads(queue);
 
         let handle = tokio::runtime::Handle::current();
         let mut fuse_session = match fuser::Session::new(
@@ -265,6 +271,10 @@ impl Mount {
         &self.mountpoint
     }
 
+    pub async fn settle(&self) -> Result<(), MountError> {
+        self.inner.sync_pending().await
+    }
+
     pub fn info(&self) -> MountInfo {
         MountInfo {
             target: self.target.clone(),
@@ -282,6 +292,9 @@ impl Mount {
     }
 
     async fn release(&mut self) -> UnmountOutcome {
+        if let Err(err) = self.inner.sync_pending().await {
+            warn!(error = %err.message, "卸载前仍有影子文件没回传成功");
+        }
         let outcome = self.unmount();
         if let Some(worker) = self.worker.take() {
             if matches!(outcome, UnmountOutcome::Detached { .. }) {
@@ -487,6 +500,11 @@ pub struct Inner {
     spool_limit: u64,
     spool_seq: AtomicU64,
     spool_total: AtomicU64,
+    uploads: mpsc::UnboundedSender<Arc<AsyncMutex<Spool>>>,
+    upload_paths: Mutex<HashSet<String>>,
+    upload_count: watch::Sender<usize>,
+    upload_errors: Mutex<Vec<MountError>>,
+    upload_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     cancel: CancellationToken,
 }
 
@@ -499,8 +517,10 @@ impl Inner {
         attr_ttl: Duration,
         read_only: bool,
         cancel: CancellationToken,
-    ) -> Self {
-        Self {
+    ) -> (Self, mpsc::UnboundedReceiver<Arc<AsyncMutex<Spool>>>) {
+        let (uploads, queue) = mpsc::unbounded_channel();
+        let (upload_count, _) = watch::channel(0usize);
+        let inner = Self {
             session,
             target,
             read_only,
@@ -512,8 +532,14 @@ impl Inner {
             spool_limit: spool.limit,
             spool_seq: AtomicU64::new(0),
             spool_total: AtomicU64::new(0),
+            uploads,
+            upload_paths: Mutex::new(HashSet::new()),
+            upload_count,
+            upload_errors: Mutex::new(Vec::new()),
+            upload_worker: Mutex::new(None),
             cancel,
-        }
+        };
+        (inner, queue)
     }
 
     pub fn read_only(&self) -> bool {
@@ -596,6 +622,7 @@ impl Inner {
         if let Some(cache) = self.tree().dir(path) {
             return Ok(cache.entries.clone());
         }
+        self.sync_pending().await?;
         let mut entries = Vec::new();
         let mut offset = 0u64;
         loop {
@@ -644,6 +671,7 @@ impl Inner {
                 return Ok(spool.clone());
             }
         }
+        self.settle_path(path).await?;
         let remote = match self.stat(path).await {
             Ok(entry) => Some(entry),
             Err(err) if create && err.errno == libc::ENOENT => None,
@@ -759,22 +787,88 @@ impl Inner {
         lock(&self.handles).remove(&fh);
     }
 
-    pub async fn flush(&self, spool: &Arc<AsyncMutex<Spool>>) -> Result<(), MountError> {
-        let (path, pending_mode, entry) = {
+    fn spawn_uploads(self: &Arc<Self>, mut queue: mpsc::UnboundedReceiver<Arc<AsyncMutex<Spool>>>) {
+        let inner = self.clone();
+        let worker = tokio::spawn(async move {
+            let cancel = inner.cancel.clone();
+            loop {
+                let first = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    first = queue.recv() => match first {
+                        Some(first) => first,
+                        None => break,
+                    },
+                };
+                let mut batch = vec![first];
+                let deadline = tokio::time::Instant::now() + UPLOAD_BATCH_WINDOW;
+                while batch.len() < UPLOAD_BATCH_MAX {
+                    let next = tokio::select! {
+                        _ = cancel.cancelled() => None,
+                        next = tokio::time::timeout_at(deadline, queue.recv()) => {
+                            next.ok().flatten()
+                        }
+                    };
+                    match next {
+                        Some(spool) => batch.push(spool),
+                        None => break,
+                    }
+                }
+                let slots = Arc::new(tokio::sync::Semaphore::new(UPLOAD_CONCURRENCY));
+                let mut tasks = tokio::task::JoinSet::new();
+                for spool in batch {
+                    let inner = inner.clone();
+                    let slots = slots.clone();
+                    tasks.spawn(async move {
+                        if let Ok(_slot) = slots.acquire_owned().await {
+                            inner.upload_spool(&spool).await;
+                        }
+                    });
+                }
+                while tasks.join_next().await.is_some() {}
+            }
+        });
+        *lock(&self.upload_worker) = Some(worker);
+    }
+
+    async fn upload_spool(&self, spool: &Arc<AsyncMutex<Spool>>) {
+        loop {
+            let mut guard = spool.lock().await;
+            let path = guard.path.clone();
+            if !guard.dirty {
+                guard.queued = false;
+                drop(guard);
+                self.finish_upload(&path);
+                return;
+            }
+            let outcome = self.flush_locked(&path, &mut guard).await;
+            drop(guard);
+            match outcome {
+                Ok(()) => {}
+                Err(err) => {
+                    warn!(path, error = %err.message, "影子文件回传失败，下次远端操作会重报");
+                    lock(&self.upload_errors).push(err);
+                }
+            }
+            self.finish_upload(&path);
             let mut guard = spool.lock().await;
             if !guard.dirty {
-                return Ok(());
+                guard.queued = false;
+                return;
             }
-            let path = guard.path.clone();
-            let entry = guard
-                .flush(&self.session, &self.target, &self.cancel)
-                .await
-                .map_err(MountError::from)?;
-            (path, guard.pending_mode.take(), entry)
-        };
+            drop(guard);
+            self.mark_upload(&path);
+        }
+    }
+
+    async fn flush_locked(&self, path: &str, guard: &mut Spool) -> Result<(), MountError> {
+        let entry = guard
+            .flush(&self.session, &self.target, &self.cancel)
+            .await
+            .map_err(MountError::from)?;
+        let pending_mode = guard.pending_mode.take();
         let synced = match entry {
             Some(entry) => Some(entry),
-            None => match self.remote_stat(&path).await {
+            None => match self.remote_stat(path).await {
                 Ok(entry) => Some(entry),
                 Err(err) => {
                     warn!(path, error = %err.message, "回传后读取属性失败");
@@ -783,15 +877,14 @@ impl Inner {
             },
         };
         if let Some(entry) = synced {
-            let mut guard = spool.lock().await;
             guard.mark_synced(&entry);
-            drop(guard);
-            self.insert_child(&self.parent(&path), entry);
+            let parent = self.parent(path);
+            self.insert_child(&parent, entry);
         }
         if let Some(mode) = pending_mode {
             let params = FsParams {
                 op: "setattr".to_string(),
-                path: path.clone(),
+                path: path.to_string(),
                 mode: Some(mode),
                 ..FsParams::default()
             };
@@ -807,7 +900,75 @@ impl Inner {
         Ok(())
     }
 
+    fn mark_upload(&self, path: &str) {
+        lock(&self.upload_paths).insert(path.to_string());
+        self.upload_count.send_modify(|count| *count += 1);
+    }
+
+    fn finish_upload(&self, path: &str) {
+        if lock(&self.upload_paths).remove(path) {
+            self.upload_count
+                .send_modify(|count| *count = count.saturating_sub(1));
+        }
+    }
+
+    pub async fn queue_flush(&self, spool: &Arc<AsyncMutex<Spool>>) {
+        let path = {
+            let mut guard = spool.lock().await;
+            if !guard.dirty || guard.queued {
+                return;
+            }
+            guard.queued = true;
+            guard.path.clone()
+        };
+        self.mark_upload(&path);
+        if self.uploads.send(spool.clone()).is_err() {
+            self.finish_upload(&path);
+        }
+    }
+
+    pub async fn sync_pending(&self) -> Result<(), MountError> {
+        let mut count = self.upload_count.subscribe();
+        let waiting = async {
+            loop {
+                if *count.borrow_and_update() == 0 {
+                    return;
+                }
+                if count.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(SHUTDOWN_WAIT * 6, waiting).await;
+        let failure = lock(&self.upload_errors).pop();
+        match failure {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    async fn settle_path(&self, path: &str) -> Result<(), MountError> {
+        let mut count = self.upload_count.subscribe();
+        let waiting = async {
+            loop {
+                if *count.borrow_and_update() == 0 || !lock(&self.upload_paths).contains(path) {
+                    return;
+                }
+                if count.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(SHUTDOWN_WAIT * 6, waiting).await;
+        let failure = lock(&self.upload_errors).pop();
+        match failure {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
     pub async fn mkdir(&self, path: &str, mode: u32) -> Result<FsEntry, MountError> {
+        self.sync_pending().await?;
         let params = FsParams {
             op: "mkdir".to_string(),
             path: path.to_string(),
@@ -851,6 +1012,7 @@ impl Inner {
     }
 
     pub async fn remove(&self, path: &str) -> Result<(), MountError> {
+        self.sync_pending().await?;
         let params = FsParams {
             op: "remove".to_string(),
             path: path.to_string(),
@@ -871,6 +1033,7 @@ impl Inner {
     }
 
     pub async fn rename(&self, from: &str, to: &str, overwrite: bool) -> Result<(), MountError> {
+        self.sync_pending().await?;
         let params = FsParams {
             op: "rename".to_string(),
             path: from.to_string(),
@@ -894,6 +1057,7 @@ impl Inner {
     }
 
     pub async fn setattr(&self, path: &str, params: FsParams) -> Result<FsEntry, MountError> {
+        self.sync_pending().await?;
         if let Some(spool) = self.spool(path) {
             let mut guard = spool.lock().await;
             if guard.dirty {
@@ -930,6 +1094,7 @@ impl Inner {
     }
 
     pub async fn symlink(&self, path: &str, target: &str) -> Result<FsEntry, MountError> {
+        self.sync_pending().await?;
         let params = FsParams {
             op: "symlink".to_string(),
             path: path.to_string(),
@@ -951,6 +1116,7 @@ impl Inner {
     }
 
     pub async fn readlink(&self, path: &str) -> Result<String, MountError> {
+        self.sync_pending().await?;
         let params = FsParams {
             op: "readlink".to_string(),
             path: path.to_string(),
@@ -967,6 +1133,9 @@ impl Inner {
     }
 
     pub async fn shutdown(&self) {
+        if let Err(err) = self.sync_pending().await {
+            warn!(error = %err.message, "退出前仍有影子文件没回传成功");
+        }
         self.cancel.cancel();
         let spools: Vec<Arc<AsyncMutex<Spool>>> =
             lock(&self.spools).drain().map(|(_, spool)| spool).collect();

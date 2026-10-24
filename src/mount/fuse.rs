@@ -247,13 +247,8 @@ impl Filesystem for Fs {
         };
         let inner = self.inner.clone();
         self.offload(async move {
-            match inner.flush(&spool).await {
-                Ok(()) => reply.ok(),
-                Err(err) => {
-                    warn!(error = %err.message, "回传影子文件失败");
-                    reply.error(err.errno);
-                }
-            }
+            inner.queue_flush(&spool).await;
+            reply.ok();
         });
     }
 
@@ -273,9 +268,7 @@ impl Filesystem for Fs {
         };
         let inner = self.inner.clone();
         self.offload(async move {
-            if let Err(err) = inner.flush(&spool).await {
-                warn!(error = %err.message, "关闭文件时回传失败");
-            }
+            inner.queue_flush(&spool).await;
             let mut guard = spool.lock().await;
             guard.opened = guard.opened.saturating_sub(1);
             drop(guard);
@@ -561,7 +554,7 @@ impl Filesystem for Fs {
                         let mut guard = spool.lock().await;
                         guard.truncate(size)?;
                     }
-                    inner.flush(&spool).await?;
+                    inner.queue_flush(&spool).await;
                 }
                 let entry = if params.mode.is_some()
                     || params.atime_ms.is_some()

@@ -21,6 +21,7 @@ pub struct Spool {
     pub base_mtime_ms: u64,
     pub pending_mode: Option<u32>,
     pub opened: u32,
+    pub queued: bool,
     pub have_baseline: bool,
     pub last_used: Instant,
 }
@@ -38,6 +39,7 @@ impl Spool {
             base_mtime_ms: 0,
             pending_mode: None,
             opened: 0,
+            queued: false,
             have_baseline: false,
             last_used: Instant::now(),
         }
@@ -55,6 +57,7 @@ impl Spool {
             base_mtime_ms: mtime_ms,
             pending_mode: None,
             opened: 0,
+            queued: false,
             have_baseline: true,
             last_used: Instant::now(),
         }

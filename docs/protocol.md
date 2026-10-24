@@ -218,6 +218,11 @@ ctime_ms, perm, uid, gid, nlink`。
 - `list` 受单条 `Result` 60 KiB 限制：从 `offset` 起按名字顺序连续取，累计条目
   预算用满就截断，剩下的用 `next` 续取，大目录不会撞上限。
 - 一条 `fs` 调用超时 30 秒（`exec::limits` 一处定义），与 `bash`/传输的超时互不影响。
+- 挂载点是写回语义：`close` 立即返回，`upload` 在后台按批（20ms / 32 个窗口）
+  最多 4 路并发发出。`list`、`mkdir`、`remove`、`rename`、`setattr`、`symlink`、
+  `readlink` 以及打开文件前都会先等已排队的回传落地；失败的 `upload` 不落盘，
+  下一次远端操作时以 `stale` / `io` 上报，影子文件保持脏标记等重试。
+  回传带上打开时记下的 `mtime_ms` 与 `size`，远端在这期间被改过就报 `stale`。
 
 ## 4. 路由
 
@@ -322,6 +327,8 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
   挂载登记在 server 进程里、和 session 共用一条连接：`unmount` 按挂载点卸载
   （省略 mountpoint 就全部卸载），server 退出时全部自动卸载；`list` 只看得到本进程
   挂的目录，CLI 那端挂在别的进程里。挂载点必须已存在，重复挂同一个点会直接报错。
+  MCP 的其他工具（`bash`/`upload`/`download`/`actions`）在动手前先冲刷挂载点里
+  待回传的数据，所以「写完立刻用 bash 查远端」能看到刚写的内容。
 - `req_id` 由 server 侧的 `Session` 单调分配，一条连接内并发任意多路；
   收到 `End`/`Result` 即释放。
 - MCP 的 `notifications/cancelled` → 内部 `Cancel{id}`，hub 再转发给 agent：

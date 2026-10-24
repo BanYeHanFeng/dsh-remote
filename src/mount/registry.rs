@@ -23,6 +23,19 @@ impl Mounts {
         entries.iter().map(Mount::info).collect()
     }
 
+    pub async fn settle(&self) {
+        let entries = self.entries.lock().await;
+        for mount in entries.iter() {
+            if let Err(err) = mount.settle().await {
+                warn!(
+                    mountpoint = %mount.mountpoint().display(),
+                    error = %err.message,
+                    "等待影子文件回传失败"
+                );
+            }
+        }
+    }
+
     pub async fn add(&self, session: &Session, spec: MountSpec) -> Result<MountInfo, String> {
         let mountpoint = spec
             .mountpoint
