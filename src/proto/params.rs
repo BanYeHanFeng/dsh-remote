@@ -4,10 +4,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct BashParams {
     pub command: String,
-    pub cwd: Option<String>,
-    pub stdin: Option<String>,
     pub timeout_ms: Option<u64>,
-    pub max_output: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

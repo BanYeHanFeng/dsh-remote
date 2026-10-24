@@ -29,11 +29,24 @@ pub fn no_cancel() -> CancellationToken {
     CancellationToken::new()
 }
 
+pub const SHELL_TIMEOUT: Duration = Duration::from_secs(300);
+pub const MAX_OUTPUT_CHARS: usize = 16_000;
+
 pub fn settings(roots: Vec<String>, allow_bash: bool) -> Settings {
+    settings_tuned(roots, allow_bash, MAX_OUTPUT_CHARS, SHELL_TIMEOUT)
+}
+
+pub fn settings_tuned(
+    roots: Vec<String>,
+    allow_bash: bool,
+    max_output_chars: usize,
+    shell_timeout: Duration,
+) -> Settings {
     Settings {
         roots,
         allow_bash,
-        max_output: 262_144,
+        max_output_chars,
+        shell_timeout,
         max_file: 67_108_864,
     }
 }
@@ -49,11 +62,15 @@ pub fn hub_config(addr: &str, roots: Vec<String>, allow_bash: bool) -> HubConfig
 }
 
 pub fn client_config(addr: &str, name: &str, roots: Vec<String>, allow_bash: bool) -> ClientConfig {
+    client_config_tuned(addr, name, settings(roots, allow_bash))
+}
+
+pub fn client_config_tuned(addr: &str, name: &str, target: Settings) -> ClientConfig {
     ClientConfig {
         hub: addr.to_string(),
         key: key(),
         name: name.to_string(),
-        target: settings(roots, allow_bash),
+        target,
         log: "stderr".to_string(),
         github: GithubConfig::default(),
     }
@@ -71,11 +88,17 @@ pub fn hello(role: Role, name: &str) -> Msg {
     }
 }
 
-pub fn bash_params(command: &str, timeout_ms: u64) -> Value {
-    value::map(vec![
-        ("command", Value::Text(command.to_string())),
-        ("timeout_ms", Value::Integer(timeout_ms.into())),
-    ])
+pub fn bash_params(command: &str) -> Value {
+    value::map(vec![("command", Value::Text(command.to_string()))])
+}
+
+pub fn bash_report(result: &call::CallResult) -> dsh_remote::exec::shell::Report {
+    assert!(result.ok, "error: {:?}", result.error);
+    let value = result
+        .value
+        .clone()
+        .expect("bash 应该回一条带 value 的 Result");
+    value::deserialize(&value).expect("bash 结果不是 Report")
 }
 
 pub fn sha256_file(path: &Path) -> String {
@@ -107,6 +130,8 @@ pub struct Harness {
     pub roots: Vec<String>,
     pub hub_allow_bash: bool,
     pub agent_allow_bash: bool,
+    pub max_output_chars: usize,
+    pub shell_timeout: Duration,
     pub hub_shutdown: CancellationToken,
     pub agent_shutdown: CancellationToken,
     pub hub: Option<JoinHandle<anyhow::Result<()>>>,
@@ -119,6 +144,25 @@ impl Harness {
         hub_allow_bash: bool,
         agent_allow_bash: bool,
         roots: Option<Vec<String>>,
+    ) -> Self {
+        Self::start_tuned(
+            tag,
+            hub_allow_bash,
+            agent_allow_bash,
+            roots,
+            MAX_OUTPUT_CHARS,
+            SHELL_TIMEOUT,
+        )
+        .await
+    }
+
+    pub async fn start_tuned(
+        tag: &str,
+        hub_allow_bash: bool,
+        agent_allow_bash: bool,
+        roots: Option<Vec<String>>,
+        max_output_chars: usize,
+        shell_timeout: Duration,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -135,6 +179,8 @@ impl Harness {
             roots,
             hub_allow_bash,
             agent_allow_bash,
+            max_output_chars,
+            shell_timeout,
             hub_shutdown: CancellationToken::new(),
             agent_shutdown: CancellationToken::new(),
             hub: None,
@@ -154,17 +200,30 @@ impl Harness {
             None => TcpListener::bind(addr).await.unwrap(),
         };
         self.hub_shutdown = CancellationToken::new();
+        let mut config = hub_config(addr, self.roots.clone(), self.hub_allow_bash);
+        config.target = settings_tuned(
+            config.target.roots.clone(),
+            self.hub_allow_bash,
+            self.max_output_chars,
+            self.shell_timeout,
+        );
         self.hub = Some(tokio::spawn(hub::serve(
             listener,
-            hub_config(addr, self.roots.clone(), self.hub_allow_bash),
+            config,
             self.hub_shutdown.clone(),
         )));
     }
 
     async fn spawn_agent(&mut self) {
         self.agent_shutdown = CancellationToken::new();
+        let target = settings_tuned(
+            self.roots.clone(),
+            self.agent_allow_bash,
+            self.max_output_chars,
+            self.shell_timeout,
+        );
         self.agent = Some(tokio::spawn(agent::run(
-            client_config(&self.addr, AGENT, self.roots.clone(), self.agent_allow_bash),
+            client_config_tuned(&self.addr, AGENT, target),
             self.agent_shutdown.clone(),
         )));
     }

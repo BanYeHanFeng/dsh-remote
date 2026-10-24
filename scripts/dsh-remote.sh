@@ -18,7 +18,8 @@ DEFAULT_HUB=${DSH_REMOTE_DEFAULT_HUB:-}
 DEFAULT_NAME=${DSH_REMOTE_DEFAULT_NAME:-$(uname -n 2>/dev/null || printf 'dsh-remote')}
 DEFAULT_ROOTS=${DSH_REMOTE_DEFAULT_ROOTS:-/data}
 DEFAULT_LISTEN=${DSH_REMOTE_DEFAULT_LISTEN:-0.0.0.0:7000}
-DEFAULT_MAX_OUTPUT=${DSH_REMOTE_DEFAULT_MAX_OUTPUT:-262144}
+DEFAULT_MAX_OUTPUT_CHARS=${DSH_REMOTE_DEFAULT_MAX_OUTPUT_CHARS:-16000}
+DEFAULT_SHELL_TIMEOUT_MS=${DSH_REMOTE_DEFAULT_SHELL_TIMEOUT_MS:-300000}
 DEFAULT_MAX_FILE=${DSH_REMOTE_DEFAULT_MAX_FILE:-67108864}
 DEFAULT_CHANNEL=${DSH_REMOTE_DEFAULT_CHANNEL:-stable}
 DEV_TAG=${DSH_REMOTE_DEV_TAG:-}
@@ -75,7 +76,8 @@ action:
 
 环境变量（install 非交互时使用）:
   DSH_REMOTE_HUB, DSH_REMOTE_KEY, DSH_REMOTE_NAME, DSH_REMOTE_ROOTS,
-  DSH_REMOTE_LISTEN, DSH_REMOTE_ALLOW_BASH, DSH_REMOTE_MAX_OUTPUT, DSH_REMOTE_MAX_FILE
+  DSH_REMOTE_LISTEN, DSH_REMOTE_ALLOW_BASH, DSH_REMOTE_MAX_OUTPUT_CHARS,
+  DSH_REMOTE_SHELL_TIMEOUT_MS, DSH_REMOTE_MAX_FILE
   DSH_REMOTE_ASSUME_YES=1  不再询问，直接采用上面的值或默认值
   DSH_REMOTE_BIN, DSH_REMOTE_CONF_DIR, DSH_REMOTE_STATE_DIR, DSH_REMOTE_LOG_DIR
   DSH_REMOTE_CHANNEL=stable|dev  发布渠道（默认 stable）
@@ -665,7 +667,8 @@ write_config() {
     roots=
     allow_bash=
     listen=
-    max_output=
+    max_output_chars=
+    shell_timeout_ms=
     max_file=
 
     case "$role" in
@@ -738,12 +741,19 @@ write_config() {
         allow_bash=$ASK_RESULT
         validate_allow_bash "$allow_bash" || return 1
 
-        max_output=${DSH_REMOTE_MAX_OUTPUT:-}
-        [ -n "$max_output" ] || max_output=$(conf_get "$conf" MAX_OUTPUT)
-        [ -n "$max_output" ] || max_output=$DEFAULT_MAX_OUTPUT
-        ask_value "单次输出上限（字节）" "$max_output"
-        max_output=$ASK_RESULT
-        validate_num "MAX_OUTPUT" "$max_output" || return 1
+        max_output_chars=${DSH_REMOTE_MAX_OUTPUT_CHARS:-}
+        [ -n "$max_output_chars" ] || max_output_chars=$(conf_get "$conf" MAX_OUTPUT_CHARS)
+        [ -n "$max_output_chars" ] || max_output_chars=$DEFAULT_MAX_OUTPUT_CHARS
+        ask_value "单次 bash 返回的字符上限" "$max_output_chars"
+        max_output_chars=$ASK_RESULT
+        validate_num "MAX_OUTPUT_CHARS" "$max_output_chars" || return 1
+
+        shell_timeout_ms=${DSH_REMOTE_SHELL_TIMEOUT_MS:-}
+        [ -n "$shell_timeout_ms" ] || shell_timeout_ms=$(conf_get "$conf" SHELL_TIMEOUT_MS)
+        [ -n "$shell_timeout_ms" ] || shell_timeout_ms=$DEFAULT_SHELL_TIMEOUT_MS
+        ask_value "单条命令超时（毫秒）" "$shell_timeout_ms"
+        shell_timeout_ms=$ASK_RESULT
+        validate_num "SHELL_TIMEOUT_MS" "$shell_timeout_ms" || return 1
 
         max_file=${DSH_REMOTE_MAX_FILE:-}
         [ -n "$max_file" ] || max_file=$(conf_get "$conf" MAX_FILE)
@@ -769,7 +779,8 @@ write_config() {
                 printf 'NAME=%s\n' "$name"
                 printf 'ROOTS=%s\n' "$roots"
                 printf 'ALLOW_BASH=%s\n' "$allow_bash"
-                printf 'MAX_OUTPUT=%s\n' "$max_output"
+                printf 'MAX_OUTPUT_CHARS=%s\n' "$max_output_chars"
+                printf 'SHELL_TIMEOUT_MS=%s\n' "$shell_timeout_ms"
                 printf 'MAX_FILE=%s\n' "$max_file"
                 printf 'LOG=stderr\n'
                 ;;
@@ -779,7 +790,8 @@ write_config() {
                 printf 'NAME=%s\n' "$name"
                 printf 'ROOTS=%s\n' "$roots"
                 printf 'ALLOW_BASH=%s\n' "$allow_bash"
-                printf 'MAX_OUTPUT=%s\n' "$max_output"
+                printf 'MAX_OUTPUT_CHARS=%s\n' "$max_output_chars"
+                printf 'SHELL_TIMEOUT_MS=%s\n' "$shell_timeout_ms"
                 printf 'MAX_FILE=%s\n' "$max_file"
                 printf 'LOG=stderr\n'
                 ;;

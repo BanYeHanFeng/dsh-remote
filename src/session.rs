@@ -49,10 +49,6 @@ pub type RemoteResult<T> = std::result::Result<T, RemoteError>;
 
 pub struct CallResult {
     pub ok: bool,
-    pub exit_code: Option<i32>,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub truncated: bool,
     pub size: Option<u64>,
     pub sha256: Option<String>,
     pub status: Option<EndStatus>,
@@ -64,10 +60,6 @@ impl CallResult {
     fn empty() -> Self {
         Self {
             ok: false,
-            exit_code: None,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            truncated: false,
             size: None,
             sha256: None,
             status: None,
@@ -533,25 +525,17 @@ impl CallHandle {
                     return Err(RemoteError::new("offline", "中继连接中断，调用未完成"));
                 };
                 match msg {
-                    Msg::Chunk { stream, data, .. } => {
-                        if stream == crate::proto::STREAM_STDOUT {
-                            result.stdout.extend_from_slice(&data);
-                        } else {
-                            result.stderr.extend_from_slice(&data);
-                        }
+                    Msg::Chunk { .. } => {
+                        debug!("该调用没有在等流式数据，忽略分块");
                     }
                     Msg::End {
                         status,
-                        exit_code,
                         size,
                         sha256,
-                        truncated,
                         ..
                     } => {
                         result.ok = status == EndStatus::Ok;
-                        result.exit_code = exit_code;
                         result.status = Some(status);
-                        result.truncated = truncated.unwrap_or(false);
                         result.size = size;
                         result.sha256 = sha256;
                         return Ok(());

@@ -196,10 +196,8 @@ mod tests {
         let end = Msg::End {
             id: 1,
             status: EndStatus::Ok,
-            exit_code: None,
             size: Some(16),
             sha256: None,
-            truncated: Some(false),
         };
         sink.try_send(chunk).unwrap();
         assert!(sink.try_send(end).is_err());

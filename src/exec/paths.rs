@@ -80,23 +80,16 @@ pub fn resolve_for_write(
     Ok(candidate)
 }
 
-pub fn ensure_allowed(cwd: Option<&str>, raw_roots: &[String]) -> Result<PathBuf> {
+pub fn root_cwd(raw_roots: &[String]) -> Result<PathBuf> {
     let roots = canonical_roots(raw_roots);
-    match cwd {
-        Some(value) if !value.trim().is_empty() => {
-            resolve_existing(value, raw_roots).map_err(|err| anyhow!(err.message))
-        }
-        _ => {
-            let fallback = roots.first().cloned().unwrap_or_else(|| PathBuf::from("/"));
-            let canonical = fallback
-                .canonicalize()
-                .map_err(|err| anyhow!("目录不可用 {}: {err}", fallback.display()))?;
-            if roots.iter().any(|root| canonical.starts_with(root)) {
-                Ok(canonical)
-            } else {
-                bail!("目录不在允许范围内: {}", canonical.display())
-            }
-        }
+    let fallback = roots.first().cloned().unwrap_or_else(|| PathBuf::from("/"));
+    let canonical = fallback
+        .canonicalize()
+        .map_err(|err| anyhow!("目录不可用 {}: {err}", fallback.display()))?;
+    if roots.iter().any(|root| canonical.starts_with(root)) {
+        Ok(canonical)
+    } else {
+        bail!("目录不在允许范围内: {}", canonical.display())
     }
 }
 
@@ -171,22 +164,21 @@ mod tests {
     }
 
     #[test]
-    fn allows_tmp() {
-        let roots = vec!["/tmp".to_string()];
-        let path = ensure_allowed(Some("/tmp"), &roots).unwrap();
-        assert!(path.starts_with("/tmp"));
+    fn root_cwd_is_first_root() {
+        let root = temp_root("cwd");
+        let roots = vec![root.to_string_lossy().to_string(), "/tmp".to_string()];
+        let path = root_cwd(&roots).unwrap();
+        assert_eq!(path, root.canonicalize().unwrap());
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn denies_outside() {
+    fn root_cwd_survives_missing_root() {
         let roots = vec!["/tmp".to_string()];
-        assert!(ensure_allowed(Some("/etc"), &roots).is_err());
-    }
-
-    #[test]
-    fn root_slash_allows_any() {
-        let roots = vec!["/".to_string()];
-        assert!(ensure_allowed(Some("/etc"), &roots).is_ok());
+        assert_eq!(
+            root_cwd(&roots).unwrap(),
+            Path::new("/tmp").canonicalize().unwrap()
+        );
     }
 
     #[test]

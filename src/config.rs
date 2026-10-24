@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -8,7 +9,8 @@ use crate::cli::{ClientArgs, CommonArgs, HubArgs};
 use crate::exec::Settings;
 use crate::key::KeyMaterial;
 
-const DEFAULT_MAX_OUTPUT: usize = 262_144;
+const DEFAULT_MAX_OUTPUT_CHARS: usize = 16_000;
+const DEFAULT_SHELL_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_MAX_FILE: u64 = 67_108_864;
 
 #[derive(Clone, Debug)]
@@ -117,10 +119,25 @@ pub fn client_config(args: &ClientArgs) -> Result<ClientConfig> {
 }
 
 fn resolve_settings(common: &CommonArgs, raw: &RawConfig) -> Result<Settings> {
+    let shell_timeout_ms = number(
+        common.shell_timeout_ms,
+        raw,
+        "SHELL_TIMEOUT_MS",
+        DEFAULT_SHELL_TIMEOUT_MS,
+    )?;
+    if shell_timeout_ms == 0 {
+        bail!("SHELL_TIMEOUT_MS 必须是正整数");
+    }
     Ok(Settings {
         roots: resolve_roots(common, raw),
         allow_bash: resolve_allow_bash(common, raw),
-        max_output: number(common.max_output, raw, "MAX_OUTPUT", DEFAULT_MAX_OUTPUT)?,
+        max_output_chars: number(
+            common.max_output_chars,
+            raw,
+            "MAX_OUTPUT_CHARS",
+            DEFAULT_MAX_OUTPUT_CHARS,
+        )?,
+        shell_timeout: Duration::from_millis(shell_timeout_ms),
         max_file: number(common.max_file, raw, "MAX_FILE", DEFAULT_MAX_FILE)?,
     })
 }
@@ -263,13 +280,25 @@ mod tests {
     fn settings_bundle_fields() {
         let common = CommonArgs {
             roots: Some(vec!["/data".into(), "/home".into()]),
-            max_output: Some(1024),
+            max_output_chars: Some(1024),
+            shell_timeout_ms: Some(5_000),
             ..Default::default()
         };
         let raw = RawConfig::load(None).unwrap();
         let settings = resolve_settings(&common, &raw).unwrap();
         assert_eq!(settings.roots, vec!["/data", "/home"]);
-        assert_eq!(settings.max_output, 1024);
+        assert_eq!(settings.max_output_chars, 1024);
+        assert_eq!(settings.shell_timeout, Duration::from_secs(5));
         assert_eq!(settings.max_file, DEFAULT_MAX_FILE);
+    }
+
+    #[test]
+    fn rejects_zero_shell_timeout() {
+        let common = CommonArgs {
+            shell_timeout_ms: Some(0),
+            ..Default::default()
+        };
+        let raw = RawConfig::load(None).unwrap();
+        assert!(resolve_settings(&common, &raw).is_err());
     }
 }

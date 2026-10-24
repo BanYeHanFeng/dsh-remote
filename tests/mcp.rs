@@ -223,20 +223,14 @@ async fn tools_run_against_agent_and_hub() {
     assert!(is_error, "{text}");
     assert!(text.contains("unknown_target"), "{text}");
 
-    let started = Instant::now();
     let (text, is_error) = mcp
         .tool(
             "bash",
-            json!({ "target": "nas", "command": "sleep 5", "timeout_ms": 300 }),
+            json!({ "target": "nas", "command": "cd /tmp && pwd" }),
         )
         .await;
-    assert!(is_error, "{text}");
-    assert!(text.contains("timeout"), "{text}");
-    assert!(
-        started.elapsed() < Duration::from_secs(4),
-        "超时调用应快速返回，实际 {:?}",
-        started.elapsed()
-    );
+    assert!(!is_error, "{text}");
+    assert!(text.contains("/tmp"), "{text}");
 
     mcp.close().await;
     harness.stop().await;
@@ -304,7 +298,7 @@ async fn cancelled_call_returns_quickly() {
         "method": "tools/call",
         "params": {
             "name": "bash",
-            "arguments": { "target": "nas", "command": "sleep 15", "timeout_ms": 20000 }
+            "arguments": { "target": "nas", "command": "sleep 15" }
         }
     });
     let mut line = serde_json::to_vec(&message).unwrap();

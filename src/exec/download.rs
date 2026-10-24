@@ -80,10 +80,8 @@ pub async fn run(request: Request) {
                 .send(Msg::End {
                     id: reply_id,
                     status,
-                    exit_code: None,
                     size: None,
                     sha256: None,
-                    truncated: Some(false),
                 })
                 .await;
         }
@@ -92,10 +90,8 @@ pub async fn run(request: Request) {
                 .send(Msg::End {
                     id: reply_id,
                     status: EndStatus::Error,
-                    exit_code: None,
                     size: None,
                     sha256: None,
-                    truncated: Some(false),
                 })
                 .await;
         }
@@ -147,10 +143,8 @@ async fn stream(
     sink.send(Msg::End {
         id: reply_id,
         status: EndStatus::Ok,
-        exit_code: None,
         size: Some(sent),
         sha256: Some(digest),
-        truncated: Some(false),
     })
     .await
     .map_err(|_| ToolError::io("发送下载结果失败"))?;

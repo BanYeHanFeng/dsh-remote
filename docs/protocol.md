@@ -66,19 +66,17 @@ initiator                          responder
 | 0x10 | `Call` | server→hub | `id, target, method, params` |
 | 0x11 | `Result` | hub→server | `id, ok, value?, error?` |
 | 0x12 | `Chunk` | 双向 | `id, seq, stream: 1\|2, data` |
-| 0x13 | `End` | 双向 | `id, status, exit_code?, size?, sha256?, truncated?` |
+| 0x13 | `End` | 双向 | `id, status, size?, sha256?` |
 | 0x14 | `Cancel` | server→hub→agent | `id, reason?` |
 
 - `method` 取工具名：`bash`、`upload`、`download`、`targets`、`shutdown`。
   `params` 是方法参数的 CBOR map，原样透传。
 - `shutdown` 只有 agent 处理：先回 `Result{ok:true, value:{stopping:true}}`，
   然后断开中继、退出进程；hub 自身回 `unsupported`（中继不能被远程关掉）。
-- 短结果用 `Result` 一次返回（`targets`）。
-- 长结果用流：先若干 `Chunk`，最后 `End`。`bash` 的 stdout 用 `stream=1`，
-  stderr 用 `stream=2`；文件传输只用 `stream=1`。
-- `End.status` 取 `ok` / `error` / `cancelled`；`exit_code` 只在
-  `bash` 出现；文件传输带 `size` 与 `sha256`。下载的 `End` 是终态；上传的 `End`
-  只是上行数据结束，agent 还会回一条 `Result`。
+- 短结果用 `Result` 一次返回（`targets`、`bash`）。
+- 长结果用流：先若干 `Chunk`，最后 `End`；目前只有文件传输用流，且只用 `stream=1`。
+- `End.status` 取 `ok` / `error` / `cancelled`；文件传输带 `size` 与 `sha256`。
+  下载的 `End` 是终态；上传的 `End` 只是上行数据结束，agent 还会回一条 `Result`。
 - `seq` 在每个 `stream` 内独立从 0 递增，接收端按流分别拼接；重复或跳号即判定
   `protocol` 错误并 `Cancel`。
 - `Call.id` 由 server 分配；hub 转发给 agent 前改写为房间内全局唯一的 `call_id`，
@@ -89,17 +87,26 @@ initiator                          responder
 - 一条 `Call` 的任一阶段出错，都以 `Result{ok:false}` 或 `End{status:"error"}`
   收尾，保证请求不悬挂。
 
-示例：一次 `bash` 调用
+`bash` 在目标上跑在**同一个常驻 Shell** 里：`command` 由一段带随机标记的包装行写入
+标准输入，输出（stdout 与 stderr 合并）按结束标记切出来，因此当前目录、导出的环境
+变量等状态跨调用保留。参数只有 `command` 与内部使用的 `timeout_ms`。
 
 ```json
 {"id":17,"target":"nas","method":"bash",
- "params":{"command":"df -h","cwd":"/data","timeout_ms":30000}}
+ "params":{"command":"df -h","timeout_ms":300000}}
 ```
 
 ```json
-{"id":17,"seq":0,"stream":1,"data":"<stdout bytes>"}
-{"id":17,"status":"ok","exit_code":0,"truncated":false}
+{"id":17,"ok":true,"value":{
+  "output":"Filesystem ...\n[命令结束，退出码 0]",
+  "exit_code":0,"timed_out":false}}
 ```
+
+- `output` 已经按目标的 `MAX_OUTPUT_CHARS`（默认 16000 字符）截断，并附上
+  `[命令结束，退出码 N]`；超时附 `[命令超时]`、Shell 退出附 `[Shell 已退出，退出码 N]`，
+  两种情况都会重置 Shell。
+- `timed_out` 与 `exit_code` 供调用方决定是否把这次工具调用标成失败。
+- 单条 `Result` 编码后不超过 60 KiB，`output` 另按 48 KiB 兜底截断。
 
 ### 3.3 文件传输
 
@@ -228,7 +235,7 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 | 工具 | 内部 method | 终态消息 | MCP 侧超时 |
 | --- | --- | --- | --- |
 | `targets` | `targets`（发给 hub） | `Result` | 用本地快照，断线也应答 |
-| `bash` | `bash` | `Chunk` + `End` | `timeout_ms + 15s`，上限 600s |
+| `bash` | `bash` | `Result` | `300s + 30s`（目标可用 `SHELL_TIMEOUT_MS` 调小） |
 | `upload` | `upload` | 上行 `Chunk`+`End`，回程 `Result` | `300s + 大小/256KiB` |
 | `download` | `download` | 下行 `Chunk`+`End` | `300s + 大小/256KiB` |
 | `actions stop`（内部） | `shutdown`（发给目标节点） | `Result` | 10s |

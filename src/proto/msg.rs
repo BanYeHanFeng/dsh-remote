@@ -151,10 +151,8 @@ pub enum Msg {
     End {
         id: u64,
         status: EndStatus,
-        exit_code: Option<i32>,
         size: Option<u64>,
         sha256: Option<String>,
-        truncated: Option<bool>,
     },
     Cancel {
         id: u64,
@@ -251,10 +249,8 @@ mod tests {
         let msg = Msg::End {
             id: 7,
             status: EndStatus::Ok,
-            exit_code: Some(0),
             size: None,
             sha256: None,
-            truncated: None,
         };
         assert_eq!(msg.with_id(9).id(), Some(9));
         assert_eq!(Msg::Ping { nonce: 1 }.with_id(9).id(), None);

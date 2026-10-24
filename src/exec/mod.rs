@@ -1,8 +1,8 @@
-pub mod bash;
 pub mod download;
 pub mod error;
 pub mod limits;
 pub mod paths;
+pub mod shell;
 pub mod transfer;
 pub mod upload;
 
@@ -14,7 +14,7 @@ use ciborium::value::Value;
 use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::net::Sink;
 use crate::proto::params::{BashParams, DownloadParams, UploadParams};
@@ -30,7 +30,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(300);
 pub struct Settings {
     pub roots: Vec<String>,
     pub allow_bash: bool,
-    pub max_output: usize,
+    pub max_output_chars: usize,
+    pub shell_timeout: Duration,
     pub max_file: u64,
 }
 
@@ -43,6 +44,7 @@ pub struct Executor {
     settings: Settings,
     running: Arc<Mutex<HashMap<u64, Running>>>,
     slots: Arc<Semaphore>,
+    shells: Arc<shell::Shells>,
     shutdown: Option<CancellationToken>,
 }
 
@@ -56,6 +58,7 @@ impl Executor {
             settings,
             running: Arc::new(Mutex::new(HashMap::new())),
             slots: Arc::new(Semaphore::new(slots)),
+            shells: Arc::new(shell::Shells::default()),
             shutdown: None,
         }
     }
@@ -124,20 +127,13 @@ impl Executor {
             reply_error(&sink, call_id, "protocol", "缺少 command 参数").await;
             return;
         }
-        let cwd = match paths::ensure_allowed(params.cwd.as_deref(), &self.settings.roots) {
-            Ok(path) => path,
+        let cwd = match paths::root_cwd(&self.settings.roots) {
+            Ok(path) => path.display().to_string(),
             Err(err) => {
                 reply_error(&sink, call_id, "denied", format!("{err:#}")).await;
                 return;
             }
         };
-        let timeout = limits::bash_timeout_ms(params.timeout_ms);
-        let max_output = params
-            .max_output
-            .map(|value| value as usize)
-            .unwrap_or(self.settings.max_output)
-            .min(self.settings.max_output);
-        let stdin = params.stdin.map(String::into_bytes);
 
         let permit = match self.slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -146,29 +142,33 @@ impl Executor {
                 return;
             }
         };
+        let timeout = limits::bash_timeout_ms(params.timeout_ms).min(self.settings.shell_timeout);
+        let request = shell::Request {
+            command: params.command,
+            cwd,
+            timeout,
+            max_output_chars: self.settings.max_output_chars,
+        };
         let token = CancellationToken::new();
         self.track(call_id, token.clone(), None);
         let running = self.running.clone();
+        let shells = self.shells.clone();
 
         tokio::spawn(async move {
-            let request = bash::Request {
-                command: params.command,
-                cwd,
-                timeout,
-                stdin,
-                max_output,
-            };
-            match bash::run(request, token).await {
-                Ok(outcome) => {
-                    if let Err(err) = bash::send_output(&sink, call_id, &outcome).await {
-                        debug!(error = %err, "发送输出失败");
+            match shells.run(request, &token).await {
+                Ok(report) => match value::serialize(&report) {
+                    Ok(value) => reply_value(&sink, call_id, value).await,
+                    Err(err) => {
+                        reply_error(
+                            &sink,
+                            call_id,
+                            "internal",
+                            format!("序列化结果失败: {err:#}"),
+                        )
+                        .await;
                     }
-                }
-                Err(err) => {
-                    let message = format!("执行命令失败: {err:#}");
-                    warn!(error = %message, "执行命令失败");
-                    reply_error(&sink, call_id, "io", message).await;
-                }
+                },
+                Err(err) => reply_error(&sink, call_id, err.code, err.message).await,
             }
             remove_running(&running, call_id);
             drop(permit);
@@ -301,6 +301,11 @@ impl Executor {
         let running = self.lock_running();
         for entry in running.values() {
             entry.token.cancel();
+        }
+        drop(running);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let shells = self.shells.clone();
+            handle.spawn(async move { shells.shutdown().await });
         }
     }
 

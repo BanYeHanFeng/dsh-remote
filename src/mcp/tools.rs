@@ -10,9 +10,7 @@ use crate::actions::{
     GhClient, StartRequest, DEFAULT_ARCH, DEFAULT_DURATION_MINUTES, MAX_DURATION_MINUTES,
 };
 use crate::call;
-use crate::exec::limits;
-use crate::proto::params::BashParams;
-use crate::proto::{now_ms, EndStatus};
+use crate::proto::now_ms;
 use crate::session::{RemoteError, Session};
 
 const START_WAIT_SECONDS: u64 = 60;
@@ -67,16 +65,12 @@ pub fn list() -> Value {
         },
         {
             "name": "bash",
-            "description": "在远端用 sh -c 一次性执行命令，返回退出码、stdout、stderr 与耗时。超过 timeout_ms 会杀掉整个进程组；交互式程序（vim、top）不可用。",
+            "description": "在目标上同一个持久的 bash 里执行命令：当前目录、导出的环境变量等状态在调用之间保留。命令超过目标配置的超时（默认 300 秒）会杀掉整个进程组并重置 Shell；返回内容超过字符上限会被截断。交互式程序（vim、top）不可用。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "target": { "type": "string", "description": TARGET_SCHEMA },
-                    "command": { "type": "string", "description": "完整 shell 命令，例如 systemctl status nginx" },
-                    "cwd": { "type": "string", "description": "工作目录，必须在目标的 ROOTS 内；省略时用第一个 root" },
-                    "timeout_ms": { "type": "integer", "description": "执行超时毫秒，默认 120000，上限 600000" },
-                    "stdin": { "type": "string", "description": "写入进程标准输入的内容" },
-                    "max_output": { "type": "integer", "description": "单路输出字节上限，默认取目标的 MAX_OUTPUT" }
+                    "command": { "type": "string", "description": "完整 shell 命令，例如 systemctl status nginx" }
                 },
                 "required": ["target", "command"]
             }
@@ -205,68 +199,11 @@ async fn targets(session: &Session) -> ToolOutput {
 async fn bash(session: &Session, args: &Value, cancel: &CancellationToken) -> ToolResult {
     let target = require_str(args, "target")?;
     let command = require_str(args, "command")?;
-    let timeout = limits::bash_timeout_ms(optional_u64(args, "timeout_ms"));
-    let params = crate::proto::value::serialize(&BashParams {
-        command,
-        cwd: optional_str(args, "cwd"),
-        stdin: optional_str(args, "stdin"),
-        timeout_ms: Some(timeout.as_millis() as u64),
-        max_output: optional_u64(args, "max_output"),
-    })
-    .map_err(|err| describe(&err))?;
-    let deadline = limits::deadline("bash", &params);
-
-    let started = Instant::now();
-    let result = session
-        .call_cancel(&target, "bash", params, deadline, cancel)
+    let report = call::bash(session, &target, &command, cancel)
         .await
-        .map_err(|err| describe(&err.into()))?;
-    let elapsed = started.elapsed().as_millis();
-
-    let mut out = String::new();
-    let exit = match result.exit_code {
-        Some(code) => code.to_string(),
-        None => "-".to_string(),
-    };
-    let _ = writeln!(out, "目标 {target}｜退出码 {exit}｜耗时 {elapsed} ms");
-    if result.truncated {
-        let _ = writeln!(out, "注意：输出超过上限，尾部已截断");
-    }
-    if !result.stdout.is_empty() {
-        let _ = writeln!(out, "--- stdout ---");
-        let _ = writeln!(
-            out,
-            "{}",
-            String::from_utf8_lossy(&result.stdout).trim_end()
-        );
-    }
-    if !result.stderr.is_empty() {
-        let _ = writeln!(out, "--- stderr ---");
-        let _ = writeln!(
-            out,
-            "{}",
-            String::from_utf8_lossy(&result.stderr).trim_end()
-        );
-    }
-    if result.ok && result.stdout.is_empty() && result.stderr.is_empty() {
-        let _ = writeln!(out, "（无输出）");
-    }
-    if let Some(error) = &result.error {
-        let _ = writeln!(out, "错误 [{}]: {}", error.code, error.message);
-    } else if !result.ok {
-        match result.status {
-            Some(EndStatus::Error) => {
-                let _ = writeln!(out, "错误 [timeout]: 远端超时，整个进程组已被杀掉");
-            }
-            Some(EndStatus::Cancelled) => {
-                let _ = writeln!(out, "错误 [cancelled]: 调用已取消");
-            }
-            _ => {}
-        }
-    }
-
-    let failed = !result.ok || result.exit_code.map(|code| code != 0).unwrap_or(false);
-    Ok(ToolOutput::ok(out).mark(failed))
+        .map_err(|err| describe(&err))?;
+    let failed = report.failed();
+    Ok(ToolOutput::ok(report.output).mark(failed))
 }
 
 async fn upload(session: &Session, args: &Value, cancel: &CancellationToken) -> ToolResult {

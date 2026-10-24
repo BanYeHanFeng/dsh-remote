@@ -136,7 +136,8 @@ jobs:
           NAME=$NODE_NAME
           ROOTS=$ROOTS
           ALLOW_BASH=$ALLOW_BASH
-          MAX_OUTPUT=262144
+          MAX_OUTPUT_CHARS=16000
+          SHELL_TIMEOUT_MS=300000
           MAX_FILE=67108864
           LOG=stderr
           EOF

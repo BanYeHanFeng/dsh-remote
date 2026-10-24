@@ -10,8 +10,9 @@ use tracing::debug;
 
 use crate::config::ClientConfig;
 use crate::exec::limits;
+use crate::exec::shell;
 use crate::exec::transfer::{TransferReport, CHUNK_SIZE};
-use crate::proto::params::{DownloadParams, UploadParams};
+use crate::proto::params::{BashParams, DownloadParams, UploadParams};
 use crate::proto::value;
 use crate::proto::{EndStatus, Msg, TargetInfo, STREAM_STDOUT};
 use crate::session::{CallHandle, Session};
@@ -48,6 +49,24 @@ pub async fn call(
     session
         .call_cancel(target, method, params, limit, cancel)
         .await
+}
+
+pub async fn bash(
+    session: &Session,
+    target: &str,
+    command: &str,
+    cancel: &CancellationToken,
+) -> Result<shell::Report> {
+    let params = value::serialize(&BashParams {
+        command: command.to_string(),
+        timeout_ms: Some(limits::BASH_DEFAULT_TIMEOUT_MS),
+    })?;
+    let deadline = limits::deadline("bash", &params);
+    let result = session
+        .call_cancel(target, "bash", params, deadline, cancel)
+        .await?;
+    let value = result.into_value()?;
+    value::deserialize(&value)
 }
 
 pub async fn upload(
@@ -95,10 +114,8 @@ pub async fn upload(
         .send(Msg::End {
             id,
             status: EndStatus::Ok,
-            exit_code: None,
             size: Some(meta.len()),
             sha256: Some(digest),
-            truncated: Some(false),
         })
         .await?;
 

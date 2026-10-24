@@ -48,8 +48,10 @@ pub struct CommonArgs {
     pub allow_bash: Option<bool>,
     #[arg(long, help = "关闭 bash 工具")]
     pub no_bash: bool,
-    #[arg(long, value_name = "字节", help = "单次输出上限")]
-    pub max_output: Option<usize>,
+    #[arg(long, value_name = "字符", help = "单次 bash 返回的字符上限")]
+    pub max_output_chars: Option<usize>,
+    #[arg(long, value_name = "毫秒", help = "单条命令超时毫秒")]
+    pub shell_timeout_ms: Option<u64>,
     #[arg(long, value_name = "字节", help = "单文件传输上限")]
     pub max_file: Option<u64>,
     #[arg(long, value_name = "路径", help = "日志目标：stderr 或文件路径")]
