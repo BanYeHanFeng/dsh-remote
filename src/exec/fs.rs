@@ -215,9 +215,9 @@ fn time_or_omit(value: Option<SystemTime>) -> libc::timespec {
             let seconds = time
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO)
-                .as_secs() as libc::time_t;
+                .as_secs();
             libc::timespec {
-                tv_sec: seconds,
+                tv_sec: seconds as _,
                 tv_nsec: 0,
             }
         }
