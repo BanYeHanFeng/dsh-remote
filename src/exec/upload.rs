@@ -86,12 +86,16 @@ async fn pump(
         };
         match msg {
             Msg::Chunk {
-                stream, seq, data, ..
+                stream,
+                seq,
+                packed,
+                data,
+                ..
             } => {
                 if stream != STREAM_STDOUT {
                     return Err(ToolError::protocol("上传只接受数据流"));
                 }
-                incoming.push(seq, &data).await?;
+                incoming.push(seq, packed, &data).await?;
             }
             Msg::End {
                 status,

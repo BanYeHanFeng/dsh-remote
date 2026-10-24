@@ -541,7 +541,12 @@ impl HubState {
                             return;
                         }
                         match msg {
-                            Msg::Chunk { stream, data, .. } if !transfer.committing => {
+                            Msg::Chunk {
+                                stream,
+                                packed,
+                                data,
+                                ..
+                            } if !transfer.committing => {
                                 let seq = transfer.next_seq;
                                 transfer.next_seq += 1;
                                 let out = Decision::Send {
@@ -550,6 +555,7 @@ impl HubState {
                                         id: transfer.dest.call_id,
                                         seq,
                                         stream,
+                                        packed,
                                         data,
                                     },
                                 };

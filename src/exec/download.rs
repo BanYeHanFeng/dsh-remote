@@ -5,7 +5,7 @@ use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 use super::error::{ToolError, ToolResult};
-use super::transfer::CHUNK_SIZE;
+use super::transfer::{pack, CHUNK_SIZE};
 use crate::net::Sink;
 use crate::proto::{EndStatus, Msg, STREAM_STDOUT};
 
@@ -121,11 +121,16 @@ async fn stream(
         }
         hasher.update(&buffer[..read]);
         sent += read as u64;
+        let (data, packed) = match pack(&buffer[..read]) {
+            Some(packed) => (packed, true),
+            None => (buffer[..read].to_vec(), false),
+        };
         let chunk = Msg::Chunk {
             id: reply_id,
             seq,
             stream: STREAM_STDOUT,
-            data: buffer[..read].to_vec(),
+            packed,
+            data,
         };
         tokio::select! {
             _ = cancel.cancelled() => {

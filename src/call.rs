@@ -12,7 +12,9 @@ use tracing::debug;
 use crate::config::ClientConfig;
 use crate::exec::limits;
 use crate::exec::shell;
-use crate::exec::transfer::{TransferReport, CHUNK_SIZE};
+use crate::exec::transfer::{
+    pack as transfer_pack, unpack as transfer_unpack, TransferReport, CHUNK_SIZE,
+};
 use crate::proto::params::{
     BashParams, DownloadParams, FsEntry, FsLink, FsList, FsParams, TransferParams, UploadParams,
 };
@@ -222,12 +224,17 @@ async fn stream_upload(
         }
         hasher.update(&buffer[..read]);
         sent += read as u64;
+        let (data, packed) = match transfer_pack(&buffer[..read]) {
+            Some(packed) => (packed, true),
+            None => (buffer[..read].to_vec(), false),
+        };
         handle
             .send(Msg::Chunk {
                 id,
                 seq,
                 stream: STREAM_STDOUT,
-                data: buffer[..read].to_vec(),
+                packed,
+                data,
             })
             .await?;
         seq += 1;
@@ -319,7 +326,11 @@ pub async fn download(
             };
             match msg {
                 Msg::Chunk {
-                    seq, stream, data, ..
+                    seq,
+                    stream,
+                    packed,
+                    data,
+                    ..
                 } => {
                     if stream != STREAM_STDOUT {
                         bail!("下载只接受数据流");
@@ -327,6 +338,11 @@ pub async fn download(
                     if seq != next_seq {
                         bail!("下载分块序号错乱：期望 {next_seq}，收到 {seq}");
                     }
+                    let data = if packed {
+                        transfer_unpack(&data)?
+                    } else {
+                        data
+                    };
                     received += data.len() as u64;
                     if received > max_file {
                         bail!("下载超过上限 {max_file} 字节");

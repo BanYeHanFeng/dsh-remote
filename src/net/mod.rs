@@ -176,6 +176,7 @@ mod tests {
             id: 1,
             seq: 0,
             stream: STREAM_STDOUT,
+            packed: false,
             data: vec![7; 16],
         };
         sink.try_send(chunk).unwrap();
@@ -191,6 +192,7 @@ mod tests {
             id: 1,
             seq: 0,
             stream: STREAM_STDOUT,
+            packed: false,
             data: vec![7; 16],
         };
         let end = Msg::End {
