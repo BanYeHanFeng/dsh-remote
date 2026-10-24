@@ -48,6 +48,8 @@ pub fn settings_tuned(
         max_output_chars,
         shell_timeout,
         max_file: 67_108_864,
+        pack: true,
+        pack_gain: 12,
     }
 }
 

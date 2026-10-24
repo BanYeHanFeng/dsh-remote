@@ -34,6 +34,8 @@ pub struct Settings {
     pub max_output_chars: usize,
     pub shell_timeout: Duration,
     pub max_file: u64,
+    pub pack: bool,
+    pub pack_gain: u8,
 }
 
 struct Running {
@@ -282,10 +284,13 @@ impl Executor {
         let token = CancellationToken::new();
         self.track(call_id, token.clone(), None);
         let running = self.running.clone();
+        let (pack, pack_gain) = (self.settings.pack, self.settings.pack_gain);
 
         tokio::spawn(async move {
             download::run(download::Request {
                 path,
+                pack,
+                pack_gain,
                 max_file,
                 reply_id: call_id,
                 sink,

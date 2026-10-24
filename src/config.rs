@@ -13,6 +13,7 @@ use crate::mount::{DEFAULT_ATTR_TTL_MS, DEFAULT_SPOOL_LIMIT};
 const DEFAULT_MAX_OUTPUT_CHARS: usize = 16_000;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_MAX_FILE: u64 = 67_108_864;
+const DEFAULT_PACK_GAIN: u8 = 12;
 
 #[derive(Clone, Debug)]
 pub struct HubConfig {
@@ -185,6 +186,8 @@ fn resolve_settings(common: &CommonArgs, raw: &RawConfig) -> Result<Settings> {
         )?,
         shell_timeout: Duration::from_millis(shell_timeout_ms),
         max_file: number(common.max_file, raw, "MAX_FILE", DEFAULT_MAX_FILE)?,
+        pack: flag(raw, "PACK", true),
+        pack_gain: number(None, raw, "PACK_GAIN", DEFAULT_PACK_GAIN)?,
     })
 }
 
@@ -274,6 +277,16 @@ fn resolve_allow_bash(common: &CommonArgs, raw: &RawConfig) -> bool {
     true
 }
 
+fn flag(raw: &RawConfig, key: &str, default: bool) -> bool {
+    match raw.get(key) {
+        Some(text) => !matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        None => default,
+    }
+}
+
 fn number<T>(cli: Option<T>, raw: &RawConfig, key: &str, default: T) -> Result<T>
 where
     T: FromStr,
@@ -336,6 +349,8 @@ mod tests {
         assert_eq!(settings.max_output_chars, 1024);
         assert_eq!(settings.shell_timeout, Duration::from_secs(5));
         assert_eq!(settings.max_file, DEFAULT_MAX_FILE);
+        assert!(settings.pack);
+        assert_eq!(settings.pack_gain, DEFAULT_PACK_GAIN);
     }
 
     #[test]

@@ -19,15 +19,15 @@ const TRANSFER_TIMEOUT_FLOOR: u64 = 300;
 const TRANSFER_TIMEOUT_MAX: u64 = 3_600;
 const TRANSFER_BYTES_PER_SECOND: u64 = 256 * 1024;
 const PACK_MIN_BYTES: usize = 1024;
-const PACK_KEEP_PERCENT: usize = 88;
 
-pub fn pack(data: &[u8]) -> Option<Vec<u8>> {
+pub fn pack(data: &[u8], gain_percent: u8) -> Option<Vec<u8>> {
     if data.len() < PACK_MIN_BYTES {
         return None;
     }
     let packed =
         ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest);
-    if packed.is_empty() || packed.len() * 100 >= data.len() * PACK_KEEP_PERCENT {
+    let keep = 100u64.saturating_sub(gain_percent.min(90) as u64) as usize;
+    if packed.is_empty() || packed.len() * 100 >= data.len() * keep {
         return None;
     }
     Some(packed)
@@ -286,20 +286,20 @@ mod tests {
     #[test]
     fn packs_repetitive_chunks() {
         let text = "fn main() { println!(\"hello\"); }\n".repeat(1_000);
-        let packed = pack(text.as_bytes()).expect("重复文本应该压得动");
+        let packed = pack(text.as_bytes(), 12).expect("重复文本应该压得动");
         assert!(packed.len() * 4 < text.len());
         assert_eq!(unpack(&packed).unwrap(), text.as_bytes());
     }
 
     #[test]
     fn skips_tiny_and_random_chunks() {
-        assert!(pack(b"tiny").is_none());
+        assert!(pack(b"tiny", 12).is_none());
         let mut raw = Vec::with_capacity(60 * 1024);
         let mut seed = 0u64;
         while raw.len() < 60 * 1024 {
             raw.extend_from_slice(&Sha256::digest(seed.to_be_bytes()));
             seed += 1;
         }
-        assert!(pack(&raw).is_none());
+        assert!(pack(&raw, 12).is_none());
     }
 }

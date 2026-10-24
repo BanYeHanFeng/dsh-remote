@@ -171,7 +171,8 @@ pub async fn upload(
     })?;
     let deadline = limits::deadline("upload", &params);
     let mut handle = session.begin(target, "upload", params).await?;
-    let outcome = stream_upload(&mut handle, &mut file, meta.len(), local, cancel).await;
+    let packing = session.pack();
+    let outcome = stream_upload(&mut handle, &mut file, meta.len(), local, packing, cancel).await;
     let digest = match outcome {
         Ok(digest) => digest,
         Err(err) => {
@@ -199,6 +200,7 @@ async fn stream_upload(
     file: &mut tokio::fs::File,
     expected: u64,
     local: &Path,
+    packing: Option<u8>,
     cancel: &CancellationToken,
 ) -> Result<String> {
     let id = handle.id();
@@ -224,7 +226,7 @@ async fn stream_upload(
         }
         hasher.update(&buffer[..read]);
         sent += read as u64;
-        let (data, packed) = match transfer_pack(&buffer[..read]) {
+        let (data, packed) = match packing.and_then(|gain| transfer_pack(&buffer[..read], gain)) {
             Some(packed) => (packed, true),
             None => (buffer[..read].to_vec(), false),
         };

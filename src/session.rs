@@ -92,6 +92,8 @@ struct Inner {
     name: String,
     roots: Vec<String>,
     max_file: u64,
+    pack: bool,
+    pack_gain: u8,
     github: GithubConfig,
     next_id: AtomicU64,
     ever_connected: AtomicBool,
@@ -120,6 +122,8 @@ impl Session {
                 name: cfg.name.clone(),
                 roots: cfg.target.roots.clone(),
                 max_file: cfg.target.max_file,
+                pack: cfg.target.pack,
+                pack_gain: cfg.target.pack_gain,
                 github: cfg.github.clone(),
                 next_id: AtomicU64::new(1),
                 ever_connected: AtomicBool::new(false),
@@ -139,6 +143,10 @@ impl Session {
 
     pub fn max_file(&self) -> u64 {
         self.inner.max_file
+    }
+
+    pub fn pack(&self) -> Option<u8> {
+        self.inner.pack.then_some(self.inner.pack_gain)
     }
 
     pub fn key(&self) -> &KeyMaterial {

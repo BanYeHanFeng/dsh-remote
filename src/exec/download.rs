@@ -11,6 +11,8 @@ use crate::proto::{EndStatus, Msg, STREAM_STDOUT};
 
 pub struct Request {
     pub path: PathBuf,
+    pub pack: bool,
+    pub pack_gain: u8,
     pub max_file: u64,
     pub reply_id: u64,
     pub sink: Sink,
@@ -20,6 +22,8 @@ pub struct Request {
 pub async fn run(request: Request) {
     let Request {
         path,
+        pack: pack_enabled,
+        pack_gain,
         max_file,
         reply_id,
         sink,
@@ -69,7 +73,13 @@ pub async fn run(request: Request) {
     }
 
     let deadline = super::transfer::transfer_limit(size);
-    match tokio::time::timeout(deadline, stream(&mut file, &sink, reply_id, &cancel)).await {
+    let packing = pack_enabled.then_some(pack_gain);
+    match tokio::time::timeout(
+        deadline,
+        stream(&mut file, &sink, reply_id, packing, &cancel),
+    )
+    .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             let status = match err.code {
@@ -102,6 +112,7 @@ async fn stream(
     file: &mut tokio::fs::File,
     sink: &Sink,
     reply_id: u64,
+    packing: Option<u8>,
     cancel: &CancellationToken,
 ) -> ToolResult<()> {
     let mut hasher = Sha256::new();
@@ -121,7 +132,7 @@ async fn stream(
         }
         hasher.update(&buffer[..read]);
         sent += read as u64;
-        let (data, packed) = match pack(&buffer[..read]) {
+        let (data, packed) = match packing.and_then(|gain| pack(&buffer[..read], gain)) {
             Some(packed) => (packed, true),
             None => (buffer[..read].to_vec(), false),
         };
