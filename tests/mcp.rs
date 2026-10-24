@@ -174,12 +174,18 @@ async fn initialize_and_tools_list() {
         .collect();
     assert_eq!(
         names,
-        vec!["targets", "bash", "upload", "download", "actions"]
+        vec!["targets", "bash", "upload", "download", "mount", "actions"]
     );
     let bash = &listing["result"]["tools"][1];
     assert_eq!(
         bash["inputSchema"]["required"],
         json!(["target", "command"])
+    );
+    let mount = &listing["result"]["tools"][4];
+    assert_eq!(mount["inputSchema"]["required"], json!(["action"]));
+    assert_eq!(
+        mount["inputSchema"]["properties"]["action"]["enum"],
+        json!(["mount", "unmount", "list"])
     );
 
     let unknown = mcp.request("resources/list", json!({})).await;
@@ -328,6 +334,153 @@ async fn upload_and_download_between_nodes_through_mcp() {
 
     mcp.close().await;
     harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mount_tool_mounts_lists_and_unmounts() {
+    let harness = Harness::start("mcp-mount", true, true, None).await;
+    std::fs::write(harness.local("hello.txt"), b"through the mount\n").unwrap();
+    let mountpoint = std::env::temp_dir().join(format!(
+        "dsh-remote-mcp-mount-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let mountpoint = mountpoint.canonicalize().unwrap();
+    let mount_text = mountpoint.to_string_lossy().to_string();
+    let remote_root = harness.root.to_string_lossy().to_string();
+    let mut mcp = connect(&harness).await;
+
+    let (text, is_error) = mcp.tool("mount", json!({ "action": "list" })).await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains("没有挂载"), "{text}");
+
+    let (text, is_error) = mcp
+        .tool(
+            "mount",
+            json!({ "action": "mount", "target": "ghost", "mountpoint": mount_text }),
+        )
+        .await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("不在线"), "{text}");
+
+    let missing = mountpoint.join("missing").to_string_lossy().to_string();
+    let (text, is_error) = mcp
+        .tool(
+            "mount",
+            json!({ "action": "mount", "target": "nas", "mountpoint": missing }),
+        )
+        .await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("挂载点"), "{text}");
+
+    let (text, is_error) = mcp
+        .tool(
+            "mount",
+            json!({
+                "action": "mount",
+                "target": "nas",
+                "mountpoint": mount_text,
+                "remote_root": remote_root,
+            }),
+        )
+        .await;
+    if is_error {
+        eprintln!("跳过 FUSE 用例: {text}");
+        mcp.close().await;
+        harness.stop().await;
+        std::fs::remove_dir_all(&mountpoint).ok();
+        return;
+    }
+    assert!(text.contains("已挂载"), "{text}");
+    assert!(
+        wait_until(|| {
+            std::fs::read_to_string(mountpoint.join("hello.txt"))
+                .map(|text| text == "through the mount\n")
+                .unwrap_or(false)
+        })
+        .await,
+        "挂载点读不到远端文件"
+    );
+
+    let (text, is_error) = mcp.tool("mount", json!({ "action": "list" })).await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains(&mount_text), "{text}");
+    assert!(text.contains(&format!("nas:{remote_root}")), "{text}");
+
+    let (text, is_error) = mcp
+        .tool(
+            "mount",
+            json!({ "action": "mount", "target": "nas", "mountpoint": mount_text }),
+        )
+        .await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("已经挂着"), "{text}");
+
+    let (text, is_error) = mcp
+        .tool(
+            "mount",
+            json!({ "action": "unmount", "mountpoint": mount_text }),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains("已卸载"), "{text}");
+    assert!(
+        wait_until(|| !is_mounted(&mount_text)).await,
+        "卸载后挂载点仍在"
+    );
+
+    let (text, is_error) = mcp
+        .tool(
+            "mount",
+            json!({ "action": "unmount", "mountpoint": mount_text }),
+        )
+        .await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("没有挂着"), "{text}");
+
+    let (text, is_error) = mcp
+        .tool(
+            "mount",
+            json!({
+                "action": "mount",
+                "target": "nas",
+                "mountpoint": mount_text,
+                "remote_root": remote_root,
+            }),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    assert!(wait_until(|| is_mounted(&mount_text)).await, "再次挂载失败");
+
+    mcp.close().await;
+    assert!(
+        wait_until(|| !is_mounted(&mount_text)).await,
+        "server 退出后挂载点仍在"
+    );
+    harness.stop().await;
+    std::fs::remove_dir_all(&mountpoint).ok();
+}
+
+fn is_mounted(mountpoint: &str) -> bool {
+    std::fs::read_to_string("/proc/self/mounts")
+        .unwrap_or_default()
+        .lines()
+        .any(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            fields.len() >= 2 && fields[0].starts_with("dsh-remote:") && fields[1] == mountpoint
+        })
+}
+
+async fn wait_until<F: Fn() -> bool>(condition: F) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    condition()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
