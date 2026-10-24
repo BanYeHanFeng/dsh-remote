@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -24,6 +24,7 @@ use tree::Tree;
 const LIST_CAP: usize = 50_000;
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const CONNECT_LIMIT: Duration = Duration::from_secs(10);
+const MOUNT_SOURCE_PREFIX: &str = "dsh-remote:";
 
 pub const DEFAULT_ATTR_TTL_MS: u64 = 2_000;
 pub const DEFAULT_SPOOL_LIMIT: u64 = 536_870_912;
@@ -77,6 +78,19 @@ pub struct MountInfo {
     pub remote_root: String,
     pub read_only: bool,
     pub elapsed: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnmountOutcome {
+    Clean,
+    Detached { reason: String },
+    Stuck { reason: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct UnmountReport {
+    pub info: MountInfo,
+    pub outcome: UnmountOutcome,
 }
 
 #[derive(Debug, Clone)]
@@ -260,28 +274,65 @@ impl Mount {
         }
     }
 
-    pub async fn stop(mut self) {
-        self.release().await;
+    pub async fn stop(mut self) -> UnmountReport {
+        let info = self.info();
+        let outcome = self.release().await;
+        UnmountReport { info, outcome }
     }
 
-    async fn release(&mut self) {
-        if let Some(mut unmounter) = self.unmounter.take() {
-            if let Err(err) = unmounter.unmount() {
-                warn!(error = %err, mountpoint = %self.mountpoint.display(), "卸载失败");
-            }
-        }
+    async fn release(&mut self) -> UnmountOutcome {
+        let outcome = self.unmount();
         if let Some(worker) = self.worker.take() {
-            let join = tokio::task::spawn_blocking(move || worker.join());
-            if tokio::time::timeout(SHUTDOWN_WAIT, join).await.is_err() {
-                warn!(
+            if matches!(outcome, UnmountOutcome::Detached { .. }) {
+                debug!(
                     mountpoint = %self.mountpoint.display(),
-                    "FUSE 线程没按时退出，挂载点可能还占着"
+                    "挂载点已强制解除绑定，FUSE 线程等占用释放后自己退出"
                 );
+            } else {
+                let join = tokio::task::spawn_blocking(move || worker.join());
+                if tokio::time::timeout(SHUTDOWN_WAIT, join).await.is_err() {
+                    warn!(
+                        mountpoint = %self.mountpoint.display(),
+                        "FUSE 线程没按时退出，挂载点可能还占着"
+                    );
+                }
             }
         }
         self.inner.shutdown().await;
         let _ = std::fs::remove_dir_all(&self.spool_dir);
         info!(mountpoint = %self.mountpoint.display(), "挂载已退出");
+        outcome
+    }
+
+    fn unmount(&mut self) -> UnmountOutcome {
+        if let Some(mut unmounter) = self.unmounter.take() {
+            if let Err(err) = unmounter.unmount() {
+                warn!(error = %err, mountpoint = %self.mountpoint.display(), "卸载调用出错");
+            }
+        }
+        let Some(source) = mounted_source(&self.mountpoint) else {
+            return UnmountOutcome::Clean;
+        };
+        if !source.starts_with(MOUNT_SOURCE_PREFIX) {
+            warn!(source = %source, mountpoint = %self.mountpoint.display(), "挂载点已被别的文件系统接管");
+            return UnmountOutcome::Stuck {
+                reason: format!("挂载点已被其它文件系统占用（{source}），没有动它"),
+            };
+        }
+        warn!(source = %source, mountpoint = %self.mountpoint.display(), "卸载后挂载点还在，改用懒卸载");
+        if let Err(err) = force_detach(&self.mountpoint) {
+            return UnmountOutcome::Stuck {
+                reason: format!("懒卸载失败（{err}）"),
+            };
+        }
+        match mounted_source(&self.mountpoint) {
+            None => UnmountOutcome::Detached {
+                reason: "挂载点被占用，已强制解除绑定".to_string(),
+            },
+            Some(_) => UnmountOutcome::Stuck {
+                reason: "懒卸载后挂载点仍在挂载表里".to_string(),
+            },
+        }
     }
 }
 
@@ -291,12 +342,17 @@ impl Drop for Mount {
         if let Some(mut unmounter) = self.unmounter.take() {
             let _ = unmounter.unmount();
         }
+        if mounted_source(&self.mountpoint)
+            .is_some_and(|source| source.starts_with(MOUNT_SOURCE_PREFIX))
+        {
+            let _ = force_detach(&self.mountpoint);
+        }
     }
 }
 
 fn mount_options(spec: &MountSpec) -> Vec<fuser::MountOption> {
     let mut options = vec![
-        fuser::MountOption::FSName(format!("dsh-remote:{}", spec.target)),
+        fuser::MountOption::FSName(format!("{MOUNT_SOURCE_PREFIX}{}", spec.target)),
         fuser::MountOption::Subtype("dsh-remote".to_string()),
         fuser::MountOption::DefaultPermissions,
         fuser::MountOption::NoDev,
@@ -346,33 +402,46 @@ pub fn root_allowed(roots: &[String], path: &str) -> bool {
 }
 
 fn detach_stale(mountpoint: &Path) -> Result<()> {
+    let Some(source) = mounted_source(mountpoint) else {
+        return Ok(());
+    };
+    if !source.starts_with(MOUNT_SOURCE_PREFIX) {
+        bail!(
+            "挂载点已被其它文件系统占用: {} ({})",
+            mountpoint.display(),
+            source
+        );
+    }
+    info!(source = %source, "清理残留挂载");
+    if let Err(err) = force_detach(mountpoint) {
+        warn!(error = %err, mountpoint = %mountpoint.display(), "清理残留挂载失败");
+    }
+    Ok(())
+}
+
+fn mounted_source(mountpoint: &Path) -> Option<String> {
     let mut wanted = vec![mountpoint.to_string_lossy().to_string()];
     if let Ok(canonical) = mountpoint.canonicalize() {
         wanted.push(canonical.to_string_lossy().to_string());
     }
     let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
-    for line in mounts.lines() {
+    mounts.lines().find_map(|line| {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 3 || !wanted.iter().any(|path| *path == unescape(fields[1])) {
-            continue;
+            return None;
         }
-        if !fields[0].starts_with("dsh-remote:") {
-            bail!(
-                "挂载点已被其它文件系统占用: {} ({})",
-                mountpoint.display(),
-                fields[0]
-            );
-        }
-        info!(source = fields[0], "清理残留挂载");
-        let raw = std::ffi::CString::new(mountpoint.to_string_lossy().as_bytes())
-            .map_err(|_| anyhow!("挂载点包含空字节"))?;
-        let result = unsafe { libc::umount2(raw.as_ptr(), libc::MNT_DETACH) };
-        if result != 0 {
-            let err = std::io::Error::last_os_error();
-            warn!(error = %err, mountpoint = %mountpoint.display(), "清理残留挂载失败");
-        }
+        Some(fields[0].to_string())
+    })
+}
+
+fn force_detach(mountpoint: &Path) -> std::io::Result<()> {
+    let raw = std::ffi::CString::new(mountpoint.to_string_lossy().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "挂载点包含空字节"))?;
+    let result = unsafe { libc::umount2(raw.as_ptr(), libc::MNT_DETACH) };
+    if result == 0 {
+        return Ok(());
     }
-    Ok(())
+    Err(std::io::Error::last_os_error())
 }
 
 fn unescape(value: &str) -> String {
