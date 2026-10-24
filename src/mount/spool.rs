@@ -115,10 +115,6 @@ impl Spool {
         if !self.dirty {
             return Ok(None);
         }
-        self.file()
-            .map_err(local_error)?
-            .sync_data()
-            .map_err(local_error)?;
         let report = call::upload(session, target, &self.local, &self.path, true, true, cancel)
             .await
             .map_err(remote_error)?;
@@ -154,10 +150,6 @@ impl Drop for Spool {
         self.file = None;
         let _ = std::fs::remove_file(&self.local);
     }
-}
-
-fn local_error(err: io::Error) -> RemoteError {
-    RemoteError::new("io", format!("本地影子文件操作失败: {err}"))
 }
 
 fn remote_error(err: anyhow::Error) -> RemoteError {
