@@ -528,12 +528,16 @@ async fn mount_tool_unmount_detaches_busy_mountpoint() {
             json!({ "action": "unmount", "mountpoint": mount_text }),
         )
         .await;
+    let rooted = unsafe { libc::geteuid() } == 0;
+    eprintln!("卸载返回（root={rooted}）: {text}");
     assert!(!is_error, "{text}");
     assert!(text.contains("已卸载"), "{text}");
-    assert!(
-        text.contains("强制解除绑定"),
-        "占用时应当告知做了强制解除绑定: {text}"
-    );
+    if rooted {
+        assert!(
+            text.contains("强制解除绑定"),
+            "root 下 umount 会被占用挡住，应当告知做了强制解除绑定: {text}"
+        );
+    }
     assert!(!is_mounted(&mount_text), "卸载后挂载点还在: {text}");
 
     holder.kill().await.ok();
