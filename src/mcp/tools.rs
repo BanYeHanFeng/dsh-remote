@@ -57,8 +57,6 @@ impl ToolOutput {
 
 type ToolResult = Result<ToolOutput, String>;
 
-const TARGET_SCHEMA: &str = "目标名，取自 targets 工具返回的名字";
-
 pub fn list() -> Value {
     json!([
         {
