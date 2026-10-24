@@ -2,10 +2,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
+use tracing::warn;
 
 use crate::session::Session;
 
-use super::{Mount, MountInfo, MountSpec};
+use super::{Mount, MountInfo, MountSpec, UnmountOutcome, UnmountReport};
 
 #[derive(Clone, Default)]
 pub struct Mounts {
@@ -52,7 +53,7 @@ impl Mounts {
         Ok(info)
     }
 
-    pub async fn remove(&self, mountpoint: Option<&Path>) -> Vec<MountInfo> {
+    pub async fn remove(&self, mountpoint: Option<&Path>) -> Vec<UnmountReport> {
         let taken: Vec<Mount> = {
             let mut entries = self.entries.lock().await;
             match mountpoint {
@@ -71,14 +72,27 @@ impl Mounts {
         };
         let mut removed = Vec::with_capacity(taken.len());
         for mount in taken {
-            removed.push(mount.info());
-            mount.stop().await;
+            removed.push(mount.stop().await);
         }
         removed
     }
 
     pub async fn stop_all(&self) {
-        self.remove(None).await;
+        for report in self.remove(None).await {
+            match report.outcome {
+                UnmountOutcome::Clean => {}
+                UnmountOutcome::Detached { reason } => warn!(
+                    mountpoint = %report.info.mountpoint.display(),
+                    reason = %reason,
+                    "退出时挂载点被占用，已强制解除绑定"
+                ),
+                UnmountOutcome::Stuck { reason } => warn!(
+                    mountpoint = %report.info.mountpoint.display(),
+                    reason = %reason,
+                    "退出时卸载没成功"
+                ),
+            }
+        }
     }
 }
 

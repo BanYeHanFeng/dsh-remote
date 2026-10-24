@@ -11,7 +11,7 @@ use crate::actions::{
 };
 use crate::call;
 use crate::mount::registry::Mounts;
-use crate::mount::{root_allowed, MountSpec, DEFAULT_ATTR_TTL_MS};
+use crate::mount::{root_allowed, MountSpec, UnmountOutcome, DEFAULT_ATTR_TTL_MS};
 use crate::proto::now_ms;
 use crate::proto::params::TransferParams;
 use crate::session::{RemoteError, Session};
@@ -384,14 +384,42 @@ async fn mount(session: &Session, mounts: &Mounts, args: &Value) -> ToolResult {
                 };
             }
             let mut text = String::new();
-            for info in &removed {
-                let _ = writeln!(
-                    text,
-                    "已卸载 {}（{}:{}）",
-                    info.mountpoint.display(),
-                    info.target,
-                    info.remote_root
-                );
+            let mut stuck = Vec::new();
+            for report in &removed {
+                let info = &report.info;
+                match &report.outcome {
+                    UnmountOutcome::Clean => {
+                        let _ = writeln!(
+                            text,
+                            "已卸载 {}（{}:{}）",
+                            info.mountpoint.display(),
+                            info.target,
+                            info.remote_root
+                        );
+                    }
+                    UnmountOutcome::Detached { reason } => {
+                        let _ = writeln!(
+                            text,
+                            "已卸载 {}（{}:{}），{reason}；正在用这个路径的进程会立刻看不到它，挂载点现在可以删了",
+                            info.mountpoint.display(),
+                            info.target,
+                            info.remote_root
+                        );
+                    }
+                    UnmountOutcome::Stuck { reason } => {
+                        let _ = writeln!(
+                            text,
+                            "卸载 {}（{}:{}）没成功：{reason}，挂载点还留着，先让占用的进程退出去再卸一次",
+                            info.mountpoint.display(),
+                            info.target,
+                            info.remote_root
+                        );
+                        stuck.push(());
+                    }
+                }
+            }
+            if !stuck.is_empty() {
+                return Err(text.trim_end().to_string());
             }
             Ok(ToolOutput::ok(text))
         }
