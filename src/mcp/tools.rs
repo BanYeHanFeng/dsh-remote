@@ -63,24 +63,24 @@ pub fn list() -> Value {
     json!([
         {
             "name": "targets",
-            "description": "列出房间内所有在线目标（中继自身与各被控端）：类型、系统、架构、版本、在线时长与允许访问的目录。任何操作前先调用它确认目标名。",
+            "description": "列出所有在线目标：类型、系统、架构、版本、在线时长与允许访问的目录",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {
             "name": "bash",
-            "description": "在目标上持久的 bash 里执行命令。调用这个工具时，\"command\" 参数的内容不需要做 XML 转义。想查看文件的某一段行区间（例如第 10-25 行）时，试 sed -n 10,25p /path/to/the/file。命令超时时间来自目标的 SHELL_TIMEOUT_MS（默认 300 秒），超时会杀掉整个进程组并重置 Shell；返回内容超过字符上限会被截断。交互式程序（vim、top）不可用。",
+            "description": "在 bash shell 中运行命令，状态在多次命令调用以及与用户的对话之间持续保留",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": TARGET_SCHEMA },
-                    "command": { "type": "string", "description": "完整 shell 命令，例如 systemctl status nginx" }
+                    "target": { "type": "string" },
+                    "command": { "type": "string", "description": "完整 shell 命令，不需要做 XML 转义" }
                 },
                 "required": ["target", "command"]
             }
         },
         {
             "name": "upload",
-            "description": "把文件传到 target 节点：给 local_path 时从本机上传；给 from 时改成节点互传，由中继把 from 节点上的文件直接搬到 target 上（不经过本机磁盘）。两种方式都会先写 .part，按总字节数与 sha256 校验后原子改名，默认拒绝覆盖已有文件。",
+            "description": "把文件传到 target 节点，默认拒绝覆盖已有文件",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -97,7 +97,7 @@ pub fn list() -> Value {
         },
         {
             "name": "download",
-            "description": "从 target 节点取文件：给 local_path 时下载到本机；给 to 时改成节点互传，由中继把 target 上的文件直接搬到 to 节点（不经过本机磁盘）。默认拒绝覆盖目的地已有文件。",
+            "description": "从 target 节点取文件，默认拒绝覆盖目的地已有文件",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -113,7 +113,7 @@ pub fn list() -> Value {
         },
         {
             "name": "mount",
-            "description": "在 DSH 本机把某个目标上的目录挂成一个本地路径，挂上之后读改文件直接用本地文件工具，比一次次 bash 划算（搜索与构建仍然用 bash）。action=mount 开始挂载，要 target 与 mountpoint（本机已存在的目录）；action=unmount 卸载，给 mountpoint 只卸一个、省略则全部卸载；action=list 列出本进程挂着的目录。挂载跟 server 同生共死：server 退出时全部自动卸载。目标离线时挂载点还在，只是读写会失败。",
+            "description": "将 target 远程节点指定目录挂载到本机指定目录下",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -129,7 +129,7 @@ pub fn list() -> Value {
         },
         {
             "name": "actions",
-            "description": "把 GitHub Actions 的临时 runner 变成房间里的被控端：start 派发工作流（节点以 Actions 进房间，默认保持 60 分钟并等它上线），stop 向节点发 shutdown 让它自行退出（运行在 Actions 里保持成功，节点不在线时兜底取消运行），status 看最近的运行与在线状态。需要 server 配置 GH_REPO，并且本机 gh 已登录。",
+            "description": "把 GitHub Actions 的临时 runner 变成被控端",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -138,7 +138,7 @@ pub fn list() -> Value {
                     "allow_bash": { "type": "boolean", "description": "start 时是否允许 bash 工具，默认 true" },
                     "roots": { "type": "string", "description": "start 时允许访问的目录，冒号分隔，默认 /" },
                     "version": { "type": "string", "description": "start 时的二进制来源：latest 用最新发布、source 现场编译、或具体 tag" },
-                    "arch": { "type": "string", "enum": ["amd64", "arm64"], "description": format!("start 时的节点架构：amd64 走 ubuntu-latest，arm64 走 ubuntu-24.04-arm（公共仓库免费），默认 {DEFAULT_ARCH}") },
+                    "arch": { "type": "string", "enum": ["amd64", "arm64"], "description": format!("start 时的节点架构，默认 {DEFAULT_ARCH}") },
                     "hub": { "type": "string", "description": "start 时覆盖中继地址，默认用本会话连接的中继" },
                     "sync_key": { "type": "boolean", "description": "start 前把房间 Key 写入仓库密钥，默认 true；关掉则要求仓库里已有该密钥" },
                     "sync_hub": { "type": "boolean", "description": "start 前把中继地址写入仓库密钥（日志里不会出现），默认 true；关掉则要求仓库里已有该密钥" },
