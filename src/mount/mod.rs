@@ -1,4 +1,5 @@
 pub mod fuse;
+pub mod registry;
 pub mod spool;
 pub mod tree;
 
@@ -6,7 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::Mutex as AsyncMutex;
@@ -23,6 +24,60 @@ use tree::Tree;
 const LIST_CAP: usize = 50_000;
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const CONNECT_LIMIT: Duration = Duration::from_secs(10);
+
+pub const DEFAULT_ATTR_TTL_MS: u64 = 2_000;
+pub const DEFAULT_SPOOL_LIMIT: u64 = 536_870_912;
+
+#[derive(Debug, Clone)]
+pub struct MountSpec {
+    pub target: String,
+    pub mountpoint: PathBuf,
+    pub remote_root: String,
+    pub read_only: bool,
+    pub allow_other: bool,
+    pub attr_ttl: Duration,
+    pub spool_dir: Option<PathBuf>,
+    pub spool_limit: u64,
+}
+
+impl MountSpec {
+    pub fn new(target: impl Into<String>, mountpoint: impl Into<PathBuf>) -> Self {
+        Self {
+            target: target.into(),
+            mountpoint: mountpoint.into(),
+            remote_root: "/".to_string(),
+            read_only: false,
+            allow_other: false,
+            attr_ttl: Duration::from_millis(DEFAULT_ATTR_TTL_MS),
+            spool_dir: None,
+            spool_limit: DEFAULT_SPOOL_LIMIT,
+        }
+    }
+}
+
+impl From<&MountConfig> for MountSpec {
+    fn from(cfg: &MountConfig) -> Self {
+        Self {
+            target: cfg.target.clone(),
+            mountpoint: cfg.mountpoint.clone(),
+            remote_root: cfg.remote_root.clone(),
+            read_only: cfg.read_only,
+            allow_other: cfg.allow_other,
+            attr_ttl: cfg.attr_ttl,
+            spool_dir: cfg.spool_dir.clone(),
+            spool_limit: cfg.spool_limit,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MountInfo {
+    pub target: String,
+    pub mountpoint: PathBuf,
+    pub remote_root: String,
+    pub read_only: bool,
+    pub elapsed: Duration,
+}
 
 #[derive(Debug, Clone)]
 pub struct MountError {
@@ -95,84 +150,160 @@ pub async fn run(cfg: MountConfig, shutdown: CancellationToken) -> Result<()> {
         warn!("首次连接中继超时，挂载点等连接恢复后才能用");
     }
 
-    detach_stale(&cfg.mountpoint)?;
-    let mountpoint = cfg
-        .mountpoint
-        .canonicalize()
-        .with_context(|| format!("挂载点不可用: {}", cfg.mountpoint.display()))?;
-    if !mountpoint.is_dir() {
-        bail!("挂载点不是目录: {}", mountpoint.display());
-    }
-
-    let spool_dir = cfg.spool_dir.clone().unwrap_or_else(|| {
-        std::env::temp_dir().join(format!(
-            "dsh-remote-spool-{}-{:016x}",
-            std::process::id(),
-            rand::random::<u64>()
-        ))
-    });
-    std::fs::create_dir_all(&spool_dir)
-        .with_context(|| format!("创建影子目录失败: {}", spool_dir.display()))?;
-
-    let inner = Arc::new(Inner::new(
-        session,
-        cfg.target.clone(),
-        cfg.remote_root.clone(),
-        SpoolSet {
-            dir: spool_dir.clone(),
-            limit: cfg.spool_limit,
-        },
-        cfg.attr_ttl,
-        cfg.read_only,
-        shutdown.child_token(),
-    ));
-
-    let handle = tokio::runtime::Handle::current();
-    let mut fuse_session = fuser::Session::new(
-        fuse::Fs::new(inner.clone(), handle),
-        &mountpoint,
-        &mount_options(&cfg),
-    )
-    .with_context(|| format!("挂载失败: {}", mountpoint.display()))?;
-    let mut unmounter = fuse_session.unmount_callable();
-    let worker = std::thread::Builder::new()
-        .name("dsh-remote-fuse".to_string())
-        .spawn(move || {
-            if let Err(err) = fuse_session.run() {
-                warn!(error = %err, "FUSE 会话结束");
-            }
-        })
-        .context("创建 FUSE 线程失败")?;
-    info!(mountpoint = %mountpoint.display(), "挂载就绪");
-
+    let mount = Mount::start(&session, MountSpec::from(&cfg)).await?;
     shutdown.cancelled().await;
-    if let Err(err) = unmounter.unmount() {
-        warn!(error = %err, "卸载失败");
-    }
-    let _ = tokio::time::timeout(
-        SHUTDOWN_WAIT,
-        tokio::task::spawn_blocking(move || worker.join()),
-    )
-    .await;
-    inner.shutdown().await;
+    mount.stop().await;
     let _ = tokio::time::timeout(SHUTDOWN_WAIT, connection).await;
-    let _ = std::fs::remove_dir_all(&spool_dir);
-    info!("挂载已退出");
     Ok(())
 }
 
-fn mount_options(cfg: &MountConfig) -> Vec<fuser::MountOption> {
+pub struct Mount {
+    target: String,
+    mountpoint: PathBuf,
+    remote_root: String,
+    read_only: bool,
+    since: Instant,
+    inner: Arc<Inner>,
+    unmounter: Option<fuser::SessionUnmounter>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    spool_dir: PathBuf,
+    cancel: CancellationToken,
+}
+
+impl Mount {
+    pub async fn start(session: &Session, spec: MountSpec) -> Result<Self> {
+        detach_stale(&spec.mountpoint)?;
+        let mountpoint = spec
+            .mountpoint
+            .canonicalize()
+            .with_context(|| format!("挂载点不可用: {}", spec.mountpoint.display()))?;
+        if !mountpoint.is_dir() {
+            bail!("挂载点不是目录: {}", mountpoint.display());
+        }
+
+        let spool_dir = spec.spool_dir.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "dsh-remote-spool-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ))
+        });
+        std::fs::create_dir_all(&spool_dir)
+            .with_context(|| format!("创建影子目录失败: {}", spool_dir.display()))?;
+
+        let cancel = CancellationToken::new();
+        let inner = Arc::new(Inner::new(
+            session.clone(),
+            spec.target.clone(),
+            spec.remote_root.clone(),
+            SpoolSet {
+                dir: spool_dir.clone(),
+                limit: spec.spool_limit,
+            },
+            spec.attr_ttl,
+            spec.read_only,
+            cancel.clone(),
+        ));
+
+        let handle = tokio::runtime::Handle::current();
+        let mut fuse_session = match fuser::Session::new(
+            fuse::Fs::new(inner.clone(), handle),
+            &mountpoint,
+            &mount_options(&spec),
+        ) {
+            Ok(fuse_session) => fuse_session,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&spool_dir);
+                return Err(err).with_context(|| format!("挂载失败: {}", mountpoint.display()));
+            }
+        };
+        let unmounter = fuse_session.unmount_callable();
+        let worker = match std::thread::Builder::new()
+            .name("dsh-remote-fuse".to_string())
+            .spawn(move || {
+                if let Err(err) = fuse_session.run() {
+                    warn!(error = %err, "FUSE 会话结束");
+                }
+            }) {
+            Ok(worker) => worker,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&spool_dir);
+                return Err(err).context("创建 FUSE 线程失败");
+            }
+        };
+        info!(mountpoint = %mountpoint.display(), "挂载就绪");
+        Ok(Self {
+            target: spec.target,
+            mountpoint,
+            remote_root: spec.remote_root,
+            read_only: spec.read_only,
+            since: Instant::now(),
+            inner,
+            unmounter: Some(unmounter),
+            worker: Some(worker),
+            spool_dir,
+            cancel,
+        })
+    }
+
+    pub fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+
+    pub fn info(&self) -> MountInfo {
+        MountInfo {
+            target: self.target.clone(),
+            mountpoint: self.mountpoint.clone(),
+            remote_root: self.remote_root.clone(),
+            read_only: self.read_only,
+            elapsed: self.since.elapsed(),
+        }
+    }
+
+    pub async fn stop(mut self) {
+        self.release().await;
+    }
+
+    async fn release(&mut self) {
+        if let Some(mut unmounter) = self.unmounter.take() {
+            if let Err(err) = unmounter.unmount() {
+                warn!(error = %err, mountpoint = %self.mountpoint.display(), "卸载失败");
+            }
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = tokio::time::timeout(
+                SHUTDOWN_WAIT,
+                tokio::task::spawn_blocking(move || worker.join()),
+            )
+            .await;
+        }
+        self.inner.shutdown().await;
+        let _ = std::fs::remove_dir_all(&self.spool_dir);
+        info!(mountpoint = %self.mountpoint.display(), "挂载已退出");
+    }
+}
+
+impl Drop for Mount {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(mut unmounter) = self.unmounter.take() {
+            let _ = unmounter.unmount();
+        }
+    }
+}
+
+fn mount_options(spec: &MountSpec) -> Vec<fuser::MountOption> {
     let mut options = vec![
-        fuser::MountOption::FSName(format!("dsh-remote:{}", cfg.target)),
+        fuser::MountOption::FSName(format!("dsh-remote:{}", spec.target)),
         fuser::MountOption::Subtype("dsh-remote".to_string()),
         fuser::MountOption::DefaultPermissions,
         fuser::MountOption::NoDev,
         fuser::MountOption::NoSuid,
     ];
-    if cfg.read_only {
+    if spec.read_only {
         options.push(fuser::MountOption::RO);
     }
-    if cfg.allow_other {
+    if spec.allow_other {
         options.push(fuser::MountOption::AllowOther);
     }
     options

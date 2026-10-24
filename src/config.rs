@@ -8,12 +8,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use crate::cli::{ClientArgs, CommonArgs, HubArgs, MountArgs};
 use crate::exec::Settings;
 use crate::key::KeyMaterial;
+use crate::mount::{DEFAULT_ATTR_TTL_MS, DEFAULT_SPOOL_LIMIT};
 
 const DEFAULT_MAX_OUTPUT_CHARS: usize = 16_000;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_MAX_FILE: u64 = 67_108_864;
-const DEFAULT_ATTR_TTL_MS: u64 = 2_000;
-const DEFAULT_SPOOL_LIMIT: u64 = 536_870_912;
 
 #[derive(Clone, Debug)]
 pub struct HubConfig {
