@@ -463,6 +463,91 @@ async fn mount_tool_mounts_lists_and_unmounts() {
     std::fs::remove_dir_all(&mountpoint).ok();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mount_tool_unmount_detaches_busy_mountpoint() {
+    let harness = Harness::start("mcp-mount-busy", true, true, None).await;
+    std::fs::write(harness.local("busy.txt"), b"stuck\n").unwrap();
+    let mountpoint = std::env::temp_dir().join(format!(
+        "dsh-remote-mcp-busy-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let mountpoint = mountpoint.canonicalize().unwrap();
+    let mount_text = mountpoint.to_string_lossy().to_string();
+    let remote_root = harness.root.to_string_lossy().to_string();
+    let flag = std::env::temp_dir().join(format!(
+        "dsh-remote-mcp-busy-flag-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::remove_file(&flag);
+    let mut mcp = connect(&harness).await;
+
+    let (text, is_error) = mcp
+        .tool(
+            "mount",
+            json!({
+                "action": "mount",
+                "target": "nas",
+                "mountpoint": mount_text,
+                "remote_root": remote_root,
+            }),
+        )
+        .await;
+    if is_error {
+        eprintln!("跳过 FUSE 用例: {text}");
+        mcp.close().await;
+        harness.stop().await;
+        std::fs::remove_dir_all(&mountpoint).ok();
+        return;
+    }
+    assert!(text.contains("已挂载"), "{text}");
+    assert!(
+        wait_until(|| std::fs::read_to_string(mountpoint.join("busy.txt")).is_ok()).await,
+        "挂载点读不到远端文件"
+    );
+
+    let flag_text = flag.to_string_lossy().to_string();
+    let mut holder = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "cd '{mount_text}' && : > '{flag_text}' && exec sleep 60"
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("启动占用进程失败");
+    assert!(wait_until(|| flag.exists()).await, "占用进程没进到挂载点里");
+
+    let (text, is_error) = mcp
+        .tool(
+            "mount",
+            json!({ "action": "unmount", "mountpoint": mount_text }),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains("已卸载"), "{text}");
+    assert!(
+        text.contains("强制解除绑定"),
+        "占用时应当告知做了强制解除绑定: {text}"
+    );
+    assert!(!is_mounted(&mount_text), "卸载后挂载点还在: {text}");
+
+    holder.kill().await.ok();
+    holder.wait().await.ok();
+    let (text, is_error) = mcp.tool("mount", json!({ "action": "list" })).await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains("没有挂载"), "{text}");
+
+    mcp.close().await;
+    harness.stop().await;
+    std::fs::remove_dir_all(&mountpoint).expect("卸载后挂载点应该能删掉");
+    std::fs::remove_file(&flag).ok();
+}
+
 fn is_mounted(mountpoint: &str) -> bool {
     std::fs::read_to_string("/proc/self/mounts")
         .unwrap_or_default()
