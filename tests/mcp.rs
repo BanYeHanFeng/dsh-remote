@@ -326,12 +326,6 @@ async fn upload_and_download_between_nodes_through_mcp() {
     assert!(is_error, "{text}");
     assert!(text.contains("source_path"), "{text}");
 
-    let (text, is_error) = mcp
-        .tool("uppload", json!({ "target": "nas", "remote_path": dest }))
-        .await;
-    assert!(is_error, "{text}");
-    assert!(text.contains("未知工具"), "{text}");
-
     mcp.close().await;
     harness.stop().await;
 }

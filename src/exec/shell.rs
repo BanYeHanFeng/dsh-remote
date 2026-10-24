@@ -89,7 +89,9 @@ impl Shells {
                 let partial = capture_partial(&guard, &marker);
                 reset(&mut guard);
                 let note = exit_note(code);
-                return Ok(partial.report(request.max_output_chars, Some(&note), false));
+                let mut report = partial.report(request.max_output_chars, Some(&note), false);
+                report.exit_code = Some(code);
+                return Ok(report);
             }
             if Instant::now() >= deadline {
                 let partial = capture_partial(&guard, &marker);
@@ -326,6 +328,9 @@ impl Shell {
         command.current_dir(Path::new(cwd));
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
+        #[cfg(unix)]
+        command.stderr(Stdio::null());
+        #[cfg(not(unix))]
         command.stderr(Stdio::piped());
         command.kill_on_drop(true);
         set_process_group(&mut command);
@@ -355,6 +360,7 @@ impl Shell {
                 eof.store(true, Ordering::Relaxed);
             });
         }
+        #[cfg(not(unix))]
         if let Some(mut stderr) = child.stderr.take() {
             let target = buffer.clone();
             tokio::spawn(async move {

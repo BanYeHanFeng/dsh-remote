@@ -265,6 +265,10 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 | `download` | `download`（节点→本机）或 `transfer`（`to` 节点互传） | 下行 `Chunk`+`End`，或互传的 `Result` | `300s + 大小/256KiB` |
 | `actions stop`（内部） | `shutdown`（发给目标节点） | `Result` | 10s |
 
+- `bash` 只有 `target` 与 `command` 两个参数：超时来自目标配置（`SHELL_TIMEOUT_MS`，
+  默认 300 秒），单次返回的字符上限也来自目标配置（`MAX_OUTPUT_CHARS`，默认 16000）。
+- `upload` / `download` 各有两种用法：给 `local_path` 时走 DSH 本机磁盘，
+  给 `from` / `to` 时改发 `transfer`，由中继在两个节点之间直接搬。
 - `req_id` 由 server 侧的 `Session` 单调分配，一条连接内并发任意多路；
   收到 `End`/`Result` 即释放。
 - MCP 的 `notifications/cancelled` → 内部 `Cancel{id}`，hub 再转发给 agent：

@@ -184,6 +184,9 @@ async fn shell_exit_is_reported_and_reset() {
     assert!(report.output.contains("bye"), "{}", report.output);
     assert!(report.output.contains("Shell 已退出"), "{}", report.output);
 
+    assert_eq!(report.exit_code, Some(4));
+    assert!(!report.output.contains("命令结束"), "{}", report.output);
+
     let again = remote_call(
         &harness,
         "nas",
@@ -195,6 +198,7 @@ async fn shell_exit_is_reported_and_reset() {
     .unwrap();
     let report = bash_report(&again);
     assert_eq!(report.exit_code, Some(0));
+    assert!(!report.failed());
     assert!(report.output.contains("back"), "{}", report.output);
     harness.stop().await;
 }
@@ -250,6 +254,36 @@ async fn stderr_is_merged_into_the_output() {
     let report = bash_report(&result);
     assert!(report.output.contains("out"), "{}", report.output);
     assert!(report.output.contains("err"), "{}", report.output);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_calls_are_serialized_on_the_same_shell() {
+    let harness = Harness::start("bash", true, true, Some(vec!["/tmp".to_string()])).await;
+    let session = harness.session().await;
+    let cancel = no_cancel();
+    let first = call::call(
+        &session,
+        "nas",
+        "bash",
+        bash_params("sleep 0.2; echo first"),
+        Duration::from_secs(10),
+        &cancel,
+    );
+    let second = call::call(
+        &session,
+        "nas",
+        "bash",
+        bash_params("echo second"),
+        Duration::from_secs(10),
+        &cancel,
+    );
+    let (first, second) = tokio::join!(first, second);
+    let first = bash_report(&first.unwrap());
+    let second = bash_report(&second.unwrap());
+    assert!(first.output.contains("first"), "{}", first.output);
+    assert!(second.output.contains("second"), "{}", second.output);
+    assert_eq!(second.exit_code, Some(0));
     harness.stop().await;
 }
 

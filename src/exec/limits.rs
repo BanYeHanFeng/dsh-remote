@@ -62,7 +62,6 @@ mod tests {
         let params = value::serialize(&BashParams {
             command: "true".into(),
             timeout_ms: Some(1_000),
-            ..BashParams::default()
         })
         .unwrap();
         assert_eq!(deadline("bash", &params), Duration::from_secs(31));
