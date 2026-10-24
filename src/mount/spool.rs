@@ -21,6 +21,7 @@ pub struct Spool {
     pub base_mtime_ms: u64,
     pub pending_mode: Option<u32>,
     pub opened: u32,
+    pub have_baseline: bool,
     pub last_used: Instant,
 }
 
@@ -37,6 +38,7 @@ impl Spool {
             base_mtime_ms: 0,
             pending_mode: None,
             opened: 0,
+            have_baseline: false,
             last_used: Instant::now(),
         }
     }
@@ -53,6 +55,7 @@ impl Spool {
             base_mtime_ms: mtime_ms,
             pending_mode: None,
             opened: 0,
+            have_baseline: true,
             last_used: Instant::now(),
         }
     }
@@ -103,7 +106,13 @@ impl Spool {
     pub fn mark_synced(&mut self, remote: &FsEntry) {
         self.base_size = remote.size;
         self.base_mtime_ms = remote.mtime_ms;
+        self.have_baseline = true;
         self.dirty = false;
+    }
+
+    fn baseline(&self) -> Option<(u64, u64)> {
+        self.have_baseline
+            .then_some((self.base_mtime_ms, self.base_size))
     }
 
     pub async fn flush(
@@ -115,9 +124,18 @@ impl Spool {
         if !self.dirty {
             return Ok(None);
         }
-        let report = call::upload(session, target, &self.local, &self.path, true, true, cancel)
-            .await
-            .map_err(remote_error)?;
+        let report = call::upload_checked(
+            session,
+            target,
+            &self.local,
+            &self.path,
+            true,
+            true,
+            self.baseline(),
+            cancel,
+        )
+        .await
+        .map_err(remote_error)?;
         self.dirty = false;
         Ok(report.entry)
     }

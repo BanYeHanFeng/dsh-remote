@@ -118,6 +118,7 @@ impl From<RemoteError> for MountError {
             "too_large" => libc::EFBIG,
             "unsupported" => libc::ENOSYS,
             "timeout" => libc::ETIMEDOUT,
+            "stale" => libc::ESTALE,
             "busy" => libc::EAGAIN,
             "protocol" => libc::EINVAL,
             _ => libc::EIO,
