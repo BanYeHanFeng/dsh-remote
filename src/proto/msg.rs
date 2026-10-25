@@ -193,14 +193,6 @@ impl Msg {
     }
 }
 
-pub fn target_names(targets: &[TargetInfo]) -> String {
-    targets
-        .iter()
-        .map(|target| target.name.as_str())
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

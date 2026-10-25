@@ -15,9 +15,7 @@ use crate::key::KeyMaterial;
 use crate::net::backoff::Backoff;
 use crate::net::link::{End, Link, HELLO_TIMEOUT};
 use crate::net::Sink;
-use crate::proto::{
-    target_names, EndStatus, Msg, Role, TargetEventKind, TargetInfo, PROTO_VERSION,
-};
+use crate::proto::{EndStatus, Msg, Role, TargetEventKind, TargetInfo, PROTO_VERSION};
 
 const REPLY_QUEUE: usize = 512;
 const INITIAL_CONNECT_GRACE: Duration = Duration::from_secs(2);
@@ -256,12 +254,7 @@ impl Session {
                 if proto != PROTO_VERSION {
                     bail!("中继协议版本不匹配: {proto}");
                 }
-                info!(
-                    hub = %hub_name,
-                    targets = %target_names(&targets),
-                    server_online,
-                    "已连接中继"
-                );
+                info!(targets = targets.len(), server_online, "已连接中继");
                 (hub_name, targets)
             }
             Msg::Bye { code, message } => bail!("中继拒绝连接: {code} {message}"),

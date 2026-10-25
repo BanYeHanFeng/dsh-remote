@@ -9,7 +9,7 @@ use crate::config::ClientConfig;
 use crate::exec::Executor;
 use crate::net::backoff::Backoff;
 use crate::net::link::{End, Link, HELLO_TIMEOUT};
-use crate::proto::{target_names, Msg, Role, PROTO_VERSION};
+use crate::proto::{Msg, Role, PROTO_VERSION};
 
 const REPLACED_RETRY: Duration = Duration::from_secs(60);
 const REPLACED_JITTER_MS: u64 = 15_000;
@@ -84,21 +84,12 @@ async fn connect_once(
         .await
         .map_err(|_| anyhow!("等待 Welcome 超时"))??;
     match welcome {
-        Msg::Welcome {
-            proto,
-            hub_name,
-            targets,
-            ..
-        } => {
+        Msg::Welcome { proto, targets, .. } => {
             if proto != PROTO_VERSION {
                 bail!("中继协议版本不匹配: {proto}");
             }
             backoff.reset();
-            info!(
-                hub = %hub_name,
-                targets = %target_names(&targets),
-                "已注册到中继"
-            );
+            info!(targets = targets.len(), "已注册到中继");
         }
         Msg::Bye { code, message } if code == "replaced" => {
             return Err(anyhow::Error::new(Replaced).context(format!("中继拒绝连接: {message}")));

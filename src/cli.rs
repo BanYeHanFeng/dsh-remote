@@ -23,8 +23,8 @@ pub enum Command {
     Agent(Box<ClientArgs>),
     #[command(about = "启动 DSH 侧服务端，MCP 走 stdio")]
     Server(Box<ClientArgs>),
-    #[command(about = "列出房间内的在线目标")]
-    Targets(Box<ClientArgs>),
+    #[command(about = "查看房间内在线目标，默认只报数量")]
+    Targets(Box<TargetsArgs>),
     #[command(about = "把远端目录挂到本机，交给本地工具直接读写")]
     Mount(Box<MountArgs>),
 }
@@ -56,7 +56,7 @@ pub struct CommonArgs {
     pub shell_timeout_ms: Option<u64>,
     #[arg(long, value_name = "字节", help = "单文件传输上限")]
     pub max_file: Option<u64>,
-    #[arg(long, value_name = "路径", help = "日志目标：stderr 或文件路径")]
+    #[arg(long, value_name = "路径", help = "日志目标：stderr、文件路径或 off")]
     pub log: Option<String>,
 }
 
@@ -103,6 +103,14 @@ pub struct ClientArgs {
     pub hub: Option<String>,
 }
 
+#[derive(Args, Debug, Clone)]
+pub struct TargetsArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+    #[arg(long, help = "连名字、系统和目录一起列出，默认只报在线数量")]
+    pub names: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,9 +130,28 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::Targets(args) => {
-                assert_eq!(args.common.name.as_deref(), Some("probe"));
-                assert_eq!(args.hub.as_deref(), Some("127.0.0.1:1"));
+                assert_eq!(args.client.common.name.as_deref(), Some("probe"));
+                assert_eq!(args.client.hub.as_deref(), Some("127.0.0.1:1"));
+                assert!(!args.names);
             }
+            other => panic!("期望 targets，收到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_targets_names() {
+        let cli = Cli::try_parse_from([
+            "dsh-remote",
+            "targets",
+            "--hub",
+            "127.0.0.1:1",
+            "--key",
+            "0123456789abcdef",
+            "--names",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Targets(args) => assert!(args.names),
             other => panic!("期望 targets，收到 {other:?}"),
         }
     }

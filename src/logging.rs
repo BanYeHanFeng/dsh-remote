@@ -4,9 +4,13 @@ use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
 pub fn init(spec: &str) -> Result<()> {
+    let spec = spec.trim();
+    if spec.eq_ignore_ascii_case("off") || spec.eq_ignore_ascii_case("none") {
+        return Ok(());
+    }
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("dsh_remote=info"));
-    if spec.trim().is_empty() || spec == "stderr" {
+    if spec.is_empty() || spec == "stderr" {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)

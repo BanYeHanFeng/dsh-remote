@@ -4,6 +4,6 @@ pub mod params;
 pub mod value;
 
 pub use msg::{
-    now_ms, target_names, EndStatus, Msg, ProtoError, Role, TargetEventKind, TargetInfo,
-    TargetKind, PROTO_VERSION, STREAM_STDERR, STREAM_STDOUT,
+    now_ms, EndStatus, Msg, ProtoError, Role, TargetEventKind, TargetInfo, TargetKind,
+    PROTO_VERSION, STREAM_STDERR, STREAM_STDOUT,
 };

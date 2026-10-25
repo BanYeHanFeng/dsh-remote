@@ -60,9 +60,13 @@ async fn run() -> Result<()> {
             mount::run(cfg, shutdown_token()).await
         }
         Command::Targets(args) => {
-            let session = connect(&args).await?;
+            let session = connect(&args.client).await?;
             let targets = call::targets(&session).await?;
-            print_targets(&targets);
+            if args.names {
+                print_targets(&targets);
+            } else {
+                println!("房间内在线目标 {} 个（要名单加 --names）", targets.len());
+            }
             Ok(())
         }
     }
