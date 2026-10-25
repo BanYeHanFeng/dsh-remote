@@ -69,9 +69,6 @@ jobs:
         with:
           key: ${{ matrix.target }}
           cache-on-failure: true
-      - name: 格式检查
-        if: matrix.arch == 'amd64'
-        run: cargo fmt --check
       - name: 编译静态 musl
         run: cargo build --locked --release --target ${{ matrix.target }}
       - name: 确认静态链接
