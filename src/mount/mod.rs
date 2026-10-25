@@ -153,7 +153,6 @@ impl From<std::io::Error> for MountError {
 pub async fn run(cfg: MountConfig, shutdown: CancellationToken) -> Result<()> {
     let session = Session::new(&cfg.client);
     info!(
-        hub = %cfg.client.hub,
         target = %cfg.target,
         mountpoint = %cfg.mountpoint.display(),
         root = %cfg.remote_root,

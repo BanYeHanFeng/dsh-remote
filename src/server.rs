@@ -12,7 +12,7 @@ const CONNECTION_DRAIN: Duration = Duration::from_secs(3);
 
 pub async fn run(cfg: ClientConfig, shutdown: CancellationToken) -> Result<()> {
     let session = Session::new(&cfg);
-    info!(hub = %cfg.hub, name = %cfg.name, "启动 MCP 服务端（stdio）");
+    info!(name = %cfg.name, "启动 MCP 服务端（stdio）");
 
     let connection_shutdown = shutdown.child_token();
     let connection = tokio::spawn({
