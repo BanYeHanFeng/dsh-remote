@@ -92,7 +92,7 @@ jobs:
         run: |
           got=$(./target/${{ matrix.target }}/release/dsh-remote --version | awk '{print $2}')
           echo "二进制报告版本: $got"
-          if [ -n "$EXPECTED" ] && [ "$got" != "$EXPECTED" ]; then
+          if [ "$got" != "$EXPECTED" ]; then
             echo "版本号未注入: 期望 $EXPECTED，实际 $got" >&2
             exit 1
           fi
@@ -175,22 +175,24 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: 校验版本号
+      - name: 读取正式版版本号
+        id: version
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.build.outputs.version }}
         run: |
           case "$VERSION" in
             v*) ;;
             *)
-              echo "版本号需要以 v 开头，例如 v0.1.0" >&2
+              echo "正式版版本号缺失或格式不对: $VERSION" >&2
               exit 1
               ;;
           esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
       - name: 发布正式版
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ inputs.version }}
-          name: ${{ inputs.version }}
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
           prerelease: false
           make_latest: true
           files: dist/dsh-remote-linux-*
