@@ -66,7 +66,7 @@ pub fn list() -> Value {
         },
         {
             "name": "bash",
-            "description": "在 bash shell 中运行命令，状态在多次命令调用以及与用户的对话之间持续保留",
+            "description": "在目标上用 bash 执行一条命令，每次调用都是独立进程，命令超时时间由目标配置决定（默认 300 秒）",
             "inputSchema": {
                 "type": "object",
                 "properties": {

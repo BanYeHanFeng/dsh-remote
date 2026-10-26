@@ -44,7 +44,7 @@ async fn bash_on_hub() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shell_keeps_state_between_calls() {
+async fn each_call_starts_a_fresh_shell() {
     let harness = Harness::start("bash", true, true, Some(vec!["/tmp".to_string()])).await;
     let dir = std::env::temp_dir().join(format!(
         "dsh-remote-state-{}-{}",
@@ -70,18 +70,20 @@ async fn shell_keeps_state_between_calls() {
         &harness,
         "nas",
         "bash",
-        bash_params("pwd; echo $DSH_REMOTE_STATE"),
+        bash_params("pwd; echo \"state=$DSH_REMOTE_STATE\""),
         Duration::from_secs(10),
     )
     .await
     .unwrap();
     let report = bash_report(&second);
     assert!(
-        report.output.contains(&dir.display().to_string()),
+        !report.output.contains(&dir.display().to_string()),
         "{}",
         report.output
     );
-    assert!(report.output.contains("42"), "{}", report.output);
+    assert!(report.output.contains("/tmp"), "{}", report.output);
+    assert!(report.output.contains("state="), "{}", report.output);
+    assert!(!report.output.contains("state=42"), "{}", report.output);
     std::fs::remove_dir_all(dir).ok();
     harness.stop().await;
 }
@@ -96,7 +98,7 @@ async fn targets_lists_hub_and_agent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn timeout_kills_the_shell_and_returns_partial_output() {
+async fn timeout_kills_the_process_group_and_returns_partial_output() {
     let harness = Harness::start_tuned(
         "bash",
         true,
@@ -119,9 +121,8 @@ async fn timeout_kills_the_shell_and_returns_partial_output() {
     let report = bash_report(&result);
     assert!(report.timed_out, "{}", report.output);
     assert!(report.output.contains("before"), "{}", report.output);
-    assert!(report.output.contains("[命令超时]"), "{}", report.output);
     assert!(
-        report.output.contains("持久 Shell 已重置"),
+        report.output.contains("[命令超过 1 秒仍未结束，已被终止]"),
         "{}",
         report.output
     );
@@ -169,7 +170,7 @@ async fn output_is_truncated_to_the_configured_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shell_exit_is_reported_and_reset() {
+async fn exit_code_is_reported_and_the_next_call_still_works() {
     let harness = Harness::start("bash", true, true, Some(vec!["/tmp".to_string()])).await;
     let result = remote_call(
         &harness,
@@ -182,10 +183,13 @@ async fn shell_exit_is_reported_and_reset() {
     .unwrap();
     let report = bash_report(&result);
     assert!(report.output.contains("bye"), "{}", report.output);
-    assert!(report.output.contains("Shell 已退出"), "{}", report.output);
-
+    assert!(
+        report.output.contains("[命令结束，退出码 4]"),
+        "{}",
+        report.output
+    );
     assert_eq!(report.exit_code, Some(4));
-    assert!(!report.output.contains("命令结束"), "{}", report.output);
+    assert!(report.failed());
 
     let again = remote_call(
         &harness,
@@ -258,7 +262,7 @@ async fn stderr_is_merged_into_the_output() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_calls_are_serialized_on_the_same_shell() {
+async fn concurrent_calls_do_not_share_state() {
     let harness = Harness::start("bash", true, true, Some(vec!["/tmp".to_string()])).await;
     let session = harness.session().await;
     let cancel = no_cancel();
@@ -283,6 +287,7 @@ async fn concurrent_calls_are_serialized_on_the_same_shell() {
     let second = bash_report(&second.unwrap());
     assert!(first.output.contains("first"), "{}", first.output);
     assert!(second.output.contains("second"), "{}", second.output);
+    assert_eq!(first.exit_code, Some(0));
     assert_eq!(second.exit_code, Some(0));
     harness.stop().await;
 }

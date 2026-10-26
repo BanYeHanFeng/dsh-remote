@@ -47,7 +47,6 @@ pub struct Executor {
     settings: Settings,
     running: Arc<Mutex<HashMap<u64, Running>>>,
     slots: Arc<Semaphore>,
-    shells: Arc<shell::Shells>,
     shutdown: Option<CancellationToken>,
 }
 
@@ -61,7 +60,6 @@ impl Executor {
             settings,
             running: Arc::new(Mutex::new(HashMap::new())),
             slots: Arc::new(Semaphore::new(slots)),
-            shells: Arc::new(shell::Shells::default()),
             shutdown: None,
         }
     }
@@ -156,10 +154,9 @@ impl Executor {
         let token = CancellationToken::new();
         self.track(call_id, token.clone(), None);
         let running = self.running.clone();
-        let shells = self.shells.clone();
 
         tokio::spawn(async move {
-            match shells.run(request, &token).await {
+            match shell::run(request, &token).await {
                 Ok(report) => match value::serialize(&report) {
                     Ok(value) => reply_value(&sink, call_id, value).await,
                     Err(err) => {
@@ -339,11 +336,6 @@ impl Executor {
         let running = self.lock_running();
         for entry in running.values() {
             entry.token.cancel();
-        }
-        drop(running);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let shells = self.shells.clone();
-            handle.spawn(async move { shells.shutdown().await });
         }
     }
 

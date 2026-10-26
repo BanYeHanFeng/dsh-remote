@@ -92,9 +92,11 @@ initiator                          responder
 - 一条 `Call` 的任一阶段出错，都以 `Result{ok:false}` 或 `End{status:"error"}`
   收尾，保证请求不悬挂。
 
-`bash` 在目标上跑在**同一个常驻 Shell** 里：`command` 由一段带随机标记的包装行写入
-标准输入，输出（stdout 与 stderr 合并）按结束标记切出来，因此当前目录、导出的环境
-变量等状态跨调用保留。参数只有 `command` 与内部使用的 `timeout_ms`。
+`bash` 每条命令都在目标上起一个**新进程**（`bash -c`，没有 bash 时退到 `sh -c`），
+工作目录固定为该目标 `ROOTS` 的第一个目录，输出（stdout 与 stderr 合并）边跑边收，
+超过 `timeout_ms` 或调用被取消就杀掉整个进程组。因此 `cd`、`export`、后台任务都不会
+跨调用保留，多步操作要在同一条 `command` 里用 `&&` 串起来。参数只有 `command` 与内部
+使用的 `timeout_ms`。
 
 ```json
 {"id":17,"target":"nas","method":"bash",
@@ -108,8 +110,8 @@ initiator                          responder
 ```
 
 - `output` 已经按目标的 `MAX_OUTPUT_CHARS`（默认 16000 字符）截断，并附上
-  `[命令结束，退出码 N]`；超时附 `[命令超时]`、Shell 退出附 `[Shell 已退出，退出码 N]`，
-  两种情况都会重置 Shell。
+  `[命令结束，退出码 N]`；超时附 `[命令超过 N 秒仍未结束，已被终止]` 与已产生的部分
+  输出，被信号打死附 `[Shell 被信号终止：N]`。
 - `timed_out` 与 `exit_code` 供调用方决定是否把这次工具调用标成失败。
 - 单条 `Result` 编码后不超过 60 KiB，`output` 另按 48 KiB 兜底截断。
 
