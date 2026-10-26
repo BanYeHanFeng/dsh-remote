@@ -124,7 +124,7 @@ server ── Call{id, target, method:"upload",
              params:{remote_path,size,overwrite,create_parents?}} ──▶
 server ── Chunk{id, seq, stream:1} ... ──▶
 server ── End{id, status:"ok", size, sha256} ──▶
-agent  ── Result{ok:true, value:{path,size,sha256,entry?}} ──▶
+agent  ── Result{ok:true, value:{path,size,sha256}} ──▶
 ```
 
 - hub 为 server 发来的 `Chunk`/`End` 按 `(server_id, id)` 找到 `call_id` 后转发；
@@ -135,8 +135,7 @@ agent  ── Result{ok:true, value:{path,size,sha256,entry?}} ──▶
 - `Call.params.size` 用于提前拒绝超过 `MAX_FILE` 的请求；`End.size` 与
   `End.sha256` 是最终校验依据。校验失败或取消时删除临时文件。
 - 校验通过后 `rename` 到目标路径；`overwrite=false` 时目标已存在直接回
-  `conflict`。回包里的 `entry` 是改名后 `symlink_metadata` 的属性，挂载回传时
-  直接拿它更新本地缓存，省掉一次 `fs stat` 往返。
+  `conflict`。
 
 下载（agent → hub → server）：
 
@@ -162,7 +161,7 @@ hub    ── Call{src_call, target:source, method:"download",
              params:{remote_path:source_path,max_size}} ──▶
 source ── Chunk{src_call, seq, stream:1} ──▶ hub ── Chunk{dest_call, seq} ──▶ dest
 source ── End{src_call, status:"ok", size, sha256} ──▶ hub ── End{dest_call, …} ──▶ dest
-dest   ── Result{ok:true, value:{path,size,sha256,entry?}} ──▶ hub ── Result ──▶ server
+dest   ── Result{ok:true, value:{path,size,sha256}} ──▶ hub ── Result ──▶ server
 ```
 
 - `transfer` 只有 hub 处理，agent 收到回 `unsupported`。hub 把它拼成两条普通调用，
@@ -184,9 +183,8 @@ dest   ── Result{ok:true, value:{path,size,sha256,entry?}} ──▶ hub ─
 
 ### 3.4 目录与属性
 
-挂载（`dsh-remote mount` 或 MCP 的 `mount` 工具）需要的元数据都走同一个方法 `fs`，
-一次一个操作，`Result` 一次返回；内容不在这里传，仍然走 `upload` / `download`，
-所以这一族只有属性。
+`fs` 方法一次一个操作，`Result` 一次返回；内容不在这里传，仍然走
+`upload` / `download`，所以这一族只有属性。
 
 | op | 参数 | 结果 | 说明 |
 | --- | --- | --- | --- |
@@ -216,15 +214,10 @@ ctime_ms, perm, uid, gid, nlink`。
 
 - 白名单与 `upload` / `download` 相同，但 `stat`、`readlink`、`remove`、`rename`
   只解析到父目录、末段不跟随符号链接：指着白名单外的符号链接本身仍然可读可删，
-  要不要跟随由调用方（本机内核）决定，所以挂载点上的符号链接语义和本机一致。
+  要不要跟随由调用方决定。
 - `list` 受单条 `Result` 60 KiB 限制：从 `offset` 起按名字顺序连续取，累计条目
   预算用满就截断，剩下的用 `next` 续取，大目录不会撞上限。
 - 一条 `fs` 调用超时 30 秒（`exec::limits` 一处定义），与 `bash`/传输的超时互不影响。
-- 挂载点是写回语义：`close` 立即返回，`upload` 在后台按批（20ms / 32 个窗口）
-  最多 4 路并发发出。`list`、`mkdir`、`remove`、`rename`、`setattr`、`symlink`、
-  `readlink` 以及打开文件前都会先等已排队的回传落地；失败的 `upload` 不落盘，
-  下一次远端操作时以 `stale` / `io` 上报，影子文件保持脏标记等重试。
-  回传带上打开时记下的 `mtime_ms` 与 `size`，远端在这期间被改过就报 `stale`。
 
 ## 4. 路由
 
@@ -295,7 +288,6 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 | `not_found` | 路径不存在 |
 | `conflict` | 目标已存在且未允许覆盖 |
 | `not_empty` | 目录非空，不能按空目录删除 |
-| `stale` | 带基线回传时远端文件已被改动或删除，拒绝覆盖 |
 | `too_large` | 输出或文件超上限 |
 | `busy` | 并发执行数达到上限 |
 | `io` | 本地文件/进程 IO 错误 |
@@ -316,21 +308,12 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 | `bash` | `bash` | `Result` | `300s + 30s`（目标可用 `SHELL_TIMEOUT_MS` 调小） |
 | `upload` | `upload`（本机→节点）或 `transfer`（`from` 节点互传） | 上行 `Chunk`+`End`，回程 `Result` | `300s + 大小/256KiB` |
 | `download` | `download`（节点→本机）或 `transfer`（`to` 节点互传） | 下行 `Chunk`+`End`，或互传的 `Result` | `300s + 大小/256KiB` |
-| `mount`（本机 FUSE） | `fs` 一族，内容用 `upload` / `download` | `Result` | 单次 `fs` 30s，传输按大小 |
 | `actions stop`（内部） | `shutdown`（发给目标节点） | `Result` | 10s |
 
 - `bash` 只有 `target` 与 `command` 两个参数：超时来自目标配置（`SHELL_TIMEOUT_MS`，
   默认 300 秒），单次返回的字符上限也来自目标配置（`MAX_OUTPUT_CHARS`，默认 16000）。
 - `upload` / `download` 各有两种用法：给 `local_path` 时走 DSH 本机磁盘，
   给 `from` / `to` 时改发 `transfer`，由中继在两个节点之间直接搬。
-- `mount` 有两个入口：CLI 的 `dsh-remote mount` 与 MCP 的 `mount` 工具
-  （`action` 取 `mount` / `unmount` / `list`）。两者都把目标上的一个目录挂成本机
-  路径，于是本机的编辑器、`git`、AI 的文件工具都能直接读写远端文件。MCP 入口把
-  挂载登记在 server 进程里、和 session 共用一条连接：`unmount` 按挂载点卸载
-  （省略 mountpoint 就全部卸载），server 退出时全部自动卸载；`list` 只看得到本进程
-  挂的目录，CLI 那端挂在别的进程里。挂载点必须已存在，重复挂同一个点会直接报错。
-  MCP 的其他工具（`bash`/`upload`/`download`/`actions`）在动手前先冲刷挂载点里
-  待回传的数据，所以「写完立刻用 bash 查远端」能看到刚写的内容。
 - `req_id` 由 server 侧的 `Session` 单调分配，一条连接内并发任意多路；
   收到 `End`/`Result` 即释放。
 - MCP 的 `notifications/cancelled` → 内部 `Cancel{id}`，hub 再转发给 agent：
@@ -343,8 +326,8 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 ## 8. 演进
 
 - 新增消息类型不改变已有语义；未知 type 记录日志后忽略，连接不断开。
-- 新增 `Call.method` 同理：旧被控端对 `fs` 回 `unsupported`，`proto` 不升版本，
-  所以 `mount` 可以只升级本机一端。
+- 新增 `Call.method` 同理：旧被控端对未知方法回 `unsupported`，`proto` 不升版本，
+  所以一次只升级一端也能通信，只是新方法不可用。
 - `Hello.proto` 只做“同主版本可通信”的粗校验；只增不删的字段用 CBOR 可选字段追加，
   一旦新字段改变已有字段的解释方式（例如 `Chunk.packed` 改变 `Chunk.data` 的含义），
   就必须升 `proto`。

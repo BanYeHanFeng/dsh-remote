@@ -10,8 +10,6 @@ use crate::actions::{
     GhClient, StartRequest, DEFAULT_ARCH, DEFAULT_DURATION_MINUTES, MAX_DURATION_MINUTES,
 };
 use crate::call;
-use crate::mount::registry::Mounts;
-use crate::mount::{root_allowed, MountSpec, UnmountOutcome, DEFAULT_ATTR_TTL_MS};
 use crate::proto::now_ms;
 use crate::proto::params::TransferParams;
 use crate::session::{RemoteError, Session};
@@ -110,22 +108,6 @@ pub fn list() -> Value {
             }
         },
         {
-            "name": "mount",
-            "description": "将 target 远程节点指定目录挂载到本机指定目录下",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["mount", "unmount", "list"], "description": "mount 开始挂载、unmount 卸载、list 列出" },
-                    "target": { "type": "string", "description": "要挂载的目标名，取自 targets，action=mount 时需要" },
-                    "mountpoint": { "type": "string", "description": "本机挂载点，必须是已存在的目录；action=unmount 时省略表示全部卸载" },
-                    "remote_root": { "type": "string", "description": "目标上要挂载的根目录，默认 /" },
-                    "read_only": { "type": "boolean", "description": "只读挂载，默认 false" },
-                    "attr_ttl_ms": { "type": "integer", "description": format!("属性与目录缓存毫秒，默认 {DEFAULT_ATTR_TTL_MS}") }
-                },
-                "required": ["action"]
-            }
-        },
-        {
             "name": "actions",
             "description": "把 GitHub Actions 的临时 runner 变成被控端",
             "inputSchema": {
@@ -150,12 +132,7 @@ pub fn list() -> Value {
     ])
 }
 
-pub async fn call(
-    session: &Session,
-    mounts: &Mounts,
-    params: &Value,
-    cancel: &CancellationToken,
-) -> ToolOutput {
+pub async fn call(session: &Session, params: &Value, cancel: &CancellationToken) -> ToolOutput {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return ToolOutput::error("缺少工具名 name");
     };
@@ -164,15 +141,11 @@ pub async fn call(
         Some(Value::Null) | None => json!({}),
         Some(_) => return ToolOutput::error("arguments 必须是对象"),
     };
-    if name != "mount" && name != "targets" {
-        mounts.settle().await;
-    }
     let result = match name {
         "targets" => Ok(targets(session).await),
         "bash" => bash(session, &args, cancel).await,
         "upload" => upload(session, &args, cancel).await,
         "download" => download(session, &args, cancel).await,
-        "mount" => mount(session, mounts, &args).await,
         "actions" => actions(session, &args, cancel).await,
         other => Err(format!("未知工具: {other}")),
     };
@@ -330,121 +303,6 @@ async fn download(session: &Session, args: &Value, cancel: &CancellationToken) -
         human_size(report.size),
         short_hash(&report.sha256)
     )))
-}
-
-async fn mount(session: &Session, mounts: &Mounts, args: &Value) -> ToolResult {
-    let action = require_str(args, "action")?;
-    match action.as_str() {
-        "mount" => {
-            let target = require_str(args, "target")?;
-            let mountpoint = require_str(args, "mountpoint")?;
-            let Some(online) = session
-                .targets_snapshot()
-                .into_iter()
-                .find(|info| info.name == target)
-            else {
-                return Err(format!("目标 {target} 不在线，先用 targets 看看"));
-            };
-            let mut spec = MountSpec::new(&target, &mountpoint);
-            if let Some(root) = optional_str(args, "remote_root") {
-                spec.remote_root = root;
-            }
-            spec.read_only = optional_bool(args, "read_only").unwrap_or(false);
-            if let Some(ttl) = optional_u64(args, "attr_ttl_ms") {
-                if ttl == 0 {
-                    return Err("attr_ttl_ms 必须是正整数".to_string());
-                }
-                spec.attr_ttl = Duration::from_millis(ttl);
-            }
-            let info = mounts.add(session, spec).await?;
-            let mut text = format!(
-                "已挂载 {}:{} → {}（{}），本机路径可以直接用文件工具读写。",
-                info.target,
-                info.remote_root,
-                info.mountpoint.display(),
-                if info.read_only { "只读" } else { "读写" }
-            );
-            if !root_allowed(&online.roots, &info.remote_root) {
-                let _ = write!(
-                    text,
-                    "\n注意：{} 不在目标允许的目录里（{}），读写会被告知越界。",
-                    info.remote_root,
-                    online.roots.join(":")
-                );
-            }
-            let _ = write!(text, "\n用完 action=unmount 加 mountpoint 卸载。");
-            Ok(ToolOutput::ok(text))
-        }
-        "unmount" => {
-            let mountpoint = optional_str(args, "mountpoint");
-            let removed = mounts.remove(mountpoint.as_deref().map(Path::new)).await;
-            if removed.is_empty() {
-                return match mountpoint {
-                    Some(path) => Err(format!("没有挂着 {path} 的挂载点，用 action=list 看看")),
-                    None => Ok(ToolOutput::ok("当前没有挂载。")),
-                };
-            }
-            let mut text = String::new();
-            let mut stuck = Vec::new();
-            for report in &removed {
-                let info = &report.info;
-                match &report.outcome {
-                    UnmountOutcome::Clean => {
-                        let _ = writeln!(
-                            text,
-                            "已卸载 {}（{}:{}）",
-                            info.mountpoint.display(),
-                            info.target,
-                            info.remote_root
-                        );
-                    }
-                    UnmountOutcome::Detached { reason } => {
-                        let _ = writeln!(
-                            text,
-                            "已卸载 {}（{}:{}），{reason}；正在用这个路径的进程会立刻看不到它，挂载点现在可以删了",
-                            info.mountpoint.display(),
-                            info.target,
-                            info.remote_root
-                        );
-                    }
-                    UnmountOutcome::Stuck { reason } => {
-                        let _ = writeln!(
-                            text,
-                            "卸载 {}（{}:{}）没成功：{reason}，挂载点还留着，先让占用的进程退出去再卸一次",
-                            info.mountpoint.display(),
-                            info.target,
-                            info.remote_root
-                        );
-                        stuck.push(());
-                    }
-                }
-            }
-            if !stuck.is_empty() {
-                return Err(text.trim_end().to_string());
-            }
-            Ok(ToolOutput::ok(text))
-        }
-        "list" => {
-            let mounted = mounts.list().await;
-            if mounted.is_empty() {
-                return Ok(ToolOutput::ok("当前没有挂载。"));
-            }
-            let mut text = format!("本进程挂着 {} 个目录：", mounted.len());
-            for info in &mounted {
-                let _ = write!(
-                    text,
-                    "\n{}  ←  {}:{}  {}  已挂 {}",
-                    info.mountpoint.display(),
-                    info.target,
-                    info.remote_root,
-                    if info.read_only { "只读" } else { "读写" },
-                    human_duration(info.elapsed.as_millis() as u64)
-                );
-            }
-            Ok(ToolOutput::ok(text))
-        }
-        other => Err(format!("未知 action: {other}，可用 mount、unmount、list")),
-    }
 }
 
 async fn actions(session: &Session, args: &Value, cancel: &CancellationToken) -> ToolResult {
@@ -740,7 +598,7 @@ mod tests {
     fn tools_list_covers_every_tool() {
         let tools = list();
         let entries = tools.as_array().unwrap();
-        assert_eq!(entries.len(), 6);
+        assert_eq!(entries.len(), 5);
         for entry in entries {
             assert!(entry.get("name").is_some());
             assert!(entry.get("description").is_some());

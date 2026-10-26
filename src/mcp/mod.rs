@@ -13,7 +13,6 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::mount::registry::Mounts;
 use crate::session::Session;
 
 const SUPPORTED_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -23,21 +22,17 @@ const EOF_DRAIN: Duration = Duration::from_secs(5);
 const INSTRUCTIONS: &str = "\
 这些工具作用于远端主机：先用 targets 查看在线目标（中继自身与各被控端），把返回的\
 名字作为后续工具的 target 参数。bash 每条命令都在目标上起一个新进程，当前目录是\
-目标允许访问的第一个目录，上一次调用的 cd、环境变量与后台任务都不会保留，多步操作\
-要在同一条命令里用 && 串起来；命令超过超时会杀掉整个进程组。\
-文件只能在该目标上的 ROOTS 白名单目录里读写，越界与符号链接逃逸都会被拒绝；\
-搬文件用 upload/download：给 local_path 时走本机，给 from/to 时让中继在两个节点之间\
-直接搬（不经过本机磁盘）。需要把远端目录当本地路径用时，用 mount 工具挂到本机：\
-action=mount 给 target 与 mountpoint，action=list 看本进程挂了哪些，action=unmount 卸掉\
-（server 退出时全部自动卸载）；挂上以后读改文件直接用本地文件工具，搜索与构建仍然用\
-bash 更划算。工具失败时 isError 为真，\
+目标允许访问的第一个目录，上一次调用的 cd、环境变量与后台任务都不会保留；同一次\
+命令里的多步操作请用 && 或分号串起来。命令超过超时会杀掉整个进程组；文件只能在该\
+目标上的 ROOTS 白名单目录里读写，越界与符号链接逃逸都会被拒绝；搬文件用\
+upload/download：给 local_path 时走本机，给 from/to 时让中继在两个节点之间直接搬\
+（不经过本机磁盘）。工具失败时 isError 为真，\
 错误码说明原因（unknown_target、offline、timeout、denied、too_large、busy、io、\
 protocol）。需要临时算力时用 actions 在 GitHub Actions 上开一个一次性被控端\
 （目标名 Actions，注册进房间后即可当普通 target 用），用完 actions stop 关掉\
 （直接向节点发 shutdown，节点自行退出，运行保持成功），别让它白烧额度。";
 
 pub async fn serve(session: &Session, shutdown: CancellationToken) -> Result<()> {
-    let mounts = Mounts::new();
     let (tx, mut rx) = mpsc::channel::<Value>(64);
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
@@ -93,7 +88,7 @@ pub async fn serve(session: &Session, shutdown: CancellationToken) -> Result<()>
                 continue;
             }
         };
-        dispatch(session, &mounts, &tx, &pending, &mut calls, message).await;
+        dispatch(session, &tx, &pending, &mut calls, message).await;
     }
 
     let drain = async { while calls.join_next().await.is_some() {} };
@@ -104,7 +99,6 @@ pub async fn serve(session: &Session, shutdown: CancellationToken) -> Result<()>
             token.cancel();
         }
     }
-    mounts.stop_all().await;
     drop(tx);
     let _ = timeout(WRITER_DRAIN, writer).await;
     Ok(())
@@ -112,7 +106,6 @@ pub async fn serve(session: &Session, shutdown: CancellationToken) -> Result<()>
 
 async fn dispatch(
     session: &Session,
-    mounts: &Mounts,
     tx: &mpsc::Sender<Value>,
     pending: &Arc<Mutex<HashMap<String, CancellationToken>>>,
     calls: &mut JoinSet<()>,
@@ -168,11 +161,10 @@ async fn dispatch(
                 map.insert(key.clone(), token.clone());
             }
             let session = session.clone();
-            let mounts = mounts.clone();
             let tx = tx.clone();
             let pending = pending.clone();
             calls.spawn(async move {
-                let outcome = tools::call(&session, &mounts, &params, &token).await;
+                let outcome = tools::call(&session, &params, &token).await;
                 if let Ok(mut map) = pending.lock() {
                     map.remove(&key);
                 }
