@@ -47,11 +47,6 @@ pub fn resolve_for_write(
     Ok(candidate)
 }
 
-pub fn resolve_entry(raw: &str, raw_roots: &[String]) -> ToolResult<PathBuf> {
-    let roots = canonical_roots(raw_roots);
-    resolve_entry_for_write(raw, &roots, false)
-}
-
 pub fn resolve_entry_for_write(
     raw: &str,
     roots: &[PathBuf],
@@ -233,46 +228,6 @@ mod tests {
         let roots = vec![root.to_string_lossy().to_string()];
         assert!(resolve_existing(link.to_str().unwrap(), &roots).is_err());
         assert!(resolve_for_write(link.join("passwd").to_str().unwrap(), &roots, false).is_err());
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn entry_resolution_keeps_final_symlink() {
-        let root = temp_root("entry");
-        let link = root.join("link");
-        std::os::unix::fs::symlink("/etc", &link).unwrap();
-        let roots = vec![root.to_string_lossy().to_string()];
-        let resolved = resolve_entry(link.to_str().unwrap(), &roots).unwrap();
-        assert_eq!(resolved, root.canonicalize().unwrap().join("link"));
-        assert!(fs::symlink_metadata(&resolved)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert!(resolve_entry(link.join("passwd").to_str().unwrap(), &roots).is_err());
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn entry_resolution_accepts_the_root_itself() {
-        let root = temp_root("entry-root");
-        let roots = vec![root.to_string_lossy().to_string()];
-        assert_eq!(
-            resolve_entry(root.to_str().unwrap(), &roots).unwrap(),
-            root.canonicalize().unwrap()
-        );
-        assert_eq!(
-            resolve_entry("/", &["/".to_string()]).unwrap(),
-            Path::new("/")
-        );
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn entry_resolution_requires_existing_parent() {
-        let root = temp_root("entry-missing");
-        let roots = vec![root.to_string_lossy().to_string()];
-        assert!(resolve_entry(root.join("nope/a").to_str().unwrap(), &roots).is_err());
         fs::remove_dir_all(root).ok();
     }
 }

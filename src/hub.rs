@@ -412,8 +412,6 @@ impl HubState {
             size: parsed.max_size,
             overwrite: parsed.overwrite,
             create_parents: parsed.create_parents,
-            expect_mtime_ms: None,
-            expect_size: None,
         }) {
             Ok(value) => value,
             Err(err) => {

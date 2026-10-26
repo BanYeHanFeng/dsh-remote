@@ -1,6 +1,5 @@
 pub mod download;
 pub mod error;
-pub mod fs;
 pub mod limits;
 pub mod paths;
 pub mod shell;
@@ -18,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::net::Sink;
-use crate::proto::params::{BashParams, DownloadParams, FsParams, UploadParams};
+use crate::proto::params::{BashParams, DownloadParams, UploadParams};
 use crate::proto::value;
 use crate::proto::{Msg, ProtoError};
 use error::{ToolError, ToolResult};
@@ -75,7 +74,6 @@ impl Executor {
         debug!(call_id, method, "执行工具");
         match method {
             "bash" => self.dispatch_bash(call_id, params, sink).await,
-            "fs" => self.dispatch_fs(call_id, params, sink).await,
             "upload" => self.dispatch_upload(call_id, params, sink).await,
             "download" => self.dispatch_download(call_id, params, sink).await,
             "shutdown" => self.dispatch_shutdown(call_id, sink).await,
@@ -176,33 +174,6 @@ impl Executor {
         });
     }
 
-    async fn dispatch_fs(&self, call_id: u64, params: Value, sink: Sink) {
-        let params: FsParams = match parse(&params) {
-            Ok(params) => params,
-            Err(err) => {
-                reply_error(&sink, call_id, err.code, err.message).await;
-                return;
-            }
-        };
-        let permit = match self.slots.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                reply_error(&sink, call_id, "busy", "并发执行数已达上限").await;
-                return;
-            }
-        };
-        let roots = self.settings.roots.clone();
-        let outcome = tokio::task::spawn_blocking(move || fs::run(&roots, params)).await;
-        match outcome {
-            Ok(Ok(value)) => reply_value(&sink, call_id, value).await,
-            Ok(Err(err)) => reply_error(&sink, call_id, err.code, err.message).await,
-            Err(err) => {
-                reply_error(&sink, call_id, "internal", format!("fs 操作失败: {err}")).await
-            }
-        }
-        drop(permit);
-    }
-
     async fn dispatch_upload(&self, call_id: u64, params: Value, sink: Sink) {
         let params: UploadParams = match parse(&params) {
             Ok(params) => params,
@@ -239,10 +210,6 @@ impl Executor {
             upload::run(upload::Request {
                 path,
                 overwrite: params.overwrite,
-                expect: match (params.expect_mtime_ms, params.expect_size) {
-                    (Some(mtime), Some(size)) => Some((mtime, size)),
-                    _ => None,
-                },
                 expected_size: params.size,
                 max_file,
                 reply_id: call_id,

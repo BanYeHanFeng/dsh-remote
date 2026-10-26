@@ -36,10 +36,6 @@ impl ToolError {
         Self::new("conflict", message)
     }
 
-    pub fn not_empty(message: impl Into<String>) -> Self {
-        Self::new("not_empty", message)
-    }
-
     pub fn protocol(message: impl Into<String>) -> Self {
         Self::new("protocol", message)
     }

@@ -2,7 +2,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -15,9 +14,7 @@ use crate::exec::shell;
 use crate::exec::transfer::{
     pack as transfer_pack, unpack as transfer_unpack, TransferReport, CHUNK_SIZE,
 };
-use crate::proto::params::{
-    BashParams, DownloadParams, FsEntry, FsLink, FsList, FsParams, TransferParams, UploadParams,
-};
+use crate::proto::params::{BashParams, DownloadParams, TransferParams, UploadParams};
 use crate::proto::value;
 use crate::proto::{EndStatus, Msg, TargetInfo, STREAM_STDOUT};
 use crate::session::{CallHandle, Session};
@@ -56,71 +53,6 @@ pub async fn call(
         .await
 }
 
-pub async fn fs_call(
-    session: &Session,
-    target: &str,
-    params: FsParams,
-    cancel: &CancellationToken,
-) -> RemoteResult<CallResult> {
-    let encoded = value::serialize(&params)
-        .map_err(|err| RemoteError::new("internal", format!("序列化 fs 参数失败: {err:#}")))?;
-    let deadline = limits::deadline("fs", &encoded);
-    session
-        .call_cancel(target, "fs", encoded, deadline, cancel)
-        .await
-}
-
-fn fs_decode<T: DeserializeOwned>(result: CallResult) -> RemoteResult<T> {
-    let value = result.into_value()?;
-    value::deserialize(&value)
-        .map_err(|err| RemoteError::new("protocol", format!("响应格式不符: {err:#}")))
-}
-
-pub async fn fs_stat(
-    session: &Session,
-    target: &str,
-    path: &str,
-    cancel: &CancellationToken,
-) -> RemoteResult<FsEntry> {
-    let params = FsParams {
-        op: "stat".to_string(),
-        path: path.to_string(),
-        ..FsParams::default()
-    };
-    fs_decode(fs_call(session, target, params, cancel).await?)
-}
-
-pub async fn fs_list(
-    session: &Session,
-    target: &str,
-    path: &str,
-    offset: u64,
-    cancel: &CancellationToken,
-) -> RemoteResult<FsList> {
-    let params = FsParams {
-        op: "list".to_string(),
-        path: path.to_string(),
-        offset: Some(offset),
-        limit: Some(512),
-        ..FsParams::default()
-    };
-    fs_decode(fs_call(session, target, params, cancel).await?)
-}
-
-pub async fn fs_readlink(
-    session: &Session,
-    target: &str,
-    path: &str,
-    cancel: &CancellationToken,
-) -> RemoteResult<FsLink> {
-    let params = FsParams {
-        op: "readlink".to_string(),
-        path: path.to_string(),
-        ..FsParams::default()
-    };
-    fs_decode(fs_call(session, target, params, cancel).await?)
-}
-
 pub async fn bash(
     session: &Session,
     target: &str,
@@ -148,30 +80,6 @@ pub async fn upload(
     create_parents: bool,
     cancel: &CancellationToken,
 ) -> Result<TransferReport> {
-    upload_checked(
-        session,
-        target,
-        local,
-        remote,
-        overwrite,
-        create_parents,
-        None,
-        cancel,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn upload_checked(
-    session: &Session,
-    target: &str,
-    local: &Path,
-    remote: &str,
-    overwrite: bool,
-    create_parents: bool,
-    expect: Option<(u64, u64)>,
-    cancel: &CancellationToken,
-) -> Result<TransferReport> {
     let mut file = tokio::fs::File::open(local)
         .await
         .with_context(|| format!("打开本地文件失败: {}", local.display()))?;
@@ -192,8 +100,6 @@ pub async fn upload_checked(
         size: Some(meta.len()),
         overwrite,
         create_parents,
-        expect_mtime_ms: expect.map(|(mtime, _)| mtime),
-        expect_size: expect.map(|(_, size)| size),
     })?;
     let deadline = limits::deadline("upload", &params);
     let mut handle = session.begin(target, "upload", params).await?;
@@ -409,7 +315,6 @@ pub async fn download(
                         path: local.display().to_string(),
                         size: received,
                         sha256: digest,
-                        entry: None,
                     });
                 }
                 Msg::Result { ok, error, .. } => {

@@ -71,11 +71,11 @@ initiator                          responder
 | 0x13 | `End` | 双向 | `id, status, size?, sha256?` |
 | 0x14 | `Cancel` | server→hub→agent | `id, reason?` |
 
-- `method` 取工具名：`bash`、`fs`、`upload`、`download`、`transfer`、`targets`、`shutdown`。
+- `method` 取工具名：`bash`、`upload`、`download`、`transfer`、`targets`、`shutdown`。
   `params` 是方法参数的 CBOR map，原样透传。
 - `shutdown` 只有 agent 处理：先回 `Result{ok:true, value:{stopping:true}}`，
   然后断开中继、退出进程；hub 自身回 `unsupported`（中继不能被远程关掉）。
-- 短结果用 `Result` 一次返回（`targets`、`bash`、`fs`）。
+- 短结果用 `Result` 一次返回（`targets`、`bash`）。
 - 长结果用流：先若干 `Chunk`，最后 `End`；目前只有文件传输用流，且只用 `stream=1`。
 - `Chunk.packed`（默认 false）表示 `data` 是 zstd 帧：发送端按 `PACK` 开关尝试压，
   压缩后省不到 `PACK_GAIN`（默认 12%）就发原文；接收端先解压再按 `seq` 拼接，
@@ -135,7 +135,7 @@ agent  ── Result{ok:true, value:{path,size,sha256}} ──▶
 - `Call.params.size` 用于提前拒绝超过 `MAX_FILE` 的请求；`End.size` 与
   `End.sha256` 是最终校验依据。校验失败或取消时删除临时文件。
 - 校验通过后 `rename` 到目标路径；`overwrite=false` 时目标已存在直接回
-  `conflict`。
+  `conflict`。回包的 `value` 是 `{path, size, sha256}`。
 
 下载（agent → hub → server）：
 
@@ -180,44 +180,6 @@ dest   ── Result{ok:true, value:{path,size,sha256}} ──▶ hub ── Res
 - 接收端按 `seq` 重排：连号即落盘并累计 sha256，超前分片先缓存（最多 512 片），
   收尾时仍有空洞就判定失败并丢弃临时文件。
 - `Result` 编码后不超过 60 KiB；更大的数据用上传下载。
-
-### 3.4 目录与属性
-
-`fs` 方法一次一个操作，`Result` 一次返回；内容不在这里传，仍然走
-`upload` / `download`，所以这一族只有属性。
-
-| op | 参数 | 结果 | 说明 |
-| --- | --- | --- | --- |
-| `stat` | `path` | `FsEntry` | 末段不跟随符号链接 |
-| `list` | `path, offset?, limit?` | `{entries[], next?}` | 按名字排序，装不下时用 `next` 续 |
-| `readlink` | `path` | `{target}` | 目标原样返回，跟随与否由调用方决定 |
-| `symlink` | `path, target` | `FsEntry` | 建符号链接，已存在回 `conflict` |
-| `mkdir` | `path, mode?, create_parents?` | `FsEntry` | 已存在回 `conflict` |
-| `remove` | `path` | `FsEntry` | 文件删文件、空目录删目录，非空回 `not_empty` |
-| `rename` | `path, to_path, overwrite?, create_parents?` | `FsEntry` | 目标已存在且不覆盖回 `conflict` |
-| `setattr` | `path, mode?, mtime_ms?, atime_ms?` | `FsEntry` | 符号链接本身不改属性 |
-
-`FsEntry` 字段：`name, kind(file|dir|symlink|other), size, mtime_ms, atime_ms,
-ctime_ms, perm, uid, gid, nlink`。
-
-```json
-{"id":21,"target":"nas","method":"fs",
- "params":{"op":"list","path":"/data/projects","limit":256}}
-```
-
-```json
-{"id":21,"ok":true,"value":{
-  "entries":[{"name":"README.md","kind":"file","size":1843,"mtime_ms":1730000000000,
-              "perm":420,"uid":1000,"gid":1000,"nlink":1}],
-  "next":null}}
-```
-
-- 白名单与 `upload` / `download` 相同，但 `stat`、`readlink`、`remove`、`rename`
-  只解析到父目录、末段不跟随符号链接：指着白名单外的符号链接本身仍然可读可删，
-  要不要跟随由调用方决定。
-- `list` 受单条 `Result` 60 KiB 限制：从 `offset` 起按名字顺序连续取，累计条目
-  预算用满就截断，剩下的用 `next` 续取，大目录不会撞上限。
-- 一条 `fs` 调用超时 30 秒（`exec::limits` 一处定义），与 `bash`/传输的超时互不影响。
 
 ## 4. 路由
 
@@ -287,7 +249,6 @@ hub 不缓存 `Chunk` 内容，只做转发；它必须能读到 `method`、`tar
 | `denied` | 路径越界、bash 被禁用、权限不足 |
 | `not_found` | 路径不存在 |
 | `conflict` | 目标已存在且未允许覆盖 |
-| `not_empty` | 目录非空，不能按空目录删除 |
 | `too_large` | 输出或文件超上限 |
 | `busy` | 并发执行数达到上限 |
 | `io` | 本地文件/进程 IO 错误 |
