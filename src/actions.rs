@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::process::Stdio;
 use std::time::Duration;
@@ -336,6 +337,12 @@ impl GhClient {
                 }
             );
         }
+        for node in duplicate_node_names(&runs) {
+            let _ = writeln!(
+                out,
+                "注意：多个进行中的运行都叫 {node}，同名节点会互相顶替，线上只会剩一个；节点名需要带上运行号。"
+            );
+        }
         let active = runs.iter().filter(|run| run.active()).count();
         let _ = writeln!(
             out,
@@ -555,6 +562,18 @@ fn describe_status(run: &RunSummary) -> String {
     }
 }
 
+fn duplicate_node_names(runs: &[RunSummary]) -> Vec<String> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for run in runs.iter().filter(|run| run.active()) {
+        *counts.entry(run.node_name()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(name, _)| name)
+        .collect()
+}
+
 fn normalize_arch(text: &str) -> Option<&'static str> {
     match text.trim().to_ascii_lowercase().as_str() {
         "" | "amd64" | "x86" | "x86_64" | "x64" => Some(DEFAULT_ARCH),
@@ -620,16 +639,36 @@ mod tests {
     }
 
     #[test]
-    fn keeps_legacy_title_suffix() {
+    fn keeps_run_id_suffix() {
         let run = RunSummary {
             id: 9,
             status: "in_progress".into(),
             conclusion: String::new(),
-            title: "临时被控端 gh-9".into(),
+            title: "临时被控端 Actions-amd64-9".into(),
             created_at: String::new(),
             url: String::new(),
         };
-        assert_eq!(run.node_name(), "gh-9");
+        assert_eq!(run.node_name(), "Actions-amd64-9");
+    }
+
+    #[test]
+    fn finds_shared_node_names_among_active_runs() {
+        let run = |id: u64, title: &str, status: &str| RunSummary {
+            id,
+            status: status.into(),
+            conclusion: String::new(),
+            title: title.into(),
+            created_at: String::new(),
+            url: String::new(),
+        };
+        let runs = vec![
+            run(1, "临时被控端 Actions-amd64-1", "in_progress"),
+            run(2, "临时被控端 Actions-amd64-1", "queued"),
+            run(3, "临时被控端 Actions-amd64-3", "in_progress"),
+            run(4, "临时被控端 Actions-amd64-1", "completed"),
+        ];
+        assert_eq!(duplicate_node_names(&runs), ["Actions-amd64-1"]);
+        assert!(duplicate_node_names(&runs[2..]).is_empty());
     }
 
     #[test]

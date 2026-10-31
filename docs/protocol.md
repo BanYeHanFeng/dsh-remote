@@ -185,7 +185,9 @@ dest   ── Result{ok:true, value:{path,size,sha256}} ──▶ hub ── Res
 
 hub 内维护：
 
-- `agents: Map<name, Conn>`，注册时查重；断开即移除并广播 `TargetEvent{offline}`。
+- `agents: Map<name, Conn>`，注册时按名字查重：同名新连接顶替旧连接（旧连接收到
+  `Bye{code:"replaced"}` 后自行退出），所以不同机器上的被控端必须用不同名字；
+  断开即移除并广播 `TargetEvent{offline}`。
 - `servers: Set<Conn>`，允许多个并存（DSH 探测进程、多个 DSH 实例），事件广播给全部。
 - `routes: Map<call_id, Pending>` + `legs: Map<leg_call_id, 根 call_id>`：
   单路调用只有一条腿，互传有源和目的两条腿，回程先按腿找到根、再改回 `server_req_id`。

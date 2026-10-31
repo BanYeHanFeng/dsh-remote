@@ -40,7 +40,7 @@ on:
         default: latest
         type: string
 
-run-name: 临时被控端 Actions-${{ inputs.arch || 'amd64' }}
+run-name: 临时被控端 Actions-${{ inputs.arch || 'amd64' }}-${{ github.run_id }}
 
 permissions:
   contents: read
@@ -52,7 +52,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   HUB: ${{ secrets.DSH_REMOTE_HUB || vars.DSH_REMOTE_HUB || inputs.hub }}
-  NODE_NAME: Actions-${{ inputs.arch || 'amd64' }}
+  NODE_NAME: Actions-${{ inputs.arch || 'amd64' }}-${{ github.run_id }}
   DURATION: ${{ inputs.duration || '60' }}
   ROOTS: ${{ inputs.roots || '/' }}
   ALLOW_BASH: ${{ inputs.allow_bash || '1' }}

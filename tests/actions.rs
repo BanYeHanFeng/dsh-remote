@@ -25,9 +25,9 @@ case "$1 $2" in
     ;;
   "run list")
     if [ -f "$state.dispatched" ]; then
-      printf '%s\n' '[{"databaseId":2222,"status":"queued","conclusion":"","displayTitle":"临时被控端","createdAt":"2026-01-02T03:04:05Z","url":"https://example.com/run/2222"}]'
+      printf '%s\n' '[{"databaseId":2222,"status":"queued","conclusion":"","displayTitle":"临时被控端 Actions-amd64-2222","createdAt":"2026-01-02T03:04:05Z","url":"https://example.com/run/2222"}]'
     else
-      printf '%s\n' '[{"databaseId":1111,"status":"completed","conclusion":"success","displayTitle":"临时被控端","createdAt":"2026-01-01T00:00:00Z","url":"https://example.com/run/1111"}]'
+      printf '%s\n' '[{"databaseId":1111,"status":"completed","conclusion":"success","displayTitle":"临时被控端 Actions-amd64-1111","createdAt":"2026-01-01T00:00:00Z","url":"https://example.com/run/1111"}]'
     fi
     exit 0
     ;;
@@ -39,7 +39,7 @@ case "$1 $2" in
       status=in_progress
       conclusion=
     fi
-    printf '{"databaseId":%s,"status":"%s","conclusion":"%s","displayTitle":"临时被控端","createdAt":"2026-01-02T03:04:05Z","url":"https://example.com/run/%s"}\n' "$3" "$status" "$conclusion" "$3"
+    printf '{"databaseId":%s,"status":"%s","conclusion":"%s","displayTitle":"临时被控端 Actions-amd64-%s","createdAt":"2026-01-02T03:04:05Z","url":"https://example.com/run/%s"}\n' "$3" "$status" "$conclusion" "$3" "$3"
     exit 0
     ;;
   "run cancel")
@@ -103,7 +103,7 @@ async fn dispatches_syncs_and_stops_gracefully() {
         .await
         .unwrap();
     assert_eq!(started.run_id, 2222);
-    assert_eq!(started.node, "Actions");
+    assert_eq!(started.node, "Actions-amd64-2222");
     let out = &started.text;
     assert!(out.contains("#2222"), "{out}");
     assert!(out.contains("15 分钟后自动下线"), "{out}");
@@ -125,7 +125,7 @@ async fn dispatches_syncs_and_stops_gracefully() {
     assert!(calls.contains("inputs[version]=latest"));
     assert!(calls.contains("inputs[arch]=amd64"));
 
-    let online = vec!["Actions".to_string()];
+    let online = vec!["Actions-amd64-2222".to_string()];
     let status = client.status(10, &online, &cancel).await.unwrap();
     assert!(status.contains("2222"), "{status}");
     assert!(status.contains("在线"), "{status}");
@@ -134,12 +134,12 @@ async fn dispatches_syncs_and_stops_gracefully() {
     assert!(notes.is_empty(), "{notes:?}");
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].run_id, 3333);
-    assert_eq!(targets[0].node, "Actions");
+    assert_eq!(targets[0].node, "Actions-amd64-3333");
 
     let (targets, notes) = client.stop_targets(None, &cancel).await.unwrap();
     assert!(notes.is_empty(), "{notes:?}");
     let nodes: Vec<&str> = targets.iter().map(|target| target.node.as_str()).collect();
-    assert_eq!(nodes, ["Actions"]);
+    assert_eq!(nodes, ["Actions-amd64-2222"]);
 
     fs::write(dir.join("state.stopped"), "").unwrap();
     let wait = client.await_finished(&[2222, 3333], &cancel).await.unwrap();

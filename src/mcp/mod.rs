@@ -29,7 +29,8 @@ upload/download：给 local_path 时走本机，给 from/to 时让中继在两�
 （不经过本机磁盘）。工具失败时 isError 为真，\
 错误码说明原因（unknown_target、offline、timeout、denied、too_large、busy、io、\
 protocol）。需要临时算力时用 actions 在 GitHub Actions 上开一个一次性被控端\
-（目标名 Actions，注册进房间后即可当普通 target 用），用完 actions stop 关掉\
+（目标名形如 Actions-amd64-1234，每个运行都不同，以 start 或 targets 返回的为准，\
+注册进房间后即可当普通 target 用），用完 actions stop 关掉\
 （直接向节点发 shutdown，节点自行退出，运行保持成功），别让它白烧额度。";
 
 pub async fn serve(session: &Session, shutdown: CancellationToken) -> Result<()> {
