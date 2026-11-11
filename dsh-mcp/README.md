@@ -4,8 +4,8 @@
 
 | 目录 | 包名 | 来源 | 作用 |
 | --- | --- | --- | --- |
-| `dsh-mcp-client/` | `@local/dsh-mcp-client` | `@deepseek-ai/dsh-mcp-client@0.2.2-rc.1` | 连接 MCP 服务端（`mcp-relay` 行），把服务端的工具注册成 `mcp__<server>__*` |
-| `dsh-mcp-resources/` | `@local/dsh-mcp-resources` | `@deepseek-ai/dsh-mcp-resources@0.2.2-rc.1` | 提供 `mcpResources` 服务，并注册 `list_mcp_resources` / `list_mcp_resource_templates` / `read_mcp_resource` 三个共享工具 |
+| `dsh-mcp-client/` | `@local/dsh-mcp-client` | `@deepseek-ai/dsh-mcp-client@0.2.2-rc.2` | 连接 MCP 服务端（`mcp-relay` 行），把服务端的工具注册成 `mcp__<server>__*` |
+| `dsh-mcp-resources/` | `@local/dsh-mcp-resources` | `@deepseek-ai/dsh-mcp-resources@0.2.2-rc.2` | 提供 `mcpResources` 服务，并注册 `list_mcp_resources` / `list_mcp_resource_templates` / `read_mcp_resource` 三个共享工具 |
 
 `lib/index.js` 是上游发布包里的构建产物（上游仓库 `packages/mcp/*` 的源码编译结果），
 直接改这里的文件即可；`lib/types/`、`locale/`、README 原样保留，方便对照。
