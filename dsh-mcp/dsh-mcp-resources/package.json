@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-mcp-resources",
-  "version": "0.2.2-rc.1",
+  "version": "0.2.2-rc.2",
   "private": true,
   "description": "MCP resource tools（@deepseek-ai/dsh-mcp-resources 的本地副本，按 link 方式安装）",
   "type": "module",
@@ -18,11 +18,11 @@
   "license": "MIT",
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.1.0",
-    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-scope": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-util-values": "0.2.2-rc.1"
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-scope": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-util-values": "0.2.2-rc.2"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-system-prompt": {
