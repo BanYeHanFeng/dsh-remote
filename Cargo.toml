@@ -29,7 +29,7 @@ x25519-dalek = { version = "3", features = ["static_secrets"] }
 ruzstd = "0.9"
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
