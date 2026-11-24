@@ -6,7 +6,8 @@ ETC_DIR="/etc/dsh-remote"
 UNIT_DIR="/etc/systemd/system"
 SOCKET_PATH="/run/dsh-remote/controller.sock"
 DEFAULT_PORT="7443"
-SCRIPT_URL_PLACEHOLDER="https://your-host/dsh-remote.sh"
+REPO="BanYeHanFeng/dsh-remote"
+SCRIPT_URL="https://raw.githubusercontent.com/${REPO}/dev/scripts/dsh-remote.sh"
 
 UI=""
 
@@ -145,59 +146,42 @@ parse_tags() {
   done
 }
 
-source_binary() {
-  local explicit="${1:-}"
-  if [[ -n ${explicit} ]]; then
-    [[ -f ${explicit} ]] || die "找不到二进制文件：${explicit}"
-    printf '%s\n' "${explicit}"
-    return
+asset_url() {
+  local asset="$1" url tag
+  url="https://github.com/${REPO}/releases/latest/download/${asset}"
+  if curl -fsIL --max-time 15 "${url}" >/dev/null 2>&1; then
+    printf '%s\n' "${url}"
+    return 0
   fi
-  if [[ -x ${BIN_PATH} ]]; then
-    printf '%s\n' "${BIN_PATH}"
-    return
-  fi
-  local script_dir=""
-  if [[ -n ${BASH_SOURCE[0]:-} && -f ${BASH_SOURCE[0]} ]]; then
-    script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
-  fi
-  if [[ -n ${script_dir} ]]; then
-    for candidate in "${script_dir}/../target/release/dsh-remote" "${script_dir}/../target/debug/dsh-remote"; do
-      if [[ -x ${candidate} ]]; then
-        printf '%s\n' "${candidate}"
-        return
-      fi
-    done
-  fi
-  if [[ -n ${DSH_REMOTE_BIN_URL:-} ]]; then
-    printf '%s\n' "${DSH_REMOTE_BIN_URL}"
-    return
-  fi
-  if command -v dsh-remote >/dev/null 2>&1; then
-    printf '%s\n' "$(command -v dsh-remote)"
-    return
-  fi
-  die "找不到 dsh-remote 二进制，请用 --bin 指定文件路径，或设置 DSH_REMOTE_BIN_URL"
+  tag=$(curl -fsSL --max-time 15 "https://api.github.com/repos/${REPO}/releases?per_page=1" 2>/dev/null |
+    sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
+  [[ -n ${tag} ]] || return 1
+  printf 'https://github.com/%s/releases/download/%s/%s\n' "${REPO}" "${tag}" "${asset}"
 }
 
 install_binary() {
-  local source
-  source=$(source_binary "${1:-}")
-  mkdir -p "$(dirname "${BIN_PATH}")"
-  if [[ ${source} == http://* || ${source} == https://* ]]; then
-    msg "下载二进制：${source}"
-    curl -fsSL "${source}" -o "${BIN_PATH}.tmp"
-    if [[ ${source} == *.tar.zst ]]; then
-      command -v zstd >/dev/null 2>&1 || die "解包 .tar.zst 需要 zstd，请先安装（如 apt install zstd）"
-      tar --zstd -xOf "${BIN_PATH}.tmp" dsh-remote >"${BIN_PATH}.unpacked" || die "解包失败：${source}"
-      mv "${BIN_PATH}.unpacked" "${BIN_PATH}.tmp"
-    fi
-    chmod 0755 "${BIN_PATH}.tmp"
-    mv "${BIN_PATH}.tmp" "${BIN_PATH}"
-  elif [[ ${source} == "${BIN_PATH}" ]]; then
-    msg "已安装的二进制：${BIN_PATH}"
-  else
-    install -m 0755 "${source}" "${BIN_PATH}"
+  local arch asset url tmp
+  case $(uname -m) in
+    x86_64 | amd64) arch="x86_64" ;;
+    aarch64 | arm64) arch="aarch64" ;;
+    *) die "不支持的架构：$(uname -m)" ;;
+  esac
+  command -v zstd >/dev/null 2>&1 || die "解包需要 zstd，请先安装（如 apt install zstd）"
+  asset="dsh-remote-linux-${arch}.tar.zst"
+  url=$(asset_url "${asset}") || die "找不到发布产物：${asset}，请先在仓库 Actions 中发布一次"
+  msg "下载二进制：${url}"
+  tmp=$(mktemp -d)
+  if ! curl -fsSL --retry 2 "${url}" -o "${tmp}/${asset}"; then
+    rm -rf "${tmp}"
+    die "下载失败：${url}"
   fi
+  if ! zstd -dcq "${tmp}/${asset}" | tar -x -C "${tmp}" dsh-remote; then
+    rm -rf "${tmp}"
+    die "解包失败：${url}"
+  fi
+  install -m 0755 "${tmp}/dsh-remote" "${BIN_PATH}.new"
+  mv -f "${BIN_PATH}.new" "${BIN_PATH}"
+  rm -rf "${tmp}"
   msg "二进制就绪：${BIN_PATH}"
 }
 
@@ -271,9 +255,9 @@ write_unit() {
   local role="$1"
   local unit
   unit=$(unit_path "${role}")
-  local extra=""
+  local runtime=""
   if [[ ${role} == "controller" ]]; then
-    extra=$'RuntimeDirectory=dsh-remote\nRuntimeDirectoryMode=0700'
+    runtime=$'RuntimeDirectory=dsh-remote\nRuntimeDirectoryMode=0700'
   fi
   cat >"${unit}" <<EOF
 [Unit]
@@ -283,7 +267,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-${extra}
+${runtime}
 ExecStart=${BIN_PATH} ${role} --config ${ETC_DIR}/${role}.toml
 Restart=always
 RestartSec=3
@@ -326,7 +310,7 @@ print_access_command() {
   local psk
   psk=$(sed -n 's/^psk = "\(.*\)"$/\1/p' "${ETC_DIR}/${role}.toml" | head -n1)
   [[ -n ${psk} ]] || die "读取 ${ETC_DIR}/${role}.toml 中的 psk 失败"
-  local url="${DSH_REMOTE_SCRIPT_URL:-${SCRIPT_URL_PLACEHOLDER}}"
+  local url="${DSH_REMOTE_SCRIPT_URL:-${SCRIPT_URL}}"
   msg ""
   msg "在被控端机器上执行下面这条命令即可完成静默接入："
   msg ""
@@ -363,7 +347,7 @@ configure_controller() {
   relay_addr=$(ui_input "接入中继" "可选：要接入的中继地址，留空表示纯直连模式" "")
   mcp_http=$(ui_input "MCP HTTP" "可选：MCP Streamable HTTP 监听地址，留空表示不开启" "")
   psk=$(ask_psk)
-  install_binary "${BIN_SOURCE}"
+  install_binary
   local relay_normalized=""
   if [[ -n ${relay_addr} ]]; then
     relay_normalized=$(normalize_addr "${relay_addr}")
@@ -388,7 +372,7 @@ configure_relay() {
     fi
   fi
   psk=$(ask_psk)
-  install_binary "${BIN_SOURCE}"
+  install_binary
   listen=$(normalize_addr "${listen}")
   parse_tags "${tags}"
   write_relay_config "${listen}" "${id}" "${psk}" "${local_enabled}" "${TAG_LIST[@]:-}"
@@ -408,7 +392,7 @@ configure_agent() {
   if [[ -z ${tags} ]] && [[ ${UI} != "plain" ]]; then
     tags=$(ui_input "节点标签" "可选：标签，多个用逗号分隔（如 env=prod,role=web）" "")
   fi
-  install_binary "${BIN_SOURCE}"
+  install_binary
   parse_tags "${tags}"
   write_agent_config "$(normalize_addr "${connect}")" "${id}" "${psk}" "${TAG_LIST[@]:-}"
   enable_service agent
@@ -467,12 +451,11 @@ usage() {
   controller              交互式配置并部署控制端
   relay                   交互式配置并部署中继
   agent                   配置并部署被控端（支持全参数非交互）
-  install                 仅安装二进制
+  install                 按当前架构下载并安装最新发布的二进制
   status|start|stop|restart|logs|uninstall <controller|relay|agent>
   access <controller|relay>   打印被控端一键接入命令
 
 通用选项：
-  --bin <路径>            使用本地二进制文件
   --non-interactive       纯文本交互（不弹窗）
 
 agent 专用选项：
@@ -482,7 +465,6 @@ agent 专用选项：
   --tag <k=v>             节点标签，可重复
 
 环境变量：
-  DSH_REMOTE_BIN_URL      二进制下载地址
   DSH_REMOTE_SCRIPT_URL   本脚本的公网地址（用于生成接入命令）
 EOF
 }
@@ -490,14 +472,6 @@ EOF
 ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bin)
-      BIN_SOURCE="$2"
-      shift 2
-      ;;
-    --bin=*)
-      BIN_SOURCE="${1#*=}"
-      shift
-      ;;
     --non-interactive)
       UI="plain"
       shift
@@ -545,7 +519,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-BIN_SOURCE="${BIN_SOURCE:-}"
 AGENT_CONNECT="${AGENT_CONNECT:-}"
 AGENT_PSK="${AGENT_PSK:-}"
 AGENT_ID="${AGENT_ID:-}"
@@ -560,7 +533,7 @@ case ${subcmd} in
   controller) configure_controller ;;
   relay) configure_relay ;;
   agent) configure_agent ;;
-  install) install_binary "${BIN_SOURCE}" ;;
+  install) install_binary ;;
   access)
     role="${ARGS[1]:-}"
     if [[ -z ${role} ]]; then
