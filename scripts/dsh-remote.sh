@@ -23,8 +23,8 @@ need_tty() {
 }
 
 ask_menu() {
-  local title="$1" text="$2"
-  shift 2
+  local title="$1" text="$2" back="$3"
+  shift 3
   local -a items=("$@")
   local -a keys=()
   local i=0 reply n
@@ -34,9 +34,12 @@ ask_menu() {
     printf '  %d) %s\n' "$((i / 2 + 1))" "${items[i + 1]:-}" >&2
     i=$((i + 2))
   done
+  printf '  0) %s\n' "${back}" >&2
   while true; do
-    read -r -p "请输入编号（回车返回）：" reply || return 0
-    [[ -n ${reply} ]] || return 0
+    read -r -p "请输入编号（0 ${back}）：" reply || return 1
+    if [[ ${reply} == "0" ]]; then
+      return 1
+    fi
     if [[ ${reply} =~ ^[0-9]{1,3}$ ]]; then
       n=$((10#${reply}))
       if ((n >= 1 && n <= ${#keys[@]})); then
@@ -44,7 +47,7 @@ ask_menu() {
         return 0
       fi
     fi
-    msg "无效编号：${reply}"
+    msg "无效输入：${reply:-<空>}，请输入 1-${#keys[@]}，或 0 ${back}"
   done
 }
 
@@ -342,18 +345,15 @@ configure_agent() {
 
 service_menu() {
   local role action
-  role=$(ask_menu "服务管理" "选择角色" "${ROLES[@]}")
-  [[ -n ${role} ]] || return 1
-  action=$(ask_menu "服务管理 - ${role}" "选择操作" \
-    status "查看状态" start "启动" stop "停止" restart "重启" logs "实时日志" uninstall "卸载服务")
-  [[ -n ${action} ]] || return 1
+  role=$(ask_menu "服务管理" "选择角色" "返回上一级" "${ROLES[@]}") || return 1
+  action=$(ask_menu "服务管理 - ${role}" "选择操作" "返回上一级" \
+    status "查看状态" start "启动" stop "停止" restart "重启" logs "实时日志" uninstall "卸载服务") || return 1
   service_action "${role}" "${action}"
 }
 
 access_menu() {
   local role addr
-  role=$(ask_menu "一键接入命令" "选择服务角色" "${ROLES[@]:0:4}")
-  [[ -n ${role} ]] || return 1
+  role=$(ask_menu "一键接入命令" "选择服务角色" "返回上一级" "${ROLES[@]}") || return 1
   addr=$(sed -n 's/^listen = "\(.*\)"$/\1/p' "${ETC_DIR}/${role}.toml" | head -n1)
   [[ -n ${addr} ]] || die "读取 ${ETC_DIR}/${role}.toml 中的 listen 失败"
   print_access_command "${role}" "${addr}"
@@ -361,22 +361,20 @@ access_menu() {
 
 main_menu() {
   need_tty
+  local choice
   while true; do
-    local choice
-    choice=$(ask_menu "dsh-remote 一键配置" "请选择要执行的操作" \
+    choice=$(ask_menu "dsh-remote 一键配置" "请选择要执行的操作" "退出" \
       controller "配置并部署控制端（controller）" \
       relay "配置并部署中继（relay）" \
       agent "配置并部署被控端（agent）" \
       service "服务管理（状态/启停/日志/卸载）" \
-      access "生成被控端一键接入命令" \
-      quit "退出") || return 0
+      access "生成被控端一键接入命令") || return 0
     case ${choice} in
       controller) configure_controller ;;
       relay) configure_relay ;;
       agent) configure_agent ;;
       service) service_menu || continue ;;
       access) access_menu || continue ;;
-      quit | "") return 0 ;;
     esac
     printf '\n按回车返回主菜单...' >&2
     read -r _ || true
