@@ -186,6 +186,11 @@ install_binary() {
   if [[ ${source} == http://* || ${source} == https://* ]]; then
     msg "下载二进制：${source}"
     curl -fsSL "${source}" -o "${BIN_PATH}.tmp"
+    if [[ ${source} == *.tar.zst ]]; then
+      command -v zstd >/dev/null 2>&1 || die "解包 .tar.zst 需要 zstd，请先安装（如 apt install zstd）"
+      tar --zstd -xOf "${BIN_PATH}.tmp" dsh-remote >"${BIN_PATH}.unpacked" || die "解包失败：${source}"
+      mv "${BIN_PATH}.unpacked" "${BIN_PATH}.tmp"
+    fi
     chmod 0755 "${BIN_PATH}.tmp"
     mv "${BIN_PATH}.tmp" "${BIN_PATH}"
   elif [[ ${source} == "${BIN_PATH}" ]]; then

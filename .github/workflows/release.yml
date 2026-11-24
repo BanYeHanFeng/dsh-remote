@@ -30,19 +30,22 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
           - arch: aarch64
             runner: ubuntu-26.04-arm
+            target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          targets: ${{ matrix.target }}
           components: clippy, rustfmt
 
       - uses: forge-ci/zccache@v1.4.0
         with:
-          shared-key: ${{ matrix.arch }}
+          shared-key: ${{ matrix.target }}
 
       - name: Format
         if: matrix.arch == 'x86_64'
@@ -53,15 +56,18 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Stage
-        run: install -m 0755 target/release/dsh-remote "dsh-remote-linux-${{ matrix.arch }}"
+      - name: Package
+        run: |
+          BIN="target/${{ matrix.target }}/release/dsh-remote"
+          file "$BIN" | grep -q 'statically linked' || { file "$BIN"; exit 1; }
+          tar --zstd -cf "dsh-remote-linux-${{ matrix.arch }}.tar.zst" -C "$(dirname "$BIN")" dsh-remote
 
       - uses: actions/upload-artifact@v7
         with:
           name: dsh-remote-linux-${{ matrix.arch }}
-          path: dsh-remote-linux-${{ matrix.arch }}
+          path: dsh-remote-linux-${{ matrix.arch }}.tar.zst
           if-no-files-found: error
 
       - name: zccache cleanup
@@ -81,7 +87,7 @@ jobs:
           merge-multiple: true
 
       - name: Checksums
-        run: cd dist && sha256sum dsh-remote-linux-* > SHA256SUMS
+        run: cd dist && sha256sum ./*.tar.zst > SHA256SUMS
 
       - name: Tag
         id: tag
