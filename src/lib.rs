@@ -5,6 +5,7 @@ pub mod fileio;
 pub mod frame;
 pub mod ipc;
 pub mod mcp;
+pub mod node;
 pub mod ops;
 pub mod protocol;
 pub mod relay;

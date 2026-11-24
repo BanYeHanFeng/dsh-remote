@@ -24,7 +24,17 @@ use yamux::{Connection, Mode};
 
 use crate::protocol::{Role, PROTO_VERSION};
 
-pub type Stream = Compat<yamux::Stream>;
+pub trait Io: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<T> Io for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
+
+pub type Stream = Box<dyn Io>;
+
+/// 本地节点与远端节点共用的内存流
+pub fn local_pair() -> (Stream, Stream) {
+    let (a, b) = tokio::io::duplex(LOCAL_BUFFER);
+    (Box::new(a), Box::new(b))
+}
 
 type Mux = Connection<Compat<tokio::io::Join<DuplexStream, RecordWriter>>>;
 
@@ -33,6 +43,7 @@ const MAX_HANDSHAKE: usize = 64 * 1024;
 const MAX_RECORD: usize = 64 * 1024;
 const MAX_PAYLOAD: usize = MAX_RECORD - 16;
 const PLAIN_BUFFER: usize = 128 * 1024;
+const LOCAL_BUFFER: usize = 64 * 1024;
 const STREAM_QUEUE: usize = 16;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
@@ -93,7 +104,7 @@ impl Session {
         .await
         .context("打开业务流失败")?;
         let _ = self.inner.nudge.try_send(());
-        Ok(stream.compat())
+        Ok(Box::new(stream.compat()) as Stream)
     }
 
     pub async fn accept(&self) -> Result<Stream> {
@@ -317,7 +328,7 @@ fn start(
         yamux::Config::default(),
         mode,
     )));
-    let (in_tx, in_rx) = mpsc::channel(STREAM_QUEUE);
+    let (in_tx, in_rx) = mpsc::channel::<Stream>(STREAM_QUEUE);
     let (closed_tx, _closed_rx) = watch::channel(false);
     let (nudge_tx, mut nudge_rx) = mpsc::channel::<()>(1);
     let driver = conn.clone();
@@ -335,7 +346,11 @@ fn start(
             };
             match next {
                 Some(Ok(stream)) => {
-                    if in_tx.send(stream.compat()).await.is_err() {
+                    if in_tx
+                        .send(Box::new(stream.compat()) as Stream)
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
