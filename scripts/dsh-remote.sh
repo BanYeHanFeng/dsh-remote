@@ -72,7 +72,8 @@ ui_input() {
   local title="$1" prompt="$2" default="${3:-}"
   local value
   if [[ ${UI} == "plain" ]]; then
-    read -r -p "${prompt}${default:+ [${default}]}：" value
+    local hint="${prompt}${default:+ [${default}]}"
+    read -r -p "${hint//\\n/$'\n'}：" value || true
     printf '%s\n' "${value:-${default}}"
     return 0
   fi
@@ -88,7 +89,7 @@ ui_password() {
   local title="$1" prompt="$2"
   local value
   if [[ ${UI} == "plain" ]]; then
-    read -r -s -p "${prompt}：" value
+    read -r -s -p "${prompt//\\n/$'\n'}：" value || true
     printf '\n' >&2
     printf '%s\n' "${value}"
     return 0
@@ -106,9 +107,10 @@ ui_yesno() {
   local -a extra=()
   [[ ${default} == "y" ]] || extra=(--defaultno)
   if [[ ${UI} == "plain" ]]; then
-    local answer hint="[y/N]"
-    [[ ${default} == "y" ]] && hint="[Y/n]"
-    read -r -p "${prompt} ${hint}：" answer
+    local answer mark="[y/N]"
+    [[ ${default} == "y" ]] && mark="[Y/n]"
+    local hint="${prompt} ${mark}"
+    read -r -p "${hint//\\n/$'\n'}：" answer || true
     answer="${answer:-${default}}"
     [[ ${answer} == "y" || ${answer} == "Y" ]]
     return
@@ -151,10 +153,12 @@ parse_tags() {
   TAG_LIST=()
   local item
   local -a raw=()
-  IFS=',' read -ra raw <<<"$1"
+  IFS=',' read -ra raw <<<"$1" || true
   for item in "${raw[@]:-}"; do
     item=$(printf '%s' "${item}" | tr -d ' ')
-    [[ -n ${item} ]] && TAG_LIST+=("${item}")
+    if [[ -n ${item} ]]; then
+      TAG_LIST+=("${item}")
+    fi
   done
 }
 
@@ -304,22 +308,27 @@ enable_service() {
 
 service_action() {
   local role="$1" action="$2"
+  local unit="dsh-remote-${role}.service"
+  if [[ ! -f $(unit_path "${role}") ]]; then
+    msg "${unit} 未安装，请先执行「配置并部署${role}」"
+    return 1
+  fi
   case ${action} in
-    status) systemctl --no-pager --lines=20 status "dsh-remote-${role}.service" || true ;;
+    status) systemctl --no-pager --lines=20 status "${unit}" || true ;;
     logs)
       trap '' INT
-      (trap - INT; journalctl -u "dsh-remote-${role}.service" -n 100 --no-pager -f) || true
+      (trap - INT; journalctl -u "${unit}" -n 100 --no-pager -f) || true
       trap - INT
       ;;
     uninstall)
-      systemctl disable --now "dsh-remote-${role}.service" >/dev/null 2>&1 || true
+      systemctl disable --now "${unit}" >/dev/null 2>&1 || true
       rm -f "$(unit_path "${role}")"
       systemctl daemon-reload
-      msg "已停止并移除 dsh-remote-${role}.service（配置文件与二进制保留）"
+      msg "已停止并移除 ${unit}（配置文件与二进制保留）"
       ;;
     *)
-      systemctl "${action}" "dsh-remote-${role}.service"
-      systemctl is-active "dsh-remote-${role}.service" >&2 || true
+      systemctl "${action}" "${unit}"
+      systemctl is-active "${unit}" >&2 || true
       ;;
   esac
 }
@@ -350,14 +359,16 @@ EOF
 }
 
 ask_psk() {
-  local generated
+  local generated psk
   generated=$(gen_psk)
   if ui_yesno "预共享密钥" "是否自动生成 32 字节随机 PSK？\n（选否可手动输入，需与控制端/中继一致）"; then
     msg "已生成 PSK：${generated}"
     printf '%s\n' "${generated}"
-    return
+    return 0
   fi
-  ui_password "预共享密钥" "请输入 PSK"
+  psk=$(ui_password "预共享密钥" "请输入 PSK")
+  [[ -n ${psk} ]] || die "PSK 不能为空"
+  printf '%s\n' "${psk}"
 }
 
 configure_controller() {
@@ -407,6 +418,7 @@ configure_agent() {
   id="${AGENT_ID:-$(hostname)}"
   psk="${AGENT_PSK:-}"
   [[ -n ${psk} ]] || psk=$(ui_password "预共享密钥" "请输入与控制端/中继一致的 PSK")
+  [[ -n ${psk} ]] || die "PSK 不能为空"
   tags="${AGENT_TAGS:-}"
   if [[ -z ${tags} ]] && [[ ${UI} != "plain" ]]; then
     tags=$(ui_input "节点标签" "可选：标签，多个用逗号分隔（如 env=prod,role=web）" "")
