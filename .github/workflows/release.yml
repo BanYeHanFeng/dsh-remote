@@ -88,9 +88,6 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: 计算校验和
-        run: cd dist && sha256sum ./*.tar.zst > SHA256SUMS
-
       - name: 生成标签
         id: tag
         run: echo "tag=v$(TZ=Asia/Shanghai date +%Y%m%d)-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
