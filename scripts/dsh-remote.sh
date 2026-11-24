@@ -89,17 +89,21 @@ ui_password() {
 }
 
 ui_yesno() {
-  local title="$1" prompt="$2"
+  local title="$1" prompt="$2" default="${3:-n}"
+  local -a extra=()
+  [[ ${default} == "y" ]] || extra=(--defaultno)
   if [[ ${UI} == "plain" ]]; then
-    local answer
-    read -r -p "${prompt} [y/N]：" answer
+    local answer hint="[y/N]"
+    [[ ${default} == "y" ]] && hint="[Y/n]"
+    read -r -p "${prompt} ${hint}：" answer
+    answer="${answer:-${default}}"
     [[ ${answer} == "y" || ${answer} == "Y" ]]
     return
   fi
   if [[ ${UI} == "whiptail" ]]; then
-    whiptail --title "${title}" --yesno "${prompt}" 12 72
+    whiptail --title "${title}" --yesno "${prompt}" 12 72 "${extra[@]}"
   else
-    dialog --title "${title}" --yesno "${prompt}" 12 72
+    dialog --title "${title}" --yesno "${prompt}" 12 72 "${extra[@]}"
   fi
 }
 
@@ -118,6 +122,27 @@ normalize_addr() {
 
 toml_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+toml_tags() {
+  local literal="" tag
+  for tag in "$@"; do
+    [[ -z ${tag} ]] && continue
+    [[ -n ${literal} ]] && literal+=", "
+    literal+="\"$(toml_escape "${tag}")\""
+  done
+  printf '%s' "${literal}"
+}
+
+parse_tags() {
+  TAG_LIST=()
+  local item
+  local -a raw=()
+  IFS=',' read -ra raw <<<"$1"
+  for item in "${raw[@]:-}"; do
+    item=$(printf '%s' "${item}" | tr -d ' ')
+    [[ -n ${item} ]] && TAG_LIST+=("${item}")
+  done
 }
 
 source_binary() {
@@ -193,7 +218,8 @@ EOF
 }
 
 write_relay_config() {
-  local listen="$1" psk="$2"
+  local listen="$1" id="$2" psk="$3" local_enabled="$4"
+  shift 4
   prepare_etc
   local file="${ETC_DIR}/relay.toml"
   umask 077
@@ -201,6 +227,14 @@ write_relay_config() {
 listen = "$(toml_escape "${listen}")"
 psk = "$(toml_escape "${psk}")"
 EOF
+  if [[ ${local_enabled} == "1" ]]; then
+    cat >>"${file}" <<EOF
+id = "$(toml_escape "${id}")"
+tags = [$(toml_tags "$@")]
+EOF
+  else
+    printf 'local = false\n' >>"${file}"
+  fi
   chmod 0600 "${file}"
   msg "已写入 ${file}"
 }
@@ -211,15 +245,8 @@ write_agent_config() {
   local tags=("$@")
   prepare_etc
   local file="${ETC_DIR}/agent.toml"
-  local tags_literal=""
-  local tag
-  for tag in "${tags[@]:-}"; do
-    [[ -z ${tag} ]] && continue
-    if [[ -n ${tags_literal} ]]; then
-      tags_literal+=", "
-    fi
-    tags_literal+="\"$(toml_escape "${tag}")\""
-  done
+  local tags_literal
+  tags_literal=$(toml_tags "${tags[@]:-}")
   umask 077
   cat >"${file}" <<EOF
 connect = "$(toml_escape "${connect}")"
@@ -343,12 +370,23 @@ configure_controller() {
 }
 
 configure_relay() {
-  local listen psk
+  local listen psk id tags local_enabled
   listen=$(ui_input "中继监听地址" "监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "0.0.0.0:${DEFAULT_PORT}")
+  local_enabled=0
+  id=""
+  tags=""
+  if ui_yesno "中继本机节点" "是否允许控制端在中继本机上执行命令？\n（开启后中继本机会以节点形式出现在节点列表）" y; then
+    local_enabled=1
+    id=$(ui_input "本机节点标识" "中继本机作为节点时使用的标识" "$(hostname)")
+    if [[ ${UI} != "plain" ]]; then
+      tags=$(ui_input "本机节点标签" "可选：标签，多个用逗号分隔（如 env=prod,role=relay）" "")
+    fi
+  fi
   psk=$(ask_psk)
   install_binary "${BIN_SOURCE}"
   listen=$(normalize_addr "${listen}")
-  write_relay_config "${listen}" "${psk}"
+  parse_tags "${tags}"
+  write_relay_config "${listen}" "${id}" "${psk}" "${local_enabled}" "${TAG_LIST[@]:-}"
   enable_service relay
   print_access_command relay "${listen}"
 }
@@ -366,14 +404,8 @@ configure_agent() {
     tags=$(ui_input "节点标签" "可选：标签，多个用逗号分隔（如 env=prod,role=web）" "")
   fi
   install_binary "${BIN_SOURCE}"
-  local -a tag_list=()
-  local item
-  IFS=',' read -ra raw_tags <<<"${tags}"
-  for item in "${raw_tags[@]:-}"; do
-    item=$(printf '%s' "${item}" | tr -d ' ')
-    [[ -n ${item} ]] && tag_list+=("${item}")
-  done
-  write_agent_config "$(normalize_addr "${connect}")" "${id}" "${psk}" "${tag_list[@]:-}"
+  parse_tags "${tags}"
+  write_agent_config "$(normalize_addr "${connect}")" "${id}" "${psk}" "${TAG_LIST[@]:-}"
   enable_service agent
 }
 
