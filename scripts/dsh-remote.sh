@@ -315,7 +315,11 @@ configure_agent() {
   connect="${AGENT_CONNECT:-}"
   [[ -n ${connect} ]] || connect=$(ask_input "控制端或中继地址（如 10.0.0.1:${DEFAULT_PORT}）")
   [[ -n ${connect} ]] || die "接入地址不能为空"
-  id="${AGENT_ID:-$(hostname)}"
+  id="${AGENT_ID:-}"
+  if [[ -z ${id} && -t 0 ]]; then
+    id=$(ask_input "节点标识（用于在控制端区分不同机器）" "$(hostname)")
+  fi
+  id="${id:-$(hostname)}"
   psk="${AGENT_PSK:-}"
   [[ -n ${psk} ]] || psk=$(ask_password "请输入与控制端/中继一致的 PSK")
   [[ -n ${psk} ]] || die "PSK 不能为空"
