@@ -12,7 +12,6 @@ pub struct FileConfig {
     pub listen: Option<String>,
     pub relay: Option<String>,
     pub socket: Option<PathBuf>,
-    pub mcp_http: Option<String>,
     pub psk: Option<String>,
     pub connect: Option<String>,
     pub local: Option<bool>,
@@ -44,7 +43,6 @@ impl FileConfig {
         for value in [
             &mut self.listen,
             &mut self.relay,
-            &mut self.mcp_http,
             &mut self.psk,
             &mut self.connect,
             &mut self.id,

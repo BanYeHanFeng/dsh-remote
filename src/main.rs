@@ -42,7 +42,7 @@ enum Command {
     #[command(about = "启动被控端，接入控制端或中继")]
     Agent(AgentArgs),
     #[command(about = "以 MCP 协议对外提供服务")]
-    Mcp(McpArgs),
+    Mcp,
     #[command(about = "列出在线节点")]
     Nodes,
     #[command(about = "在指定节点执行一次性 bash 命令")]
@@ -61,12 +61,6 @@ struct ControllerArgs {
     listen: Option<String>,
     #[arg(long, value_name = "ADDR", help = "接入的中继地址")]
     relay: Option<String>,
-    #[arg(
-        long,
-        value_name = "ADDR",
-        help = "若提供则同时开启 MCP Streamable HTTP"
-    )]
-    mcp_http: Option<String>,
     #[arg(long, value_name = "PATH", help = "本地 socket 路径")]
     socket: Option<PathBuf>,
 }
@@ -87,12 +81,6 @@ struct AgentArgs {
     connect: Option<String>,
     #[arg(long, value_name = "ID", help = "节点标识，默认取主机名")]
     id: Option<String>,
-}
-
-#[derive(Args)]
-struct McpArgs {
-    #[arg(long, value_name = "ADDR", help = "以 Streamable HTTP 方式监听该地址")]
-    http: Option<String>,
 }
 
 #[derive(Args)]
@@ -168,7 +156,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Controller(args) => run_controller(cli.config, args).await,
         Command::Relay(args) => run_relay(cli.config, args).await,
         Command::Agent(args) => run_agent(cli.config, args).await,
-        Command::Mcp(args) => run_mcp(socket, args).await,
+        Command::Mcp => run_mcp(socket).await,
         Command::Nodes => run_nodes(socket, cli.json).await,
         Command::Exec(args) => run_exec(socket, args, cli.json).await,
         Command::Upload(args) => run_upload(socket, args, cli.json).await,
@@ -192,7 +180,6 @@ async fn run_controller(config_path: Option<PathBuf>, args: ControllerArgs) -> R
         listen: listen.map(|addr| config::with_port(&addr)),
         relay: relay.map(|addr| config::with_port(&addr)),
         socket,
-        mcp_http: config::pick_string(args.mcp_http, file.mcp_http),
         psk: config::psk(file.psk)?,
     };
     controller::run(opts).await
@@ -235,11 +222,8 @@ async fn run_agent(config_path: Option<PathBuf>, args: AgentArgs) -> Result<()> 
     agent::run(opts).await
 }
 
-async fn run_mcp(socket: PathBuf, args: McpArgs) -> Result<()> {
-    match args.http {
-        Some(addr) => mcp::serve_http(&addr, socket).await,
-        None => mcp::serve_stdio(socket).await,
-    }
+async fn run_mcp(socket: PathBuf) -> Result<()> {
+    mcp::serve_stdio(socket).await
 }
 
 async fn run_nodes(socket: PathBuf, json: bool) -> Result<()> {

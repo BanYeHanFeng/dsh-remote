@@ -20,7 +20,6 @@ pub struct ControllerOptions {
     pub listen: Option<String>,
     pub relay: Option<String>,
     pub socket: PathBuf,
-    pub mcp_http: Option<String>,
     pub psk: Vec<u8>,
 }
 
@@ -190,15 +189,6 @@ pub async fn run(opts: ControllerOptions) -> Result<()> {
     if let Some(relay_addr) = opts.relay.clone() {
         let ctl = ctl.clone();
         tokio::spawn(async move { relay_loop(ctl, relay_addr).await });
-    }
-
-    if let Some(addr) = opts.mcp_http.clone() {
-        let socket = opts.socket.clone();
-        tokio::spawn(async move {
-            if let Err(error) = crate::mcp::serve_http(&addr, socket).await {
-                tracing::error!(error = %format!("{error:#}"), "MCP HTTP 服务退出");
-            }
-        });
     }
 
     serve_ipc(ctl, opts.socket).await

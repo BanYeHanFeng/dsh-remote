@@ -136,7 +136,7 @@ prepare_etc() {
 }
 
 write_controller_config() {
-  local listen="$1" relay="$2" mcp_http="$3" psk="$4"
+  local listen="$1" relay="$2" psk="$3"
   prepare_etc
   local file="${ETC_DIR}/controller.toml"
   umask 077
@@ -144,7 +144,6 @@ write_controller_config() {
 listen = "$(toml_escape "${listen}")"
 relay = "$(toml_escape "${relay}")"
 socket = "${SOCKET_PATH}"
-mcp_http = "$(toml_escape "${mcp_http}")"
 psk = "$(toml_escape "${psk}")"
 EOF
   chmod 0600 "${file}"
@@ -288,19 +287,18 @@ ask_psk() {
 }
 
 configure_controller() {
-  local listen relay_addr mcp_http psk default_listen
+  local listen relay_addr psk default_listen
   default_listen=$(config_value controller listen)
   default_listen="${default_listen:-0.0.0.0:${DEFAULT_PORT}}"
   listen=$(ask_input "监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "${default_listen}")
   relay_addr=$(ask_input "可选：要接入的中继地址，留空表示纯直连模式" "$(config_value controller relay)")
-  mcp_http=$(ask_input "可选：MCP Streamable HTTP 监听地址，留空表示不开启" "$(config_value controller mcp_http)")
   psk=$(ask_psk "$(config_value controller psk)")
   local relay_normalized=""
   if [[ -n ${relay_addr} ]]; then
     relay_normalized=$(normalize_addr "${relay_addr}")
   fi
   listen=$(normalize_addr "${listen}")
-  write_controller_config "${listen}" "${relay_normalized}" "${mcp_http}" "${psk}"
+  write_controller_config "${listen}" "${relay_normalized}" "${psk}"
   deploy_service controller
   msg "部署完成"
 }

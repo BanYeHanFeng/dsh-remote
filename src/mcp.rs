@@ -2,8 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use crate::ipc::{IpcClient, IpcEvent, IpcRequest, NodeInfo};
 use crate::protocol::Failure;
@@ -47,117 +46,6 @@ pub async fn serve_stdio(socket: PathBuf) -> Result<()> {
             writer.flush().await?;
         }
     }
-}
-
-pub async fn serve_http(addr: &str, socket: PathBuf) -> Result<()> {
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("监听 MCP HTTP 端口失败：{}", addr))?;
-    tracing::info!(listen = %addr, "MCP HTTP 服务已启动");
-    loop {
-        let (stream, peer) = listener.accept().await.context("接受 MCP HTTP 连接失败")?;
-        let socket = socket.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_http(stream, socket).await {
-                tracing::debug!(peer = %peer, error = %format!("{error:#}"), "MCP HTTP 会话结束");
-            }
-        });
-    }
-}
-
-async fn handle_http(mut stream: TcpStream, socket: PathBuf) -> Result<()> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let header_end = loop {
-        let read = stream.read(&mut chunk).await?;
-        if read == 0 {
-            return Ok(());
-        }
-        buf.extend_from_slice(&chunk[..read]);
-        if let Some(pos) = find_header_end(&buf) {
-            break pos;
-        }
-        if buf.len() > 64 * 1024 {
-            return reply(&mut stream, 431, "请求头过大".as_bytes()).await;
-        }
-    };
-
-    let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-    let mut lines = head.split("\r\n");
-    let request_line = lines.next().unwrap_or_default();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_string();
-    let path = parts.next().unwrap_or_default().to_string();
-
-    let mut content_length = 0usize;
-    for line in lines {
-        if let Some((key, value)) = line.split_once(':') {
-            if key.trim().eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse().unwrap_or(0);
-            }
-        }
-    }
-
-    let mut body = buf[header_end..].to_vec();
-    if body.len() < content_length {
-        let mut rest = vec![0u8; content_length - body.len()];
-        stream.read_exact(&mut rest).await?;
-        body.extend_from_slice(&rest);
-    }
-
-    if method != "POST" {
-        return reply(&mut stream, 405, "只支持 POST".as_bytes()).await;
-    }
-    if !path.starts_with("/mcp") {
-        return reply(&mut stream, 404, "路径不存在".as_bytes()).await;
-    }
-
-    let request: Value = match serde_json::from_slice(&body) {
-        Ok(value) => value,
-        Err(_) => {
-            let error = json!({
-                "jsonrpc": "2.0",
-                "id": Value::Null,
-                "error": {"code": -32700, "message": "解析 JSON 失败"},
-            });
-            return reply_json(&mut stream, 200, &error).await;
-        }
-    };
-
-    match handle(&socket, request).await {
-        Some(response) => reply_json(&mut stream, 200, &response).await,
-        None => reply(&mut stream, 202, b"").await,
-    }
-}
-
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
-}
-
-async fn reply_json(stream: &mut TcpStream, status: u16, value: &Value) -> Result<()> {
-    let body = serde_json::to_vec(value)?;
-    reply(stream, status, &body).await
-}
-
-async fn reply(stream: &mut TcpStream, status: u16, body: &[u8]) -> Result<()> {
-    let reason = match status {
-        200 => "OK",
-        202 => "Accepted",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        431 => "Request Header Fields Too Large",
-        _ => "OK",
-    };
-    let head = format!(
-        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        status,
-        reason,
-        body.len()
-    );
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(body).await?;
-    stream.flush().await?;
-    Ok(())
 }
 
 async fn handle(socket: &Path, request: Value) -> Option<Value> {
