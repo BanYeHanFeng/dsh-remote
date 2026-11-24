@@ -26,7 +26,6 @@ pub struct ControllerOptions {
 
 struct NodeHandle {
     session: Session,
-    tags: Vec<String>,
     via_relay: bool,
     since: Instant,
 }
@@ -82,19 +81,12 @@ impl Controller {
         }
     }
 
-    pub async fn register(
-        &self,
-        node_id: String,
-        session: Session,
-        tags: Vec<String>,
-        via_relay: bool,
-    ) {
+    pub async fn register(&self, node_id: String, session: Session, via_relay: bool) {
         let mut nodes = self.nodes.write().await;
         if let Some(old) = nodes.insert(
             node_id,
             NodeHandle {
                 session: session.clone(),
-                tags,
                 via_relay,
                 since: Instant::now(),
             },
@@ -170,17 +162,12 @@ impl Controller {
         }
     }
 
-    pub async fn list(&self, tag: Option<&str>) -> Vec<NodeInfo> {
+    pub async fn list(&self) -> Vec<NodeInfo> {
         let nodes = self.nodes.read().await;
         let mut list: Vec<NodeInfo> = nodes
             .iter()
-            .filter(|(_, handle)| match tag {
-                Some(tag) => handle.tags.iter().any(|t| t == tag),
-                None => true,
-            })
             .map(|(id, handle)| NodeInfo {
                 node_id: id.clone(),
-                tags: handle.tags.clone(),
                 via: if handle.via_relay { "中继" } else { "直连" }.to_string(),
                 online_secs: handle.since.elapsed().as_secs(),
             })
@@ -253,7 +240,7 @@ async fn serve_agent(
     read_frame::<_, ControlMsg>(&mut control)
         .await
         .context("读取控制流问候失败")?;
-    ctl.register(agent.node_id.clone(), session.clone(), agent.tags, false)
+    ctl.register(agent.node_id.clone(), session.clone(), false)
         .await;
     tracing::info!(node = %agent.node_id, peer = %peer, "被控端已接入");
     control_loop(&session, control).await;
@@ -290,7 +277,7 @@ async fn relay_loop(ctl: Arc<Controller>, addr: String) {
 
 async fn relay_session(ctl: &Arc<Controller>, addr: &str) -> Result<()> {
     let node_id = format!("controller-{}", std::process::id());
-    let session = transport::connect(addr, &ctl.psk, Role::Controller, &node_id, &[])
+    let session = transport::connect(addr, &ctl.psk, Role::Controller, &node_id)
         .await
         .with_context(|| format!("接入中继 {} 失败", addr))?;
     let mut control = session.open().await.context("打开中继控制流失败")?;
@@ -317,8 +304,8 @@ async fn relay_session(ctl: &Arc<Controller>, addr: &str) -> Result<()> {
     let result = loop {
         tokio::select! {
             incoming = read_frame::<_, ControlMsg>(&mut recv) => match incoming {
-                Ok(ControlMsg::NodeOnline { node_id, tags }) => {
-                    ctl.register(node_id, session.clone(), tags, true).await;
+                Ok(ControlMsg::NodeOnline { node_id }) => {
+                    ctl.register(node_id, session.clone(), true).await;
                 }
                 Ok(ControlMsg::NodeOffline { node_id }) => {
                     ctl.unregister(&node_id, &session, true).await;

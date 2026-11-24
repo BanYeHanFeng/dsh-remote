@@ -44,7 +44,7 @@ enum Command {
     #[command(about = "以 MCP 协议对外提供服务")]
     Mcp(McpArgs),
     #[command(about = "列出在线节点")]
-    Nodes(NodesArgs),
+    Nodes,
     #[command(about = "在指定节点执行一次性 bash 命令")]
     Exec(ExecArgs),
     #[command(about = "上传本机文件到指定节点")]
@@ -77,8 +77,6 @@ struct RelayArgs {
     listen: Option<String>,
     #[arg(long, value_name = "ID", help = "中继本机作为节点的标识，默认取主机名")]
     id: Option<String>,
-    #[arg(long = "tag", value_name = "K=V", help = "中继本机节点标签，可重复")]
-    tags: Vec<String>,
     #[arg(long, help = "不把中继本机作为节点")]
     no_local: bool,
 }
@@ -89,20 +87,12 @@ struct AgentArgs {
     connect: Option<String>,
     #[arg(long, value_name = "ID", help = "节点标识，默认取主机名")]
     id: Option<String>,
-    #[arg(long = "tag", value_name = "K=V", help = "节点标签，可重复")]
-    tags: Vec<String>,
 }
 
 #[derive(Args)]
 struct McpArgs {
     #[arg(long, value_name = "ADDR", help = "以 Streamable HTTP 方式监听该地址")]
     http: Option<String>,
-}
-
-#[derive(Args)]
-struct NodesArgs {
-    #[arg(long, value_name = "K=V", help = "只看带有该标签的节点")]
-    tag: Option<String>,
 }
 
 #[derive(Args)]
@@ -179,7 +169,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Relay(args) => run_relay(cli.config, args).await,
         Command::Agent(args) => run_agent(cli.config, args).await,
         Command::Mcp(args) => run_mcp(socket, args).await,
-        Command::Nodes(args) => run_nodes(socket, args, cli.json).await,
+        Command::Nodes => run_nodes(socket, cli.json).await,
         Command::Exec(args) => run_exec(socket, args, cli.json).await,
         Command::Upload(args) => run_upload(socket, args, cli.json).await,
         Command::Download(args) => run_download(socket, args, cli.json).await,
@@ -219,14 +209,7 @@ async fn run_relay(config_path: Option<PathBuf>, args: RelayArgs) -> Result<()> 
     } else {
         let id = config::pick_string(args.id, file.id).unwrap_or_else(agent::default_node_id);
         dsh_remote::protocol::validate_node_id(&id)?;
-        Some(relay::LocalNode {
-            id,
-            tags: if args.tags.is_empty() {
-                file.tags
-            } else {
-                args.tags
-            },
-        })
+        Some(relay::LocalNode { id })
     };
     let opts = relay::RelayOptions {
         listen: config::with_port(&listen),
@@ -244,15 +227,9 @@ async fn run_agent(config_path: Option<PathBuf>, args: AgentArgs) -> Result<()> 
     )?;
     let id = config::pick_string(args.id, file.id).unwrap_or_else(agent::default_node_id);
     dsh_remote::protocol::validate_node_id(&id)?;
-    let tags = if args.tags.is_empty() {
-        file.tags
-    } else {
-        args.tags
-    };
     let opts = agent::AgentOptions {
         connect: config::with_port(&connect),
         id,
-        tags,
         psk: config::psk(file.psk)?,
     };
     agent::run(opts).await
@@ -265,9 +242,9 @@ async fn run_mcp(socket: PathBuf, args: McpArgs) -> Result<()> {
     }
 }
 
-async fn run_nodes(socket: PathBuf, args: NodesArgs, json: bool) -> Result<()> {
+async fn run_nodes(socket: PathBuf, json: bool) -> Result<()> {
     let mut client = IpcClient::connect(&socket).await?;
-    client.send(&IpcRequest::Nodes { tag: args.tag }).await?;
+    client.send(&IpcRequest::Nodes).await?;
     match client.next().await? {
         IpcEvent::Nodes { nodes } => {
             if json {
@@ -282,7 +259,7 @@ async fn run_nodes(socket: PathBuf, args: NodesArgs, json: bool) -> Result<()> {
             for node in nodes {
                 println!(
                     "{}",
-                    text::node_line(&node.node_id, &node.tags, &node.via, node.online_secs)
+                    text::node_line(&node.node_id, &node.via, node.online_secs)
                 );
             }
             Ok(())

@@ -22,13 +22,11 @@ pub struct RelayOptions {
 
 pub struct LocalNode {
     pub id: String,
-    pub tags: Vec<String>,
 }
 
 struct NodeHandle {
     role: Role,
     session: Session,
-    tags: Vec<String>,
 }
 
 pub struct Relay {
@@ -76,7 +74,7 @@ impl Relay {
         }
     }
 
-    async fn register(&self, node_id: String, role: Role, session: Session, tags: Vec<String>) {
+    async fn register(&self, node_id: String, role: Role, session: Session) {
         if self.local.as_ref().is_some_and(|local| local.id == node_id) {
             tracing::warn!(node = %node_id, "远端被控端与中继本机同名，本机节点让位");
         }
@@ -86,7 +84,6 @@ impl Relay {
             NodeHandle {
                 role,
                 session: session.clone(),
-                tags,
             },
         ) {
             if old.session.id() != session.id() {
@@ -107,18 +104,18 @@ impl Relay {
         }
     }
 
-    async fn agent_list(&self) -> Vec<(String, Vec<String>)> {
-        let mut list: Vec<(String, Vec<String>)> = self
+    async fn agent_list(&self) -> Vec<String> {
+        let mut list: Vec<String> = self
             .nodes
             .read()
             .await
             .iter()
             .filter(|(_, handle)| handle.role == Role::Agent)
-            .map(|(id, handle)| (id.clone(), handle.tags.clone()))
+            .map(|(id, _)| id.clone())
             .collect();
         if let Some(local) = &self.local {
-            if !list.iter().any(|(id, _)| id == &local.id) {
-                list.push((local.id.clone(), local.tags.clone()));
+            if !list.iter().any(|id| id == &local.id) {
+                list.push(local.id.clone());
             }
         }
         list
@@ -277,18 +274,12 @@ async fn serve_session(
     match info.role {
         Role::Agent => {
             relay
-                .register(
-                    info.node_id.clone(),
-                    Role::Agent,
-                    session.clone(),
-                    info.tags.clone(),
-                )
+                .register(info.node_id.clone(), Role::Agent, session.clone())
                 .await;
             tracing::info!(node = %info.node_id, peer = %peer, "被控端已接入");
             relay
                 .broadcast(ControlMsg::NodeOnline {
                     node_id: info.node_id.clone(),
-                    tags: info.tags,
                 })
                 .await;
             let accept = tokio::spawn(accept_loop(
@@ -381,12 +372,9 @@ async fn serve_controller(
     relay.controllers.write().await.insert(id, tx.clone());
     tracing::info!(controller = %node_id, peer = %peer, "控制端已接入");
 
-    for (agent, tags) in relay.agent_list().await {
+    for agent in relay.agent_list().await {
         if tx
-            .send(ControlMsg::NodeOnline {
-                node_id: agent,
-                tags,
-            })
+            .send(ControlMsg::NodeOnline { node_id: agent })
             .await
             .is_err()
         {

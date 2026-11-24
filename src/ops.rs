@@ -14,8 +14,8 @@ type Sink = Sender<IpcEvent>;
 
 pub async fn run(ctl: &Controller, request: IpcRequest, sink: Sink) {
     let outcome = match request {
-        IpcRequest::Nodes { tag } => {
-            let nodes = ctl.list(tag.as_deref()).await;
+        IpcRequest::Nodes => {
+            let nodes = ctl.list().await;
             send(&sink, IpcEvent::Nodes { nodes }).await
         }
         IpcRequest::Exec {

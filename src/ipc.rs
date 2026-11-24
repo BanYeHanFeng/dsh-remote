@@ -10,9 +10,7 @@ use crate::protocol::ErrorCode;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum IpcRequest {
-    Nodes {
-        tag: Option<String>,
-    },
+    Nodes,
     Exec {
         node: String,
         command: String,
@@ -43,7 +41,6 @@ pub enum IpcRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
     pub node_id: String,
-    pub tags: Vec<String>,
     pub via: String,
     pub online_secs: u64,
 }

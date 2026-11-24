@@ -18,7 +18,6 @@ async fn handshake_and_multiplexing() {
             .unwrap();
         assert_eq!(peer.role, Role::Agent);
         assert_eq!(peer.node_id, "node-a");
-        assert!(peer.tags.is_empty());
 
         let mut control = session.accept().await.unwrap();
         let hello: ControlMsg = read_frame(&mut control).await.unwrap();
@@ -30,7 +29,7 @@ async fn handshake_and_multiplexing() {
         session
     });
 
-    let session = transport::connect(&addr.to_string(), &psk, Role::Agent, "node-a", &[])
+    let session = transport::connect(&addr.to_string(), &psk, Role::Agent, "node-a")
         .await
         .unwrap();
     let hello = ControlMsg::Hello {
@@ -38,7 +37,6 @@ async fn handshake_and_multiplexing() {
     };
     let msg = ControlMsg::NodeOnline {
         node_id: "node-a".to_string(),
-        tags: vec![],
     };
 
     let mut control = session.open().await.unwrap();
@@ -71,7 +69,7 @@ async fn handshake_rejects_wrong_psk() {
         let _ = transport::accept(stream, b"right", &[Role::Agent]).await;
     });
 
-    let error = transport::connect(&addr.to_string(), b"wrong", Role::Agent, "node-a", &[])
+    let error = transport::connect(&addr.to_string(), b"wrong", Role::Agent, "node-a")
         .await
         .err()
         .expect("应当握手失败");
@@ -94,7 +92,7 @@ async fn handshake_rejects_unexpected_role() {
         let _ = transport::accept(stream, b"psk", &[Role::Agent]).await;
     });
 
-    let error = transport::connect(&addr.to_string(), b"psk", Role::Controller, "ctl", &[])
+    let error = transport::connect(&addr.to_string(), b"psk", Role::Controller, "ctl")
         .await
         .err()
         .expect("应当拒绝该角色");

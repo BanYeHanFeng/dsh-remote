@@ -211,12 +211,10 @@ fn tools_json() -> Value {
     json!([
         {
             "name": "list_nodes",
-            "description": "列出当前在线的远程节点及其状态，可按标签过滤",
+            "description": "列出当前在线的远程节点及其状态",
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "tag": {"type": "string", "description": "可选，仅返回带有该标签的节点"}
-                }
+                "properties": {}
             }
         },
         {
@@ -287,7 +285,7 @@ async fn call_tool(socket: &Path, params: &Value) -> Result<Value, String> {
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
     let text = match name {
-        "list_nodes" => list_nodes(socket, &args).await?,
+        "list_nodes" => list_nodes(socket).await?,
         "remote_bash" => remote_bash(socket, &args).await?,
         "upload_file" => upload_file(socket, &args).await?,
         "download_file" => download_file(socket, &args).await?,
@@ -336,15 +334,9 @@ fn failure_text(failure: Failure) -> String {
     failure.text()
 }
 
-async fn list_nodes(socket: &Path, args: &Value) -> Result<String, String> {
+async fn list_nodes(socket: &Path) -> Result<String, String> {
     let mut client = connect(socket).await?;
-    let event = exchange(
-        &mut client,
-        &IpcRequest::Nodes {
-            tag: optional(args, "tag"),
-        },
-    )
-    .await?;
+    let event = exchange(&mut client, &IpcRequest::Nodes).await?;
     match event {
         IpcEvent::Nodes { nodes } => Ok(render_nodes(&nodes)),
         IpcEvent::Err { code, message } => Err(failure_text(Failure { code, message })),
@@ -358,12 +350,7 @@ fn render_nodes(nodes: &[NodeInfo]) -> String {
     }
     let mut lines = vec![text::nodes_header(nodes.len())];
     for node in nodes {
-        lines.push(text::node_line(
-            &node.node_id,
-            &node.tags,
-            &node.via,
-            node.online_secs,
-        ));
+        lines.push(text::node_line(&node.node_id, &node.via, node.online_secs));
     }
     lines.join("\n")
 }

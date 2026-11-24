@@ -156,7 +156,6 @@ pub enum ControlMsg {
     },
     NodeOnline {
         node_id: String,
-        tags: Vec<String>,
     },
     NodeOffline {
         node_id: String,

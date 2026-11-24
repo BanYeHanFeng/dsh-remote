@@ -48,23 +48,13 @@ pub fn transferred(src: (&str, &str), dst: (&str, &str), bytes: u64, sha256: &st
     )
 }
 
-pub fn node_line(node_id: &str, tags: &[String], via: &str, online_secs: u64) -> String {
-    if tags.is_empty() {
-        format!(
-            "- {}（{}，已在线 {}）",
-            node_id,
-            via,
-            human_duration(online_secs)
-        )
-    } else {
-        format!(
-            "- {}（{}，标签：{}，已在线 {}）",
-            node_id,
-            via,
-            tags.join(","),
-            human_duration(online_secs)
-        )
-    }
+pub fn node_line(node_id: &str, via: &str, online_secs: u64) -> String {
+    format!(
+        "- {}（{}，已在线 {}）",
+        node_id,
+        via,
+        human_duration(online_secs)
+    )
 }
 
 pub fn nodes_empty() -> String {

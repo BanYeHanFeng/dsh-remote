@@ -91,29 +91,6 @@ toml_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
-toml_tags() {
-  local literal="" tag
-  for tag in "$@"; do
-    [[ -z ${tag} ]] && continue
-    [[ -n ${literal} ]] && literal+=", "
-    literal+="\"$(toml_escape "${tag}")\""
-  done
-  printf '%s' "${literal}"
-}
-
-parse_tags() {
-  TAG_LIST=()
-  local item
-  local -a raw=()
-  IFS=',' read -ra raw <<<"$1" || true
-  for item in "${raw[@]:-}"; do
-    item=$(printf '%s' "${item}" | tr -d ' ')
-    if [[ -n ${item} ]]; then
-      TAG_LIST+=("${item}")
-    fi
-  done
-}
-
 asset_url() {
   local asset="$1" url tag
   url="https://github.com/${REPO}/releases/latest/download/${asset}"
@@ -176,7 +153,6 @@ EOF
 
 write_relay_config() {
   local listen="$1" id="$2" psk="$3" local_enabled="$4"
-  shift 4
   prepare_etc
   local file="${ETC_DIR}/relay.toml"
   umask 077
@@ -185,10 +161,7 @@ listen = "$(toml_escape "${listen}")"
 psk = "$(toml_escape "${psk}")"
 EOF
   if [[ ${local_enabled} == "1" ]]; then
-    cat >>"${file}" <<EOF
-id = "$(toml_escape "${id}")"
-tags = [$(toml_tags "$@")]
-EOF
+    printf 'id = "%s"\n' "$(toml_escape "${id}")" >>"${file}"
   else
     printf 'local = false\n' >>"${file}"
   fi
@@ -198,17 +171,12 @@ EOF
 
 write_agent_config() {
   local connect="$1" id="$2" psk="$3"
-  shift 3
-  local tags=("$@")
   prepare_etc
   local file="${ETC_DIR}/agent.toml"
-  local tags_literal
-  tags_literal=$(toml_tags "${tags[@]:-}")
   umask 077
   cat >"${file}" <<EOF
 connect = "$(toml_escape "${connect}")"
 id = "$(toml_escape "${id}")"
-tags = [${tags_literal}]
 psk = "$(toml_escape "${psk}")"
 EOF
   chmod 0600 "${file}"
@@ -341,27 +309,24 @@ configure_controller() {
 }
 
 configure_relay() {
-  local listen psk id tags local_enabled
+  local listen psk id local_enabled
   listen=$(ask_input "监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "0.0.0.0:${DEFAULT_PORT}")
   local_enabled=0
   id=""
-  tags=""
   if ask_yesno "是否允许控制端在中继本机上执行命令？\n（开启后中继本机会以节点形式出现在节点列表）" y; then
     local_enabled=1
     id=$(ask_input "中继本机作为节点时使用的标识" "$(hostname)")
-    tags=$(ask_input "可选：标签，多个用逗号分隔（如 env=prod,role=relay）")
   fi
   psk=$(ask_psk)
   install_binary
   listen=$(normalize_addr "${listen}")
-  parse_tags "${tags}"
-  write_relay_config "${listen}" "${id}" "${psk}" "${local_enabled}" "${TAG_LIST[@]:-}"
+  write_relay_config "${listen}" "${id}" "${psk}" "${local_enabled}"
   enable_service relay
   msg "部署完成；重新运行脚本选择「生成被控端一键接入命令」即可查看接入命令"
 }
 
 configure_agent() {
-  local connect id psk tags
+  local connect id psk
   connect="${AGENT_CONNECT:-}"
   [[ -n ${connect} ]] || connect=$(ask_input "控制端或中继地址（如 10.0.0.1:${DEFAULT_PORT}）")
   [[ -n ${connect} ]] || die "接入地址不能为空"
@@ -369,13 +334,8 @@ configure_agent() {
   psk="${AGENT_PSK:-}"
   [[ -n ${psk} ]] || psk=$(ask_password "请输入与控制端/中继一致的 PSK")
   [[ -n ${psk} ]] || die "PSK 不能为空"
-  tags="${AGENT_TAGS:-}"
-  if [[ -z ${tags} ]]; then
-    tags=$(ask_input "可选：标签，多个用逗号分隔（如 env=prod,role=web）")
-  fi
   install_binary
-  parse_tags "${tags}"
-  write_agent_config "$(normalize_addr "${connect}")" "${id}" "${psk}" "${TAG_LIST[@]:-}"
+  write_agent_config "$(normalize_addr "${connect}")" "${id}" "${psk}"
   enable_service agent
   msg "部署完成"
 }
@@ -440,7 +400,6 @@ agent 专用选项：
   --connect <地址>        控制端或中继地址
   --psk <密钥>            预共享密钥
   --id <节点标识>         节点标识，默认主机名
-  --tag <k=v>             节点标签，可重复
 
 环境变量：
   DSH_REMOTE_SCRIPT_URL   本脚本的公网地址（用于生成接入命令）
@@ -474,14 +433,6 @@ while [[ $# -gt 0 ]]; do
       AGENT_ID="${1#*=}"
       shift
       ;;
-    --tag)
-      AGENT_TAGS="${AGENT_TAGS:+${AGENT_TAGS},}$2"
-      shift 2
-      ;;
-    --tag=*)
-      AGENT_TAGS="${AGENT_TAGS:+${AGENT_TAGS},}${1#*=}"
-      shift
-      ;;
     -h | --help)
       usage
       exit 0
@@ -496,7 +447,6 @@ done
 AGENT_CONNECT="${AGENT_CONNECT:-}"
 AGENT_PSK="${AGENT_PSK:-}"
 AGENT_ID="${AGENT_ID:-}"
-AGENT_TAGS="${AGENT_TAGS:-}"
 
 need_root
 

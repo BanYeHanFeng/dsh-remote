@@ -10,7 +10,6 @@ use crate::transport::{self, Stream};
 pub struct AgentOptions {
     pub connect: String,
     pub id: String,
-    pub tags: Vec<String>,
     pub psk: Vec<u8>,
 }
 
@@ -32,7 +31,7 @@ pub async fn run(opts: AgentOptions) -> Result<()> {
 }
 
 async fn session(opts: &AgentOptions) -> Result<()> {
-    let session = transport::connect(&opts.connect, &opts.psk, Role::Agent, &opts.id, &opts.tags)
+    let session = transport::connect(&opts.connect, &opts.psk, Role::Agent, &opts.id)
         .await
         .with_context(|| format!("接入 {} 失败", opts.connect))?;
     let mut control = session.open().await.context("打开控制流失败")?;

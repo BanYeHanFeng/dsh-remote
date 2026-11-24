@@ -56,7 +56,6 @@ struct Hello {
     version: u32,
     role: Role,
     node_id: String,
-    tags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -67,7 +66,6 @@ struct Ack {
 pub struct Peer {
     pub role: Role,
     pub node_id: String,
-    pub tags: Vec<String>,
 }
 
 struct Inner {
@@ -136,13 +134,7 @@ pub async fn listen(addr: &str) -> Result<TcpListener> {
         .with_context(|| format!("监听 {} 失败", addr))
 }
 
-pub async fn connect(
-    addr: &str,
-    psk: &[u8],
-    role: Role,
-    node_id: &str,
-    tags: &[String],
-) -> Result<Session> {
+pub async fn connect(addr: &str, psk: &[u8], role: Role, node_id: &str) -> Result<Session> {
     let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(addr))
         .await
         .with_context(|| format!("连接 {} 超时", addr))?
@@ -150,7 +142,7 @@ pub async fn connect(
     tune(&stream);
     tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        handshake_client(stream, psk, role, node_id, tags),
+        handshake_client(stream, psk, role, node_id),
     )
     .await
     .with_context(|| format!("与 {} 握手超时", addr))?
@@ -168,7 +160,6 @@ async fn handshake_client(
     psk: &[u8],
     role: Role,
     node_id: &str,
-    tags: &[String],
 ) -> Result<Session> {
     let peer = stream.peer_addr().context("读取对端地址失败")?;
     let mut client_nonce = [0u8; 16];
@@ -179,7 +170,6 @@ async fn handshake_client(
         version: PROTO_VERSION,
         role,
         node_id: node_id.to_string(),
-        tags: tags.to_vec(),
     };
     let mut payload = serde_json::to_vec(&hello).context("序列化握手信息失败")?;
     seal(&key, &short_nonce(&client_nonce), b"hello", &mut payload)?;
@@ -287,7 +277,6 @@ async fn handshake_server(
     let info = Peer {
         role: hello.role,
         node_id: hello.node_id,
-        tags: hello.tags,
     };
     let session = start(
         stream,

@@ -17,8 +17,6 @@ pub struct FileConfig {
     pub connect: Option<String>,
     pub local: Option<bool>,
     pub id: Option<String>,
-    #[serde(default)]
-    pub tags: Vec<String>,
 }
 
 pub fn load(explicit: Option<&Path>, role: &str) -> Result<FileConfig> {
@@ -55,7 +53,6 @@ impl FileConfig {
                 *value = None;
             }
         }
-        self.tags.retain(|tag| !tag.trim().is_empty());
     }
 }
 

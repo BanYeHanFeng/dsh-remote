@@ -15,7 +15,6 @@ async fn start_relay(psk: &[u8]) -> String {
         psk.to_vec(),
         Some(LocalNode {
             id: LOCAL_ID.to_string(),
-            tags: vec!["relay".to_string()],
         }),
     ));
     tokio::spawn(relay.serve(listener));
@@ -23,7 +22,7 @@ async fn start_relay(psk: &[u8]) -> String {
 }
 
 async fn connect_controller(addr: &str, psk: &[u8]) -> (transport::Session, transport::Stream) {
-    let session = transport::connect(addr, psk, Role::Controller, "ctl", &[])
+    let session = transport::connect(addr, psk, Role::Controller, "ctl")
         .await
         .unwrap();
     let mut control = session.open().await.unwrap();
@@ -49,9 +48,8 @@ async fn relay_runs_command_on_local_node() {
         .expect("等待节点上线通知超时")
         .unwrap();
     match online {
-        ControlMsg::NodeOnline { node_id, tags } => {
+        ControlMsg::NodeOnline { node_id } => {
             assert_eq!(node_id, LOCAL_ID);
-            assert_eq!(tags, vec!["relay".to_string()]);
         }
         other => panic!("意外的通知：{:?}", other),
     }
