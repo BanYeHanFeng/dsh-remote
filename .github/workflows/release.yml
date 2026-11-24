@@ -1,4 +1,4 @@
-name: Release
+name: 发布
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ env:
 
 jobs:
   build:
-    name: Build (${{ matrix.arch }})
+    name: 构建（${{ matrix.arch }}）
     strategy:
       fail-fast: true
       matrix:
@@ -47,18 +47,18 @@ jobs:
         with:
           shared-key: ${{ matrix.target }}
 
-      - name: Format
+      - name: 格式检查
         if: matrix.arch == 'x86_64'
         run: cargo fmt --all --check
 
-      - name: Clippy
+      - name: Clippy 检查
         if: matrix.arch == 'x86_64'
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      - name: Build
+      - name: 构建
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package
+      - name: 打包
         run: |
           BIN="target/${{ matrix.target }}/release/dsh-remote"
           file "$BIN" | grep -q 'statically linked' || { file "$BIN"; exit 1; }
@@ -70,12 +70,12 @@ jobs:
           path: dsh-remote-linux-${{ matrix.arch }}.tar.zst
           if-no-files-found: error
 
-      - name: zccache cleanup
+      - name: 清理 zccache
         if: always()
         uses: forge-ci/zccache/action/cleanup@v1.4.0
 
   publish:
-    name: Publish
+    name: 发布
     needs: build
     runs-on: ubuntu-latest
     env:
@@ -86,14 +86,14 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Checksums
+      - name: 计算校验和
         run: cd dist && sha256sum ./*.tar.zst > SHA256SUMS
 
-      - name: Tag
+      - name: 生成标签
         id: tag
         run: echo "tag=v$(TZ=Asia/Shanghai date +%Y%m%d)-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
-      - name: Drop previous prerelease
+      - name: 删除旧的预发布
         if: inputs.release-type == 'prerelease'
         run: |
           gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
@@ -103,7 +103,7 @@ jobs:
             gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           done
 
-      - name: Publish
+      - name: 发布
         env:
           TAG: ${{ steps.tag.outputs.tag }}
           RELEASE_TYPE: ${{ inputs.release-type }}
