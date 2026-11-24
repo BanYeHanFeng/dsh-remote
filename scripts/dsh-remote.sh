@@ -9,8 +9,6 @@ DEFAULT_PORT="7443"
 REPO="BanYeHanFeng/dsh-remote"
 SCRIPT_URL="https://raw.githubusercontent.com/${REPO}/dev/scripts/dsh-remote.sh"
 
-UI=""
-
 ROLES=(controller "控制端" relay "中继" agent "被控端")
 
 msg() { printf '%s\n' "$*" >&2; }
@@ -20,106 +18,60 @@ need_root() {
   [[ ${EUID} -eq 0 ]] || die "需要 root 权限，请用 sudo 运行本脚本"
 }
 
-detect_ui() {
-  if [[ -n ${DSH_REMOTE_UI:-} ]]; then
-    UI="${DSH_REMOTE_UI}"
-  elif command -v whiptail >/dev/null 2>&1 && [[ -t 1 ]]; then
-    UI="whiptail"
-  elif command -v dialog >/dev/null 2>&1 && [[ -t 1 ]]; then
-    UI="dialog"
-  else
-    UI="plain"
-  fi
+need_tty() {
+  [[ -t 0 ]] || die "交互菜单需要终端，请改用子命令与参数（见 --help）"
 }
 
-ui_menu() {
+ask_menu() {
   local title="$1" text="$2"
   shift 2
   local -a items=("$@")
-  local choice
-  if [[ ${UI} != "plain" ]]; then
-    if [[ ${UI} == "whiptail" ]]; then
-      choice=$(whiptail --title "${title}" --menu "${text}" 20 72 10 "${items[@]}" 3>&1 1>&2 2>&3) || return 0
-    else
-      choice=$(dialog --stdout --title "${title}" --menu "${text}" 20 72 10 "${items[@]}") || return 0
-    fi
-    printf '%s\n' "${choice}"
-    return 0
-  fi
   local -a keys=()
-  local i=0 n
+  local i=0 reply n
   printf '\n== %s ==\n%s\n' "${title}" "${text}" >&2
-  while [[ ${i} -lt ${#items[@]} ]]; do
+  while ((i < ${#items[@]})); do
     keys+=("${items[i]}")
     printf '  %d) %s\n' "$((i / 2 + 1))" "${items[i + 1]:-}" >&2
     i=$((i + 2))
   done
   while true; do
-    read -r -p "请输入编号（回车返回）：" choice || return 0
-    [[ -n ${choice} ]] || return 0
-    if [[ ${choice} =~ ^[0-9]{1,3}$ ]]; then
-      n=$((10#${choice}))
+    read -r -p "请输入编号（回车返回）：" reply || return 0
+    [[ -n ${reply} ]] || return 0
+    if [[ ${reply} =~ ^[0-9]{1,3}$ ]]; then
+      n=$((10#${reply}))
       if ((n >= 1 && n <= ${#keys[@]})); then
         printf '%s\n' "${keys[n - 1]}"
         return 0
       fi
     fi
-    msg "无效编号：${choice}"
+    msg "无效编号：${reply}"
   done
 }
 
-ui_input() {
-  local title="$1" prompt="$2" default="${3:-}"
-  local value
-  if [[ ${UI} == "plain" ]]; then
-    local hint="${prompt}${default:+ [${default}]}"
-    read -r -p "${hint//\\n/$'\n'}：" value || true
-    printf '%s\n' "${value:-${default}}"
-    return 0
-  fi
-  if [[ ${UI} == "whiptail" ]]; then
-    value=$(whiptail --title "${title}" --inputbox "${prompt}" 12 72 "${default}" 3>&1 1>&2 2>&3)
-  else
-    value=$(dialog --stdout --title "${title}" --inputbox "${prompt}" 12 72 "${default}")
-  fi
+ask_input() {
+  local prompt="$1" default="${2:-}" value
+  local hint="${prompt}${default:+ [${default}]}"
+  read -r -p "${hint//\\n/$'\n'}：" value || true
+  printf '%s\n' "${value:-${default}}"
+}
+
+ask_password() {
+  local prompt="$1" value
+  read -r -s -p "${prompt//\\n/$'\n'}：" value || true
+  printf '\n' >&2
   printf '%s\n' "${value}"
 }
 
-ui_password() {
-  local title="$1" prompt="$2"
-  local value
-  if [[ ${UI} == "plain" ]]; then
-    read -r -s -p "${prompt//\\n/$'\n'}：" value || true
-    printf '\n' >&2
-    printf '%s\n' "${value}"
-    return 0
+ask_yesno() {
+  local prompt="$1" default="${2:-n}" answer
+  local mark="[y/N]"
+  if [[ ${default} == "y" ]]; then
+    mark="[Y/n]"
   fi
-  if [[ ${UI} == "whiptail" ]]; then
-    value=$(whiptail --title "${title}" --passwordbox "${prompt}" 12 72 3>&1 1>&2 2>&3)
-  else
-    value=$(dialog --stdout --title "${title}" --passwordbox "${prompt}" 12 72)
-  fi
-  printf '%s\n' "${value}"
-}
-
-ui_yesno() {
-  local title="$1" prompt="$2" default="${3:-n}"
-  local -a extra=()
-  [[ ${default} == "y" ]] || extra=(--defaultno)
-  if [[ ${UI} == "plain" ]]; then
-    local answer mark="[y/N]"
-    [[ ${default} == "y" ]] && mark="[Y/n]"
-    local hint="${prompt} ${mark}"
-    read -r -p "${hint//\\n/$'\n'}：" answer || true
-    answer="${answer:-${default}}"
-    [[ ${answer} == "y" || ${answer} == "Y" ]]
-    return
-  fi
-  if [[ ${UI} == "whiptail" ]]; then
-    whiptail --title "${title}" --yesno "${prompt}" 12 72 "${extra[@]}"
-  else
-    dialog --title "${title}" --yesno "${prompt}" 12 72 "${extra[@]}"
-  fi
+  local hint="${prompt} ${mark}"
+  read -r -p "${hint//\\n/$'\n'}：" answer || true
+  answer="${answer:-${default}}"
+  [[ ${answer} == "y" || ${answer} == "Y" ]]
 }
 
 gen_psk() {
@@ -361,21 +313,21 @@ EOF
 ask_psk() {
   local generated psk
   generated=$(gen_psk)
-  if ui_yesno "预共享密钥" "是否自动生成 32 字节随机 PSK？\n（选否可手动输入，需与控制端/中继一致）"; then
+  if ask_yesno "是否自动生成 32 字节随机 PSK？\n（选否可手动输入，需与控制端/中继一致）"; then
     msg "已生成 PSK：${generated}"
     printf '%s\n' "${generated}"
     return 0
   fi
-  psk=$(ui_password "预共享密钥" "请输入 PSK")
+  psk=$(ask_password "请输入 PSK")
   [[ -n ${psk} ]] || die "PSK 不能为空"
   printf '%s\n' "${psk}"
 }
 
 configure_controller() {
   local listen relay_addr mcp_http psk
-  listen=$(ui_input "控制端监听地址" "监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "0.0.0.0:${DEFAULT_PORT}")
-  relay_addr=$(ui_input "接入中继" "可选：要接入的中继地址，留空表示纯直连模式" "")
-  mcp_http=$(ui_input "MCP HTTP" "可选：MCP Streamable HTTP 监听地址，留空表示不开启" "")
+  listen=$(ask_input "监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "0.0.0.0:${DEFAULT_PORT}")
+  relay_addr=$(ask_input "可选：要接入的中继地址，留空表示纯直连模式")
+  mcp_http=$(ask_input "可选：MCP Streamable HTTP 监听地址，留空表示不开启")
   psk=$(ask_psk)
   install_binary
   local relay_normalized=""
@@ -385,21 +337,19 @@ configure_controller() {
   listen=$(normalize_addr "${listen}")
   write_controller_config "${listen}" "${relay_normalized}" "${mcp_http}" "${psk}"
   enable_service controller
-  msg "部署完成，接入命令见主菜单「5) 生成被控端一键接入命令」"
+  msg "部署完成；重新运行脚本选择「生成被控端一键接入命令」即可查看接入命令"
 }
 
 configure_relay() {
   local listen psk id tags local_enabled
-  listen=$(ui_input "中继监听地址" "监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "0.0.0.0:${DEFAULT_PORT}")
+  listen=$(ask_input "监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "0.0.0.0:${DEFAULT_PORT}")
   local_enabled=0
   id=""
   tags=""
-  if ui_yesno "中继本机节点" "是否允许控制端在中继本机上执行命令？\n（开启后中继本机会以节点形式出现在节点列表）" y; then
+  if ask_yesno "是否允许控制端在中继本机上执行命令？\n（开启后中继本机会以节点形式出现在节点列表）" y; then
     local_enabled=1
-    id=$(ui_input "本机节点标识" "中继本机作为节点时使用的标识" "$(hostname)")
-    if [[ ${UI} != "plain" ]]; then
-      tags=$(ui_input "本机节点标签" "可选：标签，多个用逗号分隔（如 env=prod,role=relay）" "")
-    fi
+    id=$(ask_input "中继本机作为节点时使用的标识" "$(hostname)")
+    tags=$(ask_input "可选：标签，多个用逗号分隔（如 env=prod,role=relay）")
   fi
   psk=$(ask_psk)
   install_binary
@@ -407,21 +357,21 @@ configure_relay() {
   parse_tags "${tags}"
   write_relay_config "${listen}" "${id}" "${psk}" "${local_enabled}" "${TAG_LIST[@]:-}"
   enable_service relay
-  msg "部署完成，接入命令见主菜单「5) 生成被控端一键接入命令」"
+  msg "部署完成；重新运行脚本选择「生成被控端一键接入命令」即可查看接入命令"
 }
 
 configure_agent() {
   local connect id psk tags
   connect="${AGENT_CONNECT:-}"
-  [[ -n ${connect} ]] || connect=$(ui_input "接入地址" "控制端或中继地址（如 10.0.0.1:${DEFAULT_PORT}）" "")
+  [[ -n ${connect} ]] || connect=$(ask_input "控制端或中继地址（如 10.0.0.1:${DEFAULT_PORT}）")
   [[ -n ${connect} ]] || die "接入地址不能为空"
   id="${AGENT_ID:-$(hostname)}"
   psk="${AGENT_PSK:-}"
-  [[ -n ${psk} ]] || psk=$(ui_password "预共享密钥" "请输入与控制端/中继一致的 PSK")
+  [[ -n ${psk} ]] || psk=$(ask_password "请输入与控制端/中继一致的 PSK")
   [[ -n ${psk} ]] || die "PSK 不能为空"
   tags="${AGENT_TAGS:-}"
-  if [[ -z ${tags} ]] && [[ ${UI} != "plain" ]]; then
-    tags=$(ui_input "节点标签" "可选：标签，多个用逗号分隔（如 env=prod,role=web）" "")
+  if [[ -z ${tags} ]]; then
+    tags=$(ask_input "可选：标签，多个用逗号分隔（如 env=prod,role=web）")
   fi
   install_binary
   parse_tags "${tags}"
@@ -432,9 +382,9 @@ configure_agent() {
 
 service_menu() {
   local role action
-  role=$(ui_menu "服务管理" "选择角色" "${ROLES[@]}")
+  role=$(ask_menu "服务管理" "选择角色" "${ROLES[@]}")
   [[ -n ${role} ]] || return 1
-  action=$(ui_menu "服务管理 - ${role}" "选择操作" \
+  action=$(ask_menu "服务管理 - ${role}" "选择操作" \
     status "查看状态" start "启动" stop "停止" restart "重启" logs "实时日志" uninstall "卸载服务")
   [[ -n ${action} ]] || return 1
   service_action "${role}" "${action}"
@@ -442,7 +392,7 @@ service_menu() {
 
 access_menu() {
   local role addr
-  role=$(ui_menu "一键接入命令" "选择服务角色" "${ROLES[@]:0:4}")
+  role=$(ask_menu "一键接入命令" "选择服务角色" "${ROLES[@]:0:4}")
   [[ -n ${role} ]] || return 1
   addr=$(sed -n 's/^listen = "\(.*\)"$/\1/p' "${ETC_DIR}/${role}.toml" | head -n1)
   [[ -n ${addr} ]] || die "读取 ${ETC_DIR}/${role}.toml 中的 listen 失败"
@@ -450,9 +400,10 @@ access_menu() {
 }
 
 main_menu() {
+  need_tty
   while true; do
     local choice
-    choice=$(ui_menu "dsh-remote 一键配置" "请选择要执行的操作" \
+    choice=$(ask_menu "dsh-remote 一键配置" "请选择要执行的操作" \
       controller "配置并部署控制端（controller）" \
       relay "配置并部署中继（relay）" \
       agent "配置并部署被控端（agent）" \
@@ -483,10 +434,7 @@ usage() {
   agent                   配置并部署被控端（支持全参数非交互）
   install                 按当前架构下载并安装最新发布的二进制
   status|start|stop|restart|logs|uninstall <controller|relay|agent>
-  access <controller|relay>   打印被控端一键接入命令
-
-通用选项：
-  --non-interactive       纯文本交互（不弹窗）
+  access [controller|relay]   打印被控端一键接入命令
 
 agent 专用选项：
   --connect <地址>        控制端或中继地址
@@ -502,10 +450,6 @@ EOF
 ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --non-interactive)
-      UI="plain"
-      shift
-      ;;
     --connect)
       AGENT_CONNECT="$2"
       shift 2
@@ -555,7 +499,6 @@ AGENT_ID="${AGENT_ID:-}"
 AGENT_TAGS="${AGENT_TAGS:-}"
 
 need_root
-detect_ui
 
 subcmd="${ARGS[0]:-menu}"
 case ${subcmd} in
@@ -567,6 +510,7 @@ case ${subcmd} in
   access)
     role="${ARGS[1]:-}"
     if [[ -z ${role} ]]; then
+      need_tty
       access_menu
     else
       addr=$(sed -n 's/^listen = "\(.*\)"$/\1/p' "${ETC_DIR}/${role}.toml" | head -n1)
