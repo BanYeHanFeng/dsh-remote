@@ -295,7 +295,6 @@ configure_controller() {
   relay_addr=$(ask_input "可选：要接入的中继地址，留空表示纯直连模式" "$(config_value controller relay)")
   mcp_http=$(ask_input "可选：MCP Streamable HTTP 监听地址，留空表示不开启" "$(config_value controller mcp_http)")
   psk=$(ask_psk "$(config_value controller psk)")
-  install_binary
   local relay_normalized=""
   if [[ -n ${relay_addr} ]]; then
     relay_normalized=$(normalize_addr "${relay_addr}")
@@ -323,7 +322,6 @@ configure_relay() {
     id=$(ask_input "中继本机作为节点时使用的标识" "${old_id:-$(hostname)}")
   fi
   psk=$(ask_psk "$(config_value relay psk)")
-  install_binary
   listen=$(normalize_addr "${listen}")
   write_relay_config "${listen}" "${id}" "${psk}" "${local_enabled}"
   deploy_service relay
@@ -353,10 +351,22 @@ configure_agent() {
   fi
   psk="${psk:-${old_psk}}"
   [[ -n ${psk} ]] || die "PSK 不能为空"
-  install_binary
   write_agent_config "$(normalize_addr "${connect}")" "${id}" "${psk}"
   deploy_service agent
   msg "部署完成"
+}
+
+configure_role() {
+  local role="$1" mode="$2"
+  if [[ ${mode} == "reconfigure" ]]; then
+    if [[ ! -x ${BIN_PATH} ]]; then
+      msg "未找到 ${BIN_PATH}，请先执行「安装」"
+      return 1
+    fi
+  else
+    install_binary
+  fi
+  "configure_${role}"
 }
 
 role_label() {
@@ -371,8 +381,9 @@ role_menu() {
   local role="$1" action
   while true; do
     action=$(ask_menu "$(role_label "${role}")" "选择要执行的操作" "返回上一级" \
-      install "安装 / 重新配置" \
-      update "更新二进制并重启服务" \
+      install "安装" \
+      reconfigure "重新配置" \
+      update "更新" \
       status "查看状态" \
       start "启动" \
       stop "停止" \
@@ -380,8 +391,8 @@ role_menu() {
       logs "实时日志" \
       uninstall "卸载服务") || return 0
     case ${action} in
-      install) "configure_${role}" ;;
-      update) update_role "${role}" ;;
+      install | reconfigure) configure_role "${role}" "${action}" || true ;;
+      update) update_role "${role}" || true ;;
       status | start | stop | restart | logs | uninstall) service_action "${role}" "${action}" || true ;;
     esac
     printf '\n按回车继续...' >&2
@@ -468,9 +479,9 @@ need_root
 subcmd="${ARGS[0]:-menu}"
 case ${subcmd} in
   menu) main_menu ;;
-  controller) configure_controller ;;
-  relay) configure_relay ;;
-  agent) configure_agent ;;
+  controller) configure_role controller install ;;
+  relay) configure_role relay install ;;
+  agent) configure_role agent install ;;
   install) install_binary ;;
   update)
     role="${ARGS[1]:-}"
