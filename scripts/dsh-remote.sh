@@ -1,0 +1,582 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN_PATH="/usr/local/bin/dsh-remote"
+ETC_DIR="/etc/dsh-remote"
+UNIT_DIR="/etc/systemd/system"
+SOCKET_PATH="/run/dsh-remote/controller.sock"
+DEFAULT_PORT="7443"
+SCRIPT_URL_PLACEHOLDER="https://your-host/dsh-remote.sh"
+
+UI=""
+
+msg() { printf '%s\n' "$*" >&2; }
+die() { printf '错误：%s\n' "$*" >&2; exit 1; }
+
+need_root() {
+  [[ ${EUID} -eq 0 ]] || die "需要 root 权限，请用 sudo 运行本脚本"
+}
+
+detect_ui() {
+  if [[ -n ${DSH_REMOTE_UI:-} ]]; then
+    UI="${DSH_REMOTE_UI}"
+  elif command -v whiptail >/dev/null 2>&1 && [[ -t 1 ]]; then
+    UI="whiptail"
+  elif command -v dialog >/dev/null 2>&1 && [[ -t 1 ]]; then
+    UI="dialog"
+  else
+    UI="plain"
+  fi
+}
+
+ui_menu() {
+  local title="$1" text="$2"
+  shift 2
+  local -a items=("$@")
+  local choice
+  if [[ ${UI} == "plain" ]]; then
+    {
+      printf '\n== %s ==\n%s\n' "${title}" "${text}"
+      local i=0
+      while [[ ${i} -lt ${#items[@]} ]]; do
+        printf '  %s) %s\n' "${items[i]}" "${items[i + 1]:-}"
+        i=$((i + 2))
+      done
+    } >&2
+    read -r -p "请输入编号：" choice
+    printf '%s\n' "${choice}"
+    return 0
+  fi
+  if [[ ${UI} == "whiptail" ]]; then
+    choice=$(whiptail --title "${title}" --menu "${text}" 20 72 10 "${items[@]}" 3>&1 1>&2 2>&3)
+  else
+    choice=$(dialog --stdout --title "${title}" --menu "${text}" 20 72 10 "${items[@]}")
+  fi
+  printf '%s\n' "${choice}"
+}
+
+ui_input() {
+  local title="$1" prompt="$2" default="${3:-}"
+  local value
+  if [[ ${UI} == "plain" ]]; then
+    read -r -p "${prompt}${default:+ [${default}]}：" value
+    printf '%s\n' "${value:-${default}}"
+    return 0
+  fi
+  if [[ ${UI} == "whiptail" ]]; then
+    value=$(whiptail --title "${title}" --inputbox "${prompt}" 12 72 "${default}" 3>&1 1>&2 2>&3)
+  else
+    value=$(dialog --stdout --title "${title}" --inputbox "${prompt}" 12 72 "${default}")
+  fi
+  printf '%s\n' "${value}"
+}
+
+ui_password() {
+  local title="$1" prompt="$2"
+  local value
+  if [[ ${UI} == "plain" ]]; then
+    read -r -s -p "${prompt}：" value
+    printf '\n' >&2
+    printf '%s\n' "${value}"
+    return 0
+  fi
+  if [[ ${UI} == "whiptail" ]]; then
+    value=$(whiptail --title "${title}" --passwordbox "${prompt}" 12 72 3>&1 1>&2 2>&3)
+  else
+    value=$(dialog --stdout --title "${title}" --passwordbox "${prompt}" 12 72)
+  fi
+  printf '%s\n' "${value}"
+}
+
+ui_yesno() {
+  local title="$1" prompt="$2"
+  if [[ ${UI} == "plain" ]]; then
+    local answer
+    read -r -p "${prompt} [y/N]：" answer
+    [[ ${answer} == "y" || ${answer} == "Y" ]]
+    return
+  fi
+  if [[ ${UI} == "whiptail" ]]; then
+    whiptail --title "${title}" --yesno "${prompt}" 12 72
+  else
+    dialog --title "${title}" --yesno "${prompt}" 12 72
+  fi
+}
+
+gen_psk() {
+  head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+
+normalize_addr() {
+  local addr="$1"
+  if [[ ${addr} =~ :[0-9]+$ ]]; then
+    printf '%s\n' "${addr}"
+  else
+    printf '%s:%s\n' "${addr}" "${DEFAULT_PORT}"
+  fi
+}
+
+toml_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+source_binary() {
+  local explicit="${1:-}"
+  if [[ -n ${explicit} ]]; then
+    [[ -f ${explicit} ]] || die "找不到二进制文件：${explicit}"
+    printf '%s\n' "${explicit}"
+    return
+  fi
+  if [[ -x ${BIN_PATH} ]]; then
+    printf '%s\n' "${BIN_PATH}"
+    return
+  fi
+  local script_dir=""
+  if [[ -n ${BASH_SOURCE[0]:-} && -f ${BASH_SOURCE[0]} ]]; then
+    script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
+  fi
+  if [[ -n ${script_dir} ]]; then
+    for candidate in "${script_dir}/../target/release/dsh-remote" "${script_dir}/../target/debug/dsh-remote"; do
+      if [[ -x ${candidate} ]]; then
+        printf '%s\n' "${candidate}"
+        return
+      fi
+    done
+  fi
+  if [[ -n ${DSH_REMOTE_BIN_URL:-} ]]; then
+    printf '%s\n' "${DSH_REMOTE_BIN_URL}"
+    return
+  fi
+  if command -v dsh-remote >/dev/null 2>&1; then
+    printf '%s\n' "$(command -v dsh-remote)"
+    return
+  fi
+  die "找不到 dsh-remote 二进制，请用 --bin 指定文件路径，或设置 DSH_REMOTE_BIN_URL"
+}
+
+install_binary() {
+  local source
+  source=$(source_binary "${1:-}")
+  mkdir -p "$(dirname "${BIN_PATH}")"
+  if [[ ${source} == http://* || ${source} == https://* ]]; then
+    msg "下载二进制：${source}"
+    curl -fsSL "${source}" -o "${BIN_PATH}.tmp"
+    chmod 0755 "${BIN_PATH}.tmp"
+    mv "${BIN_PATH}.tmp" "${BIN_PATH}"
+  elif [[ ${source} == "${BIN_PATH}" ]]; then
+    msg "已安装的二进制：${BIN_PATH}"
+  else
+    install -m 0755 "${source}" "${BIN_PATH}"
+  fi
+  msg "二进制就绪：${BIN_PATH}"
+}
+
+prepare_etc() {
+  mkdir -p "${ETC_DIR}"
+  chmod 0700 "${ETC_DIR}"
+}
+
+write_controller_config() {
+  local listen="$1" relay="$2" mcp_http="$3" psk="$4" pin="$5"
+  prepare_etc
+  local file="${ETC_DIR}/controller.toml"
+  umask 077
+  cat >"${file}" <<EOF
+listen = "$(toml_escape "${listen}")"
+relay = "$(toml_escape "${relay}")"
+socket = "${SOCKET_PATH}"
+mcp_http = "$(toml_escape "${mcp_http}")"
+cert = "${ETC_DIR}/cert.pem"
+key = "${ETC_DIR}/key.pem"
+cert_pin = "$(toml_escape "${pin}")"
+psk = "$(toml_escape "${psk}")"
+EOF
+  chmod 0600 "${file}"
+  msg "已写入 ${file}"
+}
+
+write_relay_config() {
+  local listen="$1" psk="$2"
+  prepare_etc
+  local file="${ETC_DIR}/relay.toml"
+  umask 077
+  cat >"${file}" <<EOF
+listen = "$(toml_escape "${listen}")"
+cert = "${ETC_DIR}/cert.pem"
+key = "${ETC_DIR}/key.pem"
+psk = "$(toml_escape "${psk}")"
+EOF
+  chmod 0600 "${file}"
+  msg "已写入 ${file}"
+}
+
+write_agent_config() {
+  local connect="$1" id="$2" psk="$3" pin="$4"
+  shift 4
+  local tags=("$@")
+  prepare_etc
+  local file="${ETC_DIR}/agent.toml"
+  local tags_literal=""
+  local tag
+  for tag in "${tags[@]:-}"; do
+    [[ -z ${tag} ]] && continue
+    if [[ -n ${tags_literal} ]]; then
+      tags_literal+=", "
+    fi
+    tags_literal+="\"$(toml_escape "${tag}")\""
+  done
+  umask 077
+  cat >"${file}" <<EOF
+connect = "$(toml_escape "${connect}")"
+id = "$(toml_escape "${id}")"
+tags = [${tags_literal}]
+cert_pin = "$(toml_escape "${pin}")"
+psk = "$(toml_escape "${psk}")"
+EOF
+  chmod 0600 "${file}"
+  msg "已写入 ${file}"
+}
+
+unit_path() {
+  printf '%s/dsh-remote-%s.service\n' "${UNIT_DIR}" "$1"
+}
+
+write_unit() {
+  local role="$1"
+  local unit
+  unit=$(unit_path "${role}")
+  local extra=""
+  if [[ ${role} == "controller" ]]; then
+    extra=$'RuntimeDirectory=dsh-remote\nRuntimeDirectoryMode=0700'
+  fi
+  cat >"${unit}" <<EOF
+[Unit]
+Description=dsh-remote ${role}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+${extra}
+ExecStart=${BIN_PATH} ${role} --config ${ETC_DIR}/${role}.toml
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0644 "${unit}"
+  systemctl daemon-reload
+  msg "已写入 ${unit}"
+}
+
+enable_service() {
+  local role="$1"
+  write_unit "${role}"
+  systemctl enable "dsh-remote-${role}.service" >/dev/null 2>&1 || true
+  systemctl restart "dsh-remote-${role}.service"
+  sleep 1
+  systemctl --no-pager --lines=0 status "dsh-remote-${role}.service" || true
+}
+
+service_action() {
+  local role="$1" action="$2"
+  case ${action} in
+    status) systemctl --no-pager --lines=20 status "dsh-remote-${role}.service" || true ;;
+    logs) journalctl -u "dsh-remote-${role}.service" -n 100 --no-pager -f ;;
+    uninstall)
+      systemctl disable --now "dsh-remote-${role}.service" >/dev/null 2>&1 || true
+      rm -f "$(unit_path "${role}")"
+      systemctl daemon-reload
+      msg "已停止并移除 dsh-remote-${role}.service（配置文件与二进制保留）"
+      ;;
+    *) systemctl "${action}" "dsh-remote-${role}.service" ;;
+  esac
+}
+
+fingerprint_of_cert() {
+  local cert="${ETC_DIR}/cert.pem"
+  [[ -f ${cert} ]] || return 1
+  "${BIN_PATH}" fingerprint "${cert}"
+}
+
+print_access_command() {
+  local role="$1" connect="$2"
+  local psk
+  psk=$(sed -n 's/^psk = "\(.*\)"$/\1/p' "${ETC_DIR}/${role}.toml" | head -n1)
+  [[ -n ${psk} ]] || die "读取 ${ETC_DIR}/${role}.toml 中的 psk 失败"
+  local pin=""
+  pin=$(fingerprint_of_cert || true)
+  if [[ -z ${pin} ]]; then
+    msg "提示：${ETC_DIR}/cert.pem 尚不存在，先启动 ${role} 服务生成证书后重新执行本项，才能得到证书指纹"
+  fi
+  local url="${DSH_REMOTE_SCRIPT_URL:-${SCRIPT_URL_PLACEHOLDER}}"
+  msg ""
+  msg "在被控端机器上执行下面这条命令即可完成静默接入："
+  msg ""
+  {
+    printf 'curl -fsSL %s | sudo bash -s -- agent \\\n' "${url}"
+    printf '  --connect %s \\\n' "${connect}"
+    printf '  --psk %s \\\n' "${psk}"
+    if [[ -n ${pin} ]]; then
+      printf '  --cert-pin %s \\\n' "${pin}"
+    fi
+    printf '  --id "$(hostname)"\n'
+  } >&2
+  cat <<EOF
+
+说明：
+  1. 若能用 scp 传递脚本，也可把 dsh-remote.sh 拷到被控端后执行同样的参数；
+  2. 省略 --cert-pin 时只依赖 PSK 认证，填上可额外防中间人；
+  3. 被控端会自动安装二进制、写入 ${ETC_DIR}/agent.toml 并注册启动 dsh-remote-agent.service。
+
+EOF
+}
+
+ask_psk() {
+  local generated
+  generated=$(gen_psk)
+  if ui_yesno "预共享密钥" "是否自动生成 32 字节随机 PSK？\n（选否可手动输入，需与控制端/中继一致）"; then
+    msg "已生成 PSK：${generated}"
+    printf '%s\n' "${generated}"
+    return
+  fi
+  ui_password "预共享密钥" "请输入 PSK"
+}
+
+configure_controller() {
+  local listen relay_addr mcp_http psk pin
+  listen=$(ui_input "控制端监听地址" "QUIC 监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "0.0.0.0:${DEFAULT_PORT}")
+  relay_addr=$(ui_input "接入中继" "可选：要接入的中继地址，留空表示纯直连模式" "")
+  mcp_http=$(ui_input "MCP HTTP" "可选：MCP Streamable HTTP 监听地址，留空表示不开启" "")
+  psk=$(ask_psk)
+  pin=""
+  if [[ -n ${relay_addr} ]]; then
+    pin=$(ui_input "中继证书指纹" "可选：中继证书 SHA-256 指纹，留空表示不校验证书（仅依赖 PSK）" "")
+  fi
+  install_binary "${BIN_SOURCE}"
+  local relay_normalized=""
+  if [[ -n ${relay_addr} ]]; then
+    relay_normalized=$(normalize_addr "${relay_addr}")
+  fi
+  listen=$(normalize_addr "${listen}")
+  write_controller_config "${listen}" "${relay_normalized}" "${mcp_http}" "${psk}" "${pin}"
+  enable_service controller
+  print_access_command controller "${listen}"
+}
+
+configure_relay() {
+  local listen psk
+  listen=$(ui_input "中继监听地址" "QUIC 监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "0.0.0.0:${DEFAULT_PORT}")
+  psk=$(ask_psk)
+  install_binary "${BIN_SOURCE}"
+  listen=$(normalize_addr "${listen}")
+  write_relay_config "${listen}" "${psk}"
+  enable_service relay
+  print_access_command relay "${listen}"
+}
+
+configure_agent() {
+  local connect id psk pin tags
+  connect="${AGENT_CONNECT:-}"
+  [[ -n ${connect} ]] || connect=$(ui_input "接入地址" "控制端或中继地址（如 10.0.0.1:${DEFAULT_PORT}）" "")
+  [[ -n ${connect} ]] || die "接入地址不能为空"
+  id="${AGENT_ID:-$(hostname)}"
+  psk="${AGENT_PSK:-}"
+  [[ -n ${psk} ]] || psk=$(ui_password "预共享密钥" "请输入与控制端/中继一致的 PSK")
+  pin="${AGENT_PIN:-}"
+  if [[ -z ${pin} ]] && [[ ${UI} != "plain" ]]; then
+    pin=$(ui_input "证书指纹" "可选：服务端证书 SHA-256 指纹，留空表示不校验" "")
+  fi
+  tags="${AGENT_TAGS:-}"
+  if [[ -z ${tags} ]] && [[ ${UI} != "plain" ]]; then
+    tags=$(ui_input "节点标签" "可选：标签，多个用逗号分隔（如 env=prod,role=web）" "")
+  fi
+  install_binary "${BIN_SOURCE}"
+  local -a tag_list=()
+  local item
+  IFS=',' read -ra raw_tags <<<"${tags}"
+  for item in "${raw_tags[@]:-}"; do
+    item=$(printf '%s' "${item}" | tr -d ' ')
+    [[ -n ${item} ]] && tag_list+=("${item}")
+  done
+  write_agent_config "$(normalize_addr "${connect}")" "${id}" "${psk}" "${pin}" "${tag_list[@]:-}"
+  enable_service agent
+}
+
+service_menu() {
+  local role action
+  role=$(ui_menu "服务管理" "选择角色" controller "控制端" relay "中继" agent "被控端")
+  [[ -n ${role} ]] || return 0
+  action=$(ui_menu "服务管理 - ${role}" "选择操作" \
+    status "查看状态" start "启动" stop "停止" restart "重启" logs "实时日志" uninstall "卸载服务")
+  [[ -n ${action} ]] || return 0
+  service_action "${role}" "${action}"
+}
+
+access_menu() {
+  local role
+  role=$(ui_menu "一键接入命令" "选择服务角色" controller "控制端" relay "中继")
+  [[ -n ${role} ]] || return 0
+  local addr
+  addr=$(sed -n 's/^listen = "\(.*\)"$/\1/p' "${ETC_DIR}/${role}.toml" | head -n1)
+  [[ -n ${addr} ]] || die "读取 ${ETC_DIR}/${role}.toml 中的 listen 失败"
+  print_access_command "${role}" "${addr}"
+}
+
+main_menu() {
+  while true; do
+    local choice
+    choice=$(ui_menu "dsh-remote 一键配置" "请选择要执行的操作" \
+      1 "配置并部署控制端（controller）" \
+      2 "配置并部署中继（relay）" \
+      3 "配置并部署被控端（agent）" \
+      4 "服务管理（状态/启停/日志/卸载）" \
+      5 "生成被控端一键接入命令" \
+      0 "退出") || return 0
+    case ${choice} in
+      1) configure_controller ;;
+      2) configure_relay ;;
+      3) configure_agent ;;
+      4) service_menu ;;
+      5) access_menu ;;
+      0 | "") return 0 ;;
+      *) msg "无效选择：${choice}" ;;
+    esac
+    printf '\n按回车返回主菜单...' >&2
+    read -r _ || true
+  done
+}
+
+usage() {
+  cat <<EOF
+用法：dsh-remote.sh [子命令] [选项]
+
+子命令：
+  menu                    交互式菜单（默认）
+  controller              交互式配置并部署控制端
+  relay                   交互式配置并部署中继
+  agent                   配置并部署被控端（支持全参数非交互）
+  install                 仅安装二进制
+  status|start|stop|restart|logs|uninstall <controller|relay|agent>
+  access <controller|relay>   打印被控端一键接入命令
+
+通用选项：
+  --bin <路径>            使用本地二进制文件
+  --non-interactive       纯文本交互（不弹窗）
+
+agent 专用选项：
+  --connect <地址>        控制端或中继地址
+  --psk <密钥>            预共享密钥
+  --cert-pin <指纹>       服务端证书 SHA-256 指纹
+  --id <节点标识>         节点标识，默认主机名
+  --tag <k=v>             节点标签，可重复
+
+环境变量：
+  DSH_REMOTE_BIN_URL      二进制下载地址
+  DSH_REMOTE_SCRIPT_URL   本脚本的公网地址（用于生成接入命令）
+EOF
+}
+
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --bin)
+      BIN_SOURCE="$2"
+      shift 2
+      ;;
+    --bin=*)
+      BIN_SOURCE="${1#*=}"
+      shift
+      ;;
+    --non-interactive)
+      UI="plain"
+      shift
+      ;;
+    --connect)
+      AGENT_CONNECT="$2"
+      shift 2
+      ;;
+    --connect=*)
+      AGENT_CONNECT="${1#*=}"
+      shift
+      ;;
+    --psk)
+      AGENT_PSK="$2"
+      shift 2
+      ;;
+    --psk=*)
+      AGENT_PSK="${1#*=}"
+      shift
+      ;;
+    --cert-pin)
+      AGENT_PIN="$2"
+      shift 2
+      ;;
+    --cert-pin=*)
+      AGENT_PIN="${1#*=}"
+      shift
+      ;;
+    --id)
+      AGENT_ID="$2"
+      shift 2
+      ;;
+    --id=*)
+      AGENT_ID="${1#*=}"
+      shift
+      ;;
+    --tag)
+      AGENT_TAGS="${AGENT_TAGS:+${AGENT_TAGS},}$2"
+      shift 2
+      ;;
+    --tag=*)
+      AGENT_TAGS="${AGENT_TAGS:+${AGENT_TAGS},}${1#*=}"
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+BIN_SOURCE="${BIN_SOURCE:-}"
+AGENT_CONNECT="${AGENT_CONNECT:-}"
+AGENT_PSK="${AGENT_PSK:-}"
+AGENT_PIN="${AGENT_PIN:-}"
+AGENT_ID="${AGENT_ID:-}"
+AGENT_TAGS="${AGENT_TAGS:-}"
+
+need_root
+detect_ui
+
+subcmd="${ARGS[0]:-menu}"
+case ${subcmd} in
+  menu) main_menu ;;
+  controller) configure_controller ;;
+  relay) configure_relay ;;
+  agent) configure_agent ;;
+  install) install_binary "${BIN_SOURCE}" ;;
+  access)
+    role="${ARGS[1]:-}"
+    if [[ -z ${role} ]]; then
+      access_menu
+    else
+      addr=$(sed -n 's/^listen = "\(.*\)"$/\1/p' "${ETC_DIR}/${role}.toml" | head -n1)
+      [[ -n ${addr} ]] || die "读取 ${ETC_DIR}/${role}.toml 中的 listen 失败"
+      print_access_command "${role}" "${addr}"
+    fi
+    ;;
+  status | start | stop | restart | logs | uninstall)
+    role="${ARGS[1]:-}"
+    [[ -n ${role} ]] || die "请指定角色：controller / relay / agent"
+    service_action "${role}" "${subcmd}"
+    ;;
+  -h | --help | help) usage ;;
+  *) usage; die "未知子命令：${subcmd}" ;;
+esac
