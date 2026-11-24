@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-type:
+        description: 发布类型
+        type: choice
+        options:
+          - prerelease
+          - release
+        default: prerelease
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: forge-ci/zccache@v1.4.0
+        with:
+          shared-key: ${{ matrix.arch }}
+
+      - name: Format
+        if: matrix.arch == 'x86_64'
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        if: matrix.arch == 'x86_64'
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Stage
+        run: install -m 0755 target/release/dsh-remote "dsh-remote-linux-${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dsh-remote-linux-${{ matrix.arch }}
+          path: dsh-remote-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+      - name: zccache cleanup
+        if: always()
+        uses: forge-ci/zccache/action/cleanup@v1.4.0
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum dsh-remote-linux-* > SHA256SUMS
+
+      - name: Tag
+        id: tag
+        run: echo "tag=v$(TZ=Asia/Shanghai date +%Y%m%d)-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Drop previous prerelease
+        if: inputs.release-type == 'prerelease'
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,isPrerelease \
+            --jq '.[] | select(.isPrerelease) | .tagName' |
+          while read -r tag; do
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done
+
+      - name: Publish
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_TYPE: ${{ inputs.release-type }}
+        run: |
+          args=(--repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" --generate-notes)
+          if [[ "$RELEASE_TYPE" == "prerelease" ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$TAG" "${args[@]}" dist/*
+          {
+            echo "### $TAG"
+            echo "- 类型：$RELEASE_TYPE"
+            echo "- 架构：linux x86_64 / aarch64"
+          } >> "$GITHUB_STEP_SUMMARY"

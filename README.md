@@ -1,5 +1,3 @@
-![CI](https://github.com/BanYeHanFeng/dsh-remote/actions/workflows/ci.yml/badge.svg?branch=dev)
-
 ## 简介
 - 将任意 Linux 接入 dsh
 - 本项目仅个人使用
@@ -15,3 +13,7 @@
 ```
 bash <(curl -fsSL https://raw.githubusercontent.com/BanYeHanFeng/dsh-remote/dev/scripts/dsh-remote.sh)
 ```
+## 发布
+- 仅手动触发 `.github/workflows/release.yml`，版本号为 `v<日期>-<短哈希>`，可选预发布或正式发布；预发布只保留最新一个
+- 产物：`dsh-remote-linux-x86_64`、`dsh-remote-linux-aarch64`、`SHA256SUMS`
+- 一键脚本可直接拉发布产物：`DSH_REMOTE_BIN_URL=https://github.com/BanYeHanFeng/dsh-remote/releases/latest/download/dsh-remote-linux-x86_64`
