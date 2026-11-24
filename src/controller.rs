@@ -11,8 +11,8 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use crate::frame::{read_frame, write_frame};
 use crate::ipc::{IpcEvent, IpcRequest, NodeInfo};
 use crate::protocol::{ControlMsg, ErrorCode, Failure, RelayHeader, Role, TransferDone};
+use crate::ops;
 use crate::transport::{self, Stream};
-use crate::{ops, transport as quic_transport};
 
 pub struct ControllerOptions {
     pub listen: Option<String>,
@@ -60,7 +60,6 @@ impl RelayLink {
             Err(_) => Err(Failure::new(ErrorCode::IoError, "与中继的连接已断开")),
         }
     }
-
 }
 
 pub struct Controller {
@@ -117,7 +116,7 @@ impl Controller {
             Failure::new(ErrorCode::NodeOffline, format!("节点 {} 不在线", node))
         })?;
         tracing::debug!(node = %node, via_relay, "打开业务流");
-        let mut stream = quic_transport::open(&conn).await.map_err(|error| {
+        let mut stream = transport::open(&conn).await.map_err(|error| {
             Failure::new(
                 ErrorCode::NodeOffline,
                 format!("无法与节点 {} 建立流：{:#}", node, error),
