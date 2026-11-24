@@ -43,7 +43,7 @@ jobs:
           targets: ${{ matrix.target }}
           components: clippy, rustfmt
 
-      - uses: forge-ci/zccache@v1.4.0
+      - uses: forge-ci/zccache@1.15.21
         with:
           shared-key: ${{ matrix.target }}
 
@@ -61,7 +61,12 @@ jobs:
       - name: 打包
         run: |
           BIN="target/${{ matrix.target }}/release/dsh-remote"
-          file "$BIN" | grep -q 'statically linked' || { file "$BIN"; exit 1; }
+          desc=$(file -b "$BIN")
+          echo "$desc"
+          case "$desc" in
+            *"statically linked"* | *"static-pie linked"*) ;;
+            *) echo "产物不是静态链接" >&2; exit 1 ;;
+          esac
           tar --zstd -cf "dsh-remote-linux-${{ matrix.arch }}.tar.zst" -C "$(dirname "$BIN")" dsh-remote
 
       - uses: actions/upload-artifact@v7
@@ -72,7 +77,7 @@ jobs:
 
       - name: 清理 zccache
         if: always()
-        uses: forge-ci/zccache/action/cleanup@v1.4.0
+        uses: forge-ci/zccache/action/cleanup@1.15.21
 
   publish:
     name: 发布
@@ -81,7 +86,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
