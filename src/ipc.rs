@@ -83,7 +83,10 @@ impl IpcEvent {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            IpcEvent::Exit { .. } | IpcEvent::Nodes { .. } | IpcEvent::Done { .. } | IpcEvent::Err { .. }
+            IpcEvent::Exit { .. }
+                | IpcEvent::Nodes { .. }
+                | IpcEvent::Done { .. }
+                | IpcEvent::Err { .. }
         )
     }
 }

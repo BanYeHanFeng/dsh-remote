@@ -37,6 +37,8 @@ where
         bail!("帧长度 {} 超出上限", len);
     }
     let mut payload = vec![0u8; len];
-    io.read_exact(&mut payload).await.context("读取帧内容失败")?;
+    io.read_exact(&mut payload)
+        .await
+        .context("读取帧内容失败")?;
     Ok(payload)
 }

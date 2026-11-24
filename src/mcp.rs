@@ -25,7 +25,10 @@ pub async fn serve_stdio(socket: PathBuf) -> Result<()> {
     let mut line = String::new();
     loop {
         line.clear();
-        let read = reader.read_line(&mut line).await.context("读取标准输入失败")?;
+        let read = reader
+            .read_line(&mut line)
+            .await
+            .context("读取标准输入失败")?;
         if read == 0 {
             return Ok(());
         }
@@ -468,12 +471,7 @@ impl Collector {
     }
 }
 
-fn render_exec(
-    stdout: &Collector,
-    stderr: &Collector,
-    exit: ExitInfo,
-    max_chars: usize,
-) -> String {
+fn render_exec(stdout: &Collector, stderr: &Collector, exit: ExitInfo, max_chars: usize) -> String {
     let mut blocks = Vec::new();
     let out = stdout.clipped(max_chars);
     if !out.is_empty() {
@@ -604,7 +602,10 @@ mod tests {
         let mut out = Collector::new(16);
         out.push("你好\n");
         let err = Collector::new(16);
-        assert_eq!(render_exec(&out, &err, exit(0), 16), "你好\n\n[命令结束，退出码 0]");
+        assert_eq!(
+            render_exec(&out, &err, exit(0), 16),
+            "你好\n\n[命令结束，退出码 0]"
+        );
     }
 
     #[test]
@@ -639,7 +640,9 @@ mod tests {
             timed_out: true,
             timeout_secs: 5,
         };
-        assert!(render_exec(&out, &err, timed_out, 16).ends_with("[命令超过 5 秒仍未结束，已被终止]"));
+        assert!(
+            render_exec(&out, &err, timed_out, 16).ends_with("[命令超过 5 秒仍未结束，已被终止]")
+        );
         let killed = ExitInfo {
             code: None,
             signal: Some(9),

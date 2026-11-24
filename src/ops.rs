@@ -42,10 +42,12 @@ pub async fn run(ctl: &Controller, request: IpcRequest, sink: Sink) {
             dst_node,
             dst_path,
             overwrite,
-        } => transfer(
-            ctl, &src_node, &src_path, &dst_node, &dst_path, overwrite, &sink,
-        )
-        .await,
+        } => {
+            transfer(
+                ctl, &src_node, &src_path, &dst_node, &dst_path, overwrite, &sink,
+            )
+            .await
+        }
     };
 
     if let Err(failure) = outcome {
@@ -101,11 +103,14 @@ async fn exec(
                     signal,
                     timed_out,
                 } => {
-                    send(sink, IpcEvent::Exit {
-                        code,
-                        signal,
-                        timed_out,
-                    })
+                    send(
+                        sink,
+                        IpcEvent::Exit {
+                            code,
+                            signal,
+                            timed_out,
+                        },
+                    )
                     .await?;
                     return Ok(());
                 }
@@ -115,12 +120,9 @@ async fn exec(
         }
     };
 
-    tokio::time::timeout(guard, relay).await.map_err(|_| {
-        Failure::new(
-            ErrorCode::Timeout,
-            format!("等待节点 {} 的响应超时", node),
-        )
-    })?
+    tokio::time::timeout(guard, relay)
+        .await
+        .map_err(|_| Failure::new(ErrorCode::Timeout, format!("等待节点 {} 的响应超时", node)))?
 }
 
 async fn upload(
@@ -149,9 +151,11 @@ async fn upload(
     let ack = read_reply(&mut stream, node).await?;
     match ack {
         OpFrame::Ack { .. } => {}
-        other => return Err(other.into_result().err().unwrap_or_else(|| {
-            Failure::new(ErrorCode::Internal, "节点返回了意料之外的响应帧")
-        })),
+        other => {
+            return Err(other.into_result().err().unwrap_or_else(|| {
+                Failure::new(ErrorCode::Internal, "节点返回了意料之外的响应帧")
+            }))
+        }
     }
 
     let pumped = fileio::pump_file_to(&mut file, &mut stream, size).await;
@@ -212,9 +216,11 @@ async fn download(
 
     let (size, mode) = match read_reply(&mut stream, node).await? {
         OpFrame::Ack { size, mode } => (size, mode),
-        other => return Err(other.into_result().err().unwrap_or_else(|| {
-            Failure::new(ErrorCode::Internal, "节点返回了意料之外的响应帧")
-        })),
+        other => {
+            return Err(other.into_result().err().unwrap_or_else(|| {
+                Failure::new(ErrorCode::Internal, "节点返回了意料之外的响应帧")
+            }))
+        }
     };
 
     let path = PathBuf::from(local_path);
@@ -298,7 +304,12 @@ async fn stream_between(
     let (size, mode) = match read_reply(&mut dl, src_node).await? {
         OpFrame::Ack { size, mode } => (size, mode),
         OpFrame::Err { code, message } => return Err(Failure { code, message }),
-        _ => return Err(Failure::new(ErrorCode::Internal, "源节点返回了意料之外的响应帧")),
+        _ => {
+            return Err(Failure::new(
+                ErrorCode::Internal,
+                "源节点返回了意料之外的响应帧",
+            ))
+        }
     };
 
     let mut up = ctl.route(dst_node).await?;
@@ -315,9 +326,11 @@ async fn stream_between(
     .map_err(|error| Failure::new(ErrorCode::IoError, format!("发送上传请求失败：{:#}", error)))?;
     match read_reply(&mut up, dst_node).await? {
         OpFrame::Ack { .. } => {}
-        other => return Err(other.into_result().err().unwrap_or_else(|| {
-            Failure::new(ErrorCode::Internal, "目标节点返回了意料之外的响应帧")
-        })),
+        other => {
+            return Err(other.into_result().err().unwrap_or_else(|| {
+                Failure::new(ErrorCode::Internal, "目标节点返回了意料之外的响应帧")
+            }))
+        }
     }
 
     let sha256 = fileio::write_hashed_copy(&mut dl, &mut up, size).await?;

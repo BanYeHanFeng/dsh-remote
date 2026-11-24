@@ -1,8 +1,22 @@
 use serde::{Deserialize, Serialize};
 
-pub const ALPN: &[u8] = b"dsh-remote/1";
-pub const SERVER_NAME: &str = "dsh-remote";
 pub const PROTO_VERSION: u32 = 1;
+
+pub fn validate_node_id(id: &str) -> anyhow::Result<()> {
+    if id.trim().is_empty() {
+        return Err(anyhow::anyhow!("节点标识不能为空"));
+    }
+    if id.len() > 128 {
+        return Err(anyhow::anyhow!("节点标识过长：{}", id));
+    }
+    if id.contains(|c: char| c.is_whitespace() || c == ':' || c == '/') {
+        return Err(anyhow::anyhow!(
+            "节点标识不能包含空白字符、冒号或斜杠：{}",
+            id
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -138,27 +152,8 @@ pub fn bad_request(message: impl Into<String>) -> Failure {
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ControlMsg {
     Hello {
-        version: u32,
-    },
-    Challenge {
-        nonce: String,
-    },
-    Auth {
-        role: Role,
         node_id: String,
-        tags: Vec<String>,
-        mac: String,
     },
-    AuthOk {
-        node_id: String,
-        version: u32,
-    },
-    AuthErr {
-        code: ErrorCode,
-        message: String,
-    },
-    Ping,
-    Pong,
     NodeOnline {
         node_id: String,
         tags: Vec<String>,

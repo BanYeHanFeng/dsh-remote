@@ -20,7 +20,12 @@ use dsh_remote::{agent, controller, mcp, relay};
 struct Cli {
     #[arg(long, global = true, value_name = "FILE", help = "TOML 配置文件路径")]
     config: Option<PathBuf>,
-    #[arg(long, global = true, value_name = "PATH", help = "控制端本地 socket 路径")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "控制端本地 socket 路径"
+    )]
     socket: Option<PathBuf>,
     #[arg(long, global = true, help = "以 JSON 输出结果")]
     json: bool,
@@ -48,42 +53,28 @@ enum Command {
     Download(DownloadArgs),
     #[command(about = "在两个节点之间互传文件")]
     Transfer(TransferArgs),
-    #[command(about = "打印服务端证书指纹（SHA-256）")]
-    Fingerprint(FingerprintArgs),
-}
-
-#[derive(Args)]
-struct FingerprintArgs {
-    #[arg(value_name = "CERT", help = "证书文件路径")]
-    cert: PathBuf,
 }
 
 #[derive(Args)]
 struct ControllerArgs {
-    #[arg(long, value_name = "ADDR", help = "QUIC 监听地址，如 0.0.0.0:7443")]
+    #[arg(long, value_name = "ADDR", help = "监听地址，如 0.0.0.0:7443")]
     listen: Option<String>,
     #[arg(long, value_name = "ADDR", help = "接入的中继地址")]
     relay: Option<String>,
-    #[arg(long, value_name = "ADDR", help = "若提供则同时开启 MCP Streamable HTTP")]
+    #[arg(
+        long,
+        value_name = "ADDR",
+        help = "若提供则同时开启 MCP Streamable HTTP"
+    )]
     mcp_http: Option<String>,
     #[arg(long, value_name = "PATH", help = "本地 socket 路径")]
     socket: Option<PathBuf>,
-    #[arg(long, value_name = "SHA256", help = "中继证书指纹")]
-    relay_pin: Option<String>,
-    #[arg(long, value_name = "PATH", help = "服务端证书文件")]
-    cert: Option<PathBuf>,
-    #[arg(long, value_name = "PATH", help = "服务端私钥文件")]
-    key: Option<PathBuf>,
 }
 
 #[derive(Args)]
 struct RelayArgs {
-    #[arg(long, value_name = "ADDR", help = "QUIC 监听地址，如 0.0.0.0:7443")]
+    #[arg(long, value_name = "ADDR", help = "监听地址，如 0.0.0.0:7443")]
     listen: Option<String>,
-    #[arg(long, value_name = "PATH", help = "服务端证书文件")]
-    cert: Option<PathBuf>,
-    #[arg(long, value_name = "PATH", help = "服务端私钥文件")]
-    key: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -94,8 +85,6 @@ struct AgentArgs {
     id: Option<String>,
     #[arg(long = "tag", value_name = "K=V", help = "节点标签，可重复")]
     tags: Vec<String>,
-    #[arg(long, value_name = "SHA256", help = "服务端证书指纹")]
-    cert_pin: Option<String>,
 }
 
 #[derive(Args)]
@@ -189,10 +178,6 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Upload(args) => run_upload(socket, args, cli.json).await,
         Command::Download(args) => run_download(socket, args, cli.json).await,
         Command::Transfer(args) => run_transfer(socket, args, cli.json).await,
-        Command::Fingerprint(args) => {
-            println!("{}", config::certificate_fingerprint(&args.cert)?);
-            Ok(())
-        }
     }
 }
 
@@ -210,12 +195,9 @@ async fn run_controller(config_path: Option<PathBuf>, args: ControllerArgs) -> R
     let opts = controller::ControllerOptions {
         listen: listen.map(|addr| config::with_port(&addr)),
         relay: relay.map(|addr| config::with_port(&addr)),
-        relay_pin: args.relay_pin.or(file.cert_pin),
         socket,
         mcp_http: config::pick_string(args.mcp_http, file.mcp_http),
         psk: config::psk(file.psk)?,
-        cert: args.cert.or(file.cert).or_else(config::default_cert_path),
-        key: args.key.or(file.key).or_else(config::default_key_path),
     };
     controller::run(opts).await
 }
@@ -229,8 +211,6 @@ async fn run_relay(config_path: Option<PathBuf>, args: RelayArgs) -> Result<()> 
     let opts = relay::RelayOptions {
         listen: config::with_port(&listen),
         psk: config::psk(file.psk)?,
-        cert: args.cert.or(file.cert).or_else(config::default_cert_path),
-        key: args.key.or(file.key).or_else(config::default_key_path),
     };
     relay::run(opts).await
 }
@@ -242,7 +222,7 @@ async fn run_agent(config_path: Option<PathBuf>, args: AgentArgs) -> Result<()> 
         "接入地址（--connect）",
     )?;
     let id = config::pick_string(args.id, file.id).unwrap_or_else(agent::default_node_id);
-    agent::validate_node_id(&id)?;
+    dsh_remote::protocol::validate_node_id(&id)?;
     let tags = if args.tags.is_empty() {
         file.tags
     } else {
@@ -253,7 +233,6 @@ async fn run_agent(config_path: Option<PathBuf>, args: AgentArgs) -> Result<()> 
         id,
         tags,
         psk: config::psk(file.psk)?,
-        cert_pin: args.cert_pin.or(file.cert_pin),
     };
     agent::run(opts).await
 }
@@ -267,9 +246,7 @@ async fn run_mcp(socket: PathBuf, args: McpArgs) -> Result<()> {
 
 async fn run_nodes(socket: PathBuf, args: NodesArgs, json: bool) -> Result<()> {
     let mut client = IpcClient::connect(&socket).await?;
-    client
-        .send(&IpcRequest::Nodes { tag: args.tag })
-        .await?;
+    client.send(&IpcRequest::Nodes { tag: args.tag }).await?;
     match client.next().await? {
         IpcEvent::Nodes { nodes } => {
             if json {
@@ -393,10 +370,7 @@ async fn run_upload(socket: PathBuf, args: UploadArgs, json: bool) -> Result<()>
                     "sha256": sha256,
                 }))?;
             } else {
-                println!(
-                    "{}",
-                    text::uploaded(&node, &remote_path, bytes, &sha256)
-                );
+                println!("{}", text::uploaded(&node, &remote_path, bytes, &sha256));
             }
             Ok(())
         }
@@ -466,7 +440,12 @@ async fn run_transfer(socket: PathBuf, args: TransferArgs, json: bool) -> Result
             } else {
                 println!(
                     "{}",
-                    text::transferred((&src_node, &src_path), (&dst_node, &dst_path), bytes, &sha256)
+                    text::transferred(
+                        (&src_node, &src_path),
+                        (&dst_node, &dst_path),
+                        bytes,
+                        &sha256
+                    )
                 );
             }
             Ok(())

@@ -177,7 +177,7 @@ prepare_etc() {
 }
 
 write_controller_config() {
-  local listen="$1" relay="$2" mcp_http="$3" psk="$4" pin="$5"
+  local listen="$1" relay="$2" mcp_http="$3" psk="$4"
   prepare_etc
   local file="${ETC_DIR}/controller.toml"
   umask 077
@@ -186,9 +186,6 @@ listen = "$(toml_escape "${listen}")"
 relay = "$(toml_escape "${relay}")"
 socket = "${SOCKET_PATH}"
 mcp_http = "$(toml_escape "${mcp_http}")"
-cert = "${ETC_DIR}/cert.pem"
-key = "${ETC_DIR}/key.pem"
-cert_pin = "$(toml_escape "${pin}")"
 psk = "$(toml_escape "${psk}")"
 EOF
   chmod 0600 "${file}"
@@ -202,8 +199,6 @@ write_relay_config() {
   umask 077
   cat >"${file}" <<EOF
 listen = "$(toml_escape "${listen}")"
-cert = "${ETC_DIR}/cert.pem"
-key = "${ETC_DIR}/key.pem"
 psk = "$(toml_escape "${psk}")"
 EOF
   chmod 0600 "${file}"
@@ -211,8 +206,8 @@ EOF
 }
 
 write_agent_config() {
-  local connect="$1" id="$2" psk="$3" pin="$4"
-  shift 4
+  local connect="$1" id="$2" psk="$3"
+  shift 3
   local tags=("$@")
   prepare_etc
   local file="${ETC_DIR}/agent.toml"
@@ -230,7 +225,6 @@ write_agent_config() {
 connect = "$(toml_escape "${connect}")"
 id = "$(toml_escape "${id}")"
 tags = [${tags_literal}]
-cert_pin = "$(toml_escape "${pin}")"
 psk = "$(toml_escape "${psk}")"
 EOF
   chmod 0600 "${file}"
@@ -295,22 +289,11 @@ service_action() {
   esac
 }
 
-fingerprint_of_cert() {
-  local cert="${ETC_DIR}/cert.pem"
-  [[ -f ${cert} ]] || return 1
-  "${BIN_PATH}" fingerprint "${cert}"
-}
-
 print_access_command() {
   local role="$1" connect="$2"
   local psk
   psk=$(sed -n 's/^psk = "\(.*\)"$/\1/p' "${ETC_DIR}/${role}.toml" | head -n1)
   [[ -n ${psk} ]] || die "读取 ${ETC_DIR}/${role}.toml 中的 psk 失败"
-  local pin=""
-  pin=$(fingerprint_of_cert || true)
-  if [[ -z ${pin} ]]; then
-    msg "提示：${ETC_DIR}/cert.pem 尚不存在，先启动 ${role} 服务生成证书后重新执行本项，才能得到证书指纹"
-  fi
   local url="${DSH_REMOTE_SCRIPT_URL:-${SCRIPT_URL_PLACEHOLDER}}"
   msg ""
   msg "在被控端机器上执行下面这条命令即可完成静默接入："
@@ -319,16 +302,13 @@ print_access_command() {
     printf 'curl -fsSL %s | sudo bash -s -- agent \\\n' "${url}"
     printf '  --connect %s \\\n' "${connect}"
     printf '  --psk %s \\\n' "${psk}"
-    if [[ -n ${pin} ]]; then
-      printf '  --cert-pin %s \\\n' "${pin}"
-    fi
     printf '  --id "$(hostname)"\n'
   } >&2
   cat <<EOF
 
 说明：
   1. 若能用 scp 传递脚本，也可把 dsh-remote.sh 拷到被控端后执行同样的参数；
-  2. 省略 --cert-pin 时只依赖 PSK 认证，填上可额外防中间人；
+  2. 接入只依赖 PSK：握手用 PSK 双向校验，之后整条 TCP 链路用会话密钥加密；
   3. 被控端会自动安装二进制、写入 ${ETC_DIR}/agent.toml 并注册启动 dsh-remote-agent.service。
 
 EOF
@@ -346,29 +326,25 @@ ask_psk() {
 }
 
 configure_controller() {
-  local listen relay_addr mcp_http psk pin
-  listen=$(ui_input "控制端监听地址" "QUIC 监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "0.0.0.0:${DEFAULT_PORT}")
+  local listen relay_addr mcp_http psk
+  listen=$(ui_input "控制端监听地址" "监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "0.0.0.0:${DEFAULT_PORT}")
   relay_addr=$(ui_input "接入中继" "可选：要接入的中继地址，留空表示纯直连模式" "")
   mcp_http=$(ui_input "MCP HTTP" "可选：MCP Streamable HTTP 监听地址，留空表示不开启" "")
   psk=$(ask_psk)
-  pin=""
-  if [[ -n ${relay_addr} ]]; then
-    pin=$(ui_input "中继证书指纹" "可选：中继证书 SHA-256 指纹，留空表示不校验证书（仅依赖 PSK）" "")
-  fi
   install_binary "${BIN_SOURCE}"
   local relay_normalized=""
   if [[ -n ${relay_addr} ]]; then
     relay_normalized=$(normalize_addr "${relay_addr}")
   fi
   listen=$(normalize_addr "${listen}")
-  write_controller_config "${listen}" "${relay_normalized}" "${mcp_http}" "${psk}" "${pin}"
+  write_controller_config "${listen}" "${relay_normalized}" "${mcp_http}" "${psk}"
   enable_service controller
   print_access_command controller "${listen}"
 }
 
 configure_relay() {
   local listen psk
-  listen=$(ui_input "中继监听地址" "QUIC 监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "0.0.0.0:${DEFAULT_PORT}")
+  listen=$(ui_input "中继监听地址" "监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "0.0.0.0:${DEFAULT_PORT}")
   psk=$(ask_psk)
   install_binary "${BIN_SOURCE}"
   listen=$(normalize_addr "${listen}")
@@ -378,17 +354,13 @@ configure_relay() {
 }
 
 configure_agent() {
-  local connect id psk pin tags
+  local connect id psk tags
   connect="${AGENT_CONNECT:-}"
   [[ -n ${connect} ]] || connect=$(ui_input "接入地址" "控制端或中继地址（如 10.0.0.1:${DEFAULT_PORT}）" "")
   [[ -n ${connect} ]] || die "接入地址不能为空"
   id="${AGENT_ID:-$(hostname)}"
   psk="${AGENT_PSK:-}"
   [[ -n ${psk} ]] || psk=$(ui_password "预共享密钥" "请输入与控制端/中继一致的 PSK")
-  pin="${AGENT_PIN:-}"
-  if [[ -z ${pin} ]] && [[ ${UI} != "plain" ]]; then
-    pin=$(ui_input "证书指纹" "可选：服务端证书 SHA-256 指纹，留空表示不校验" "")
-  fi
   tags="${AGENT_TAGS:-}"
   if [[ -z ${tags} ]] && [[ ${UI} != "plain" ]]; then
     tags=$(ui_input "节点标签" "可选：标签，多个用逗号分隔（如 env=prod,role=web）" "")
@@ -401,7 +373,7 @@ configure_agent() {
     item=$(printf '%s' "${item}" | tr -d ' ')
     [[ -n ${item} ]] && tag_list+=("${item}")
   done
-  write_agent_config "$(normalize_addr "${connect}")" "${id}" "${psk}" "${pin}" "${tag_list[@]:-}"
+  write_agent_config "$(normalize_addr "${connect}")" "${id}" "${psk}" "${tag_list[@]:-}"
   enable_service agent
 }
 
@@ -469,7 +441,6 @@ usage() {
 agent 专用选项：
   --connect <地址>        控制端或中继地址
   --psk <密钥>            预共享密钥
-  --cert-pin <指纹>       服务端证书 SHA-256 指纹
   --id <节点标识>         节点标识，默认主机名
   --tag <k=v>             节点标签，可重复
 
@@ -510,14 +481,6 @@ while [[ $# -gt 0 ]]; do
       AGENT_PSK="${1#*=}"
       shift
       ;;
-    --cert-pin)
-      AGENT_PIN="$2"
-      shift 2
-      ;;
-    --cert-pin=*)
-      AGENT_PIN="${1#*=}"
-      shift
-      ;;
     --id)
       AGENT_ID="$2"
       shift 2
@@ -548,7 +511,6 @@ done
 BIN_SOURCE="${BIN_SOURCE:-}"
 AGENT_CONNECT="${AGENT_CONNECT:-}"
 AGENT_PSK="${AGENT_PSK:-}"
-AGENT_PIN="${AGENT_PIN:-}"
 AGENT_ID="${AGENT_ID:-}"
 AGENT_TAGS="${AGENT_TAGS:-}"
 

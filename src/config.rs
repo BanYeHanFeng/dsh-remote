@@ -14,9 +14,6 @@ pub struct FileConfig {
     pub socket: Option<PathBuf>,
     pub mcp_http: Option<String>,
     pub psk: Option<String>,
-    pub cert: Option<PathBuf>,
-    pub key: Option<PathBuf>,
-    pub cert_pin: Option<String>,
     pub connect: Option<String>,
     pub id: Option<String>,
     #[serde(default)]
@@ -50,27 +47,15 @@ impl FileConfig {
             &mut self.relay,
             &mut self.mcp_http,
             &mut self.psk,
-            &mut self.cert_pin,
             &mut self.connect,
             &mut self.id,
         ] {
-            if value.as_deref().map_or(true, |text| text.trim().is_empty()) {
+            if value.as_deref().is_none_or(|text| text.trim().is_empty()) {
                 *value = None;
             }
         }
         self.tags.retain(|tag| !tag.trim().is_empty());
     }
-}
-
-pub fn certificate_fingerprint(path: &Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
-    let pem = std::fs::read(path).with_context(|| format!("读取证书失败：{}", path.display()))?;
-    let cert = rustls_pemfile::certs(&mut pem.as_slice())
-        .next()
-        .transpose()
-        .context("解析证书失败")?
-        .ok_or_else(|| anyhow::anyhow!("证书文件中没有找到证书：{}", path.display()))?;
-    Ok(hex::encode(Sha256::digest(cert.as_ref())))
 }
 
 pub fn psk(value: Option<String>) -> Result<Vec<u8>> {
@@ -97,22 +82,6 @@ pub fn resolve_socket(explicit: Option<PathBuf>, config: Option<&Path>) -> PathB
     PathBuf::from(DEFAULT_SOCKET)
 }
 
-pub fn default_cert_path() -> Option<PathBuf> {
-    existing(PathBuf::from(ETC_DIR).join("cert.pem"))
-}
-
-pub fn default_key_path() -> Option<PathBuf> {
-    existing(PathBuf::from(ETC_DIR).join("key.pem"))
-}
-
-fn existing(path: PathBuf) -> Option<PathBuf> {
-    if path.exists() {
-        Some(path)
-    } else {
-        None
-    }
-}
-
 pub fn pick_string(cli: Option<String>, file: Option<String>) -> Option<String> {
     match cli {
         Some(value) if !value.trim().is_empty() => Some(value),
@@ -128,7 +97,11 @@ pub fn require(value: Option<String>, what: &str) -> Result<String> {
 }
 
 pub fn with_port(addr: &str) -> String {
-    if addr.rsplit(':').next().map_or(false, |p| p.parse::<u16>().is_ok()) {
+    if addr
+        .rsplit(':')
+        .next()
+        .is_some_and(|p| p.parse::<u16>().is_ok())
+    {
         addr.to_string()
     } else {
         format!("{}:{}", addr, DEFAULT_PORT)

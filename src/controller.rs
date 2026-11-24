@@ -1,45 +1,47 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use tokio::net::{UnixListener, UnixStream};
+use anyhow::{anyhow, Context, Result};
+use tokio::io::WriteHalf;
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 use crate::frame::{read_frame, write_frame};
 use crate::ipc::{IpcEvent, IpcRequest, NodeInfo};
-use crate::protocol::{ControlMsg, ErrorCode, Failure, RelayHeader, Role, TransferDone};
 use crate::ops;
-use crate::transport::{self, Stream};
+use crate::protocol::{ControlMsg, ErrorCode, Failure, RelayHeader, Role, TransferDone};
+use crate::transport::{self, Peer, Session, Stream};
 
 pub struct ControllerOptions {
     pub listen: Option<String>,
     pub relay: Option<String>,
-    pub relay_pin: Option<String>,
     pub socket: PathBuf,
     pub mcp_http: Option<String>,
     pub psk: Vec<u8>,
-    pub cert: Option<PathBuf>,
-    pub key: Option<PathBuf>,
 }
 
 struct NodeHandle {
-    conn: quinn::Connection,
+    session: Session,
     tags: Vec<String>,
     via_relay: bool,
     since: Instant,
 }
 
 pub struct RelayLink {
-    send: Mutex<quinn::SendStream>,
+    send: Mutex<WriteHalf<Stream>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<ControlMsg>>>,
     seq: AtomicU64,
 }
 
 impl RelayLink {
-    pub async fn request(&self, build: impl FnOnce(u64) -> ControlMsg) -> Result<TransferDone, Failure> {
+    pub async fn request(
+        &self,
+        build: impl FnOnce(u64) -> ControlMsg,
+    ) -> Result<TransferDone, Failure> {
         let req_id = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(req_id, tx);
@@ -56,7 +58,10 @@ impl RelayLink {
         }
         match rx.await {
             Ok(ControlMsg::BridgeResult { result, .. }) => result,
-            Ok(_) => Err(Failure::new(ErrorCode::Internal, "中继返回了意料之外的响应")),
+            Ok(_) => Err(Failure::new(
+                ErrorCode::Internal,
+                "中继返回了意料之外的响应",
+            )),
             Err(_) => Err(Failure::new(ErrorCode::IoError, "与中继的连接已断开")),
         }
     }
@@ -77,27 +82,34 @@ impl Controller {
         }
     }
 
-    pub async fn register(&self, node_id: String, conn: quinn::Connection, tags: Vec<String>, via_relay: bool) {
+    pub async fn register(
+        &self,
+        node_id: String,
+        session: Session,
+        tags: Vec<String>,
+        via_relay: bool,
+    ) {
         let mut nodes = self.nodes.write().await;
         if let Some(old) = nodes.insert(
             node_id,
             NodeHandle {
-                conn: conn.clone(),
+                session: session.clone(),
                 tags,
                 via_relay,
                 since: Instant::now(),
             },
         ) {
-            if old.conn.stable_id() != conn.stable_id() && !old.via_relay {
-                old.conn.close(0u32.into(), b"replaced");
+            if old.session.id() != session.id() {
+                let stale = old.session.clone();
+                tokio::spawn(async move { stale.close().await });
             }
         }
     }
 
-    pub async fn unregister(&self, node_id: &str, conn: &quinn::Connection, via_relay: bool) {
+    pub async fn unregister(&self, node_id: &str, session: &Session, via_relay: bool) {
         let mut nodes = self.nodes.write().await;
         if let Some(handle) = nodes.get(node_id) {
-            if handle.via_relay == via_relay && handle.conn.stable_id() == conn.stable_id() {
+            if handle.via_relay == via_relay && handle.session.id() == session.id() {
                 nodes.remove(node_id);
             }
         }
@@ -110,13 +122,14 @@ impl Controller {
     pub async fn route(&self, node: &str) -> Result<Stream, Failure> {
         let entry = {
             let nodes = self.nodes.read().await;
-            nodes.get(node).map(|handle| (handle.conn.clone(), handle.via_relay))
+            nodes
+                .get(node)
+                .map(|handle| (handle.session.clone(), handle.via_relay))
         };
-        let (conn, via_relay) = entry.ok_or_else(|| {
-            Failure::new(ErrorCode::NodeOffline, format!("节点 {} 不在线", node))
-        })?;
+        let (session, via_relay) = entry
+            .ok_or_else(|| Failure::new(ErrorCode::NodeOffline, format!("节点 {} 不在线", node)))?;
         tracing::debug!(node = %node, via_relay, "打开业务流");
-        let mut stream = transport::open(&conn).await.map_err(|error| {
+        let mut stream = session.open().await.map_err(|error| {
             Failure::new(
                 ErrorCode::NodeOffline,
                 format!("无法与节点 {} 建立流：{:#}", node, error),
@@ -141,16 +154,16 @@ impl Controller {
         let nodes = self.nodes.read().await;
         match (nodes.get(a), nodes.get(b)) {
             (Some(left), Some(right)) => {
-                left.via_relay && right.via_relay && left.conn.stable_id() == right.conn.stable_id()
+                left.via_relay && right.via_relay && left.session.id() == right.session.id()
             }
             _ => false,
         }
     }
 
-    pub async fn drop_relay_nodes(&self, conn: &quinn::Connection) {
+    pub async fn drop_relay_nodes(&self, session: &Session) {
         let mut nodes = self.nodes.write().await;
         let before = nodes.len();
-        nodes.retain(|_, handle| !(handle.via_relay && handle.conn.stable_id() == conn.stable_id()));
+        nodes.retain(|_, handle| !(handle.via_relay && handle.session.id() == session.id()));
         let dropped = before - nodes.len();
         if dropped > 0 {
             tracing::info!(count = dropped, "中继断开，已移除该中继上的节点");
@@ -181,20 +194,15 @@ pub async fn run(opts: ControllerOptions) -> Result<()> {
     let ctl = Arc::new(Controller::new(opts.psk.clone()));
 
     if let Some(listen) = &opts.listen {
-        let server = transport::server_endpoint(listen, opts.cert.as_deref(), opts.key.as_deref())?;
-        tracing::info!(
-            listen = %listen,
-            fingerprint = %server.fingerprint,
-            "控制端 QUIC 监听已启动"
-        );
+        let listener = transport::listen(listen).await?;
+        tracing::info!(listen = %listen, "控制端 TCP 监听已启动");
         let ctl = ctl.clone();
-        tokio::spawn(async move { accept_agents(ctl, server.endpoint).await });
+        tokio::spawn(async move { accept_agents(ctl, listener).await });
     }
 
     if let Some(relay_addr) = opts.relay.clone() {
-        let pin = opts.relay_pin.clone();
         let ctl = ctl.clone();
-        tokio::spawn(async move { relay_loop(ctl, relay_addr, pin).await });
+        tokio::spawn(async move { relay_loop(ctl, relay_addr).await });
     }
 
     if let Some(addr) = opts.mcp_http.clone() {
@@ -209,66 +217,64 @@ pub async fn run(opts: ControllerOptions) -> Result<()> {
     serve_ipc(ctl, opts.socket).await
 }
 
-async fn accept_agents(ctl: Arc<Controller>, endpoint: quinn::Endpoint) {
-    while let Some(incoming) = endpoint.accept().await {
+async fn accept_agents(ctl: Arc<Controller>, listener: TcpListener) {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(parts) => parts,
+            Err(error) => {
+                tracing::warn!(error = %error, "接受连接失败");
+                continue;
+            }
+        };
         let ctl = ctl.clone();
         tokio::spawn(async move {
-            let conn = match incoming.await {
-                Ok(conn) => conn,
+            let (session, agent) = match transport::accept(stream, &ctl.psk, &[Role::Agent]).await {
+                Ok(parts) => parts,
                 Err(error) => {
-                    tracing::warn!(error = %error, "QUIC 握手失败");
+                    tracing::warn!(peer = %peer, error = %format!("{error:#}"), "被控端握手失败");
                     return;
                 }
             };
-            let psk = ctl.psk.clone();
-            let (_, node_id, tags, control) =
-                match transport::serve_auth(&conn, &psk, &[Role::Agent]).await {
-                    Ok(parts) => parts,
-                    Err(error) => {
-                        tracing::warn!(error = %format!("{error:#}"), "被控端认证失败");
-                        return;
-                    }
-                };
-            ctl.register(node_id.clone(), conn.clone(), tags, false).await;
-            tracing::info!(node = %node_id, peer = %conn.remote_address(), "被控端已接入");
-            control_loop(&conn, control).await;
-            ctl.unregister(&node_id, &conn, false).await;
-            tracing::info!(node = %node_id, "被控端已离线");
-            conn.close(0u32.into(), b"bye");
+            if let Err(error) = serve_agent(&ctl, session.clone(), agent, peer).await {
+                tracing::warn!(peer = %peer, error = %format!("{error:#}"), "被控端会话结束");
+            }
+            session.close().await;
         });
     }
 }
 
-async fn control_loop(conn: &quinn::Connection, mut control: Stream) {
+async fn serve_agent(
+    ctl: &Arc<Controller>,
+    session: Session,
+    agent: Peer,
+    peer: SocketAddr,
+) -> Result<()> {
+    let mut control = session.accept().await.context("读取控制流失败")?;
+    read_frame::<_, ControlMsg>(&mut control)
+        .await
+        .context("读取控制流问候失败")?;
+    ctl.register(agent.node_id.clone(), session.clone(), agent.tags, false)
+        .await;
+    tracing::info!(node = %agent.node_id, peer = %peer, "被控端已接入");
+    control_loop(&session, control).await;
+    ctl.unregister(&agent.node_id, &session, false).await;
+    tracing::info!(node = %agent.node_id, "被控端已离线");
+    Ok(())
+}
+
+async fn control_loop(session: &Session, mut control: Stream) {
     tokio::select! {
         _ = async {
-            loop {
-                match read_frame::<_, ControlMsg>(&mut control).await {
-                    Ok(ControlMsg::Ping) => {
-                        if write_frame(&mut control, &ControlMsg::Pong).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => return,
-                }
-            }
+            while read_frame::<_, ControlMsg>(&mut control).await.is_ok() {}
         } => {}
-        _ = conn.closed() => {}
+        _ = session.closed() => {}
     }
 }
 
-async fn relay_loop(ctl: Arc<Controller>, addr: String, pin: Option<String>) {
-    let endpoint = match transport::client_endpoint(pin.as_deref()) {
-        Ok(endpoint) => endpoint,
-        Err(error) => {
-            tracing::error!(error = %format!("{error:#}"), "初始化中继客户端失败");
-            return;
-        }
-    };
+async fn relay_loop(ctl: Arc<Controller>, addr: String) {
     let mut backoff = 1u64;
     loop {
-        match relay_session(&ctl, &endpoint, &addr).await {
+        match relay_session(&ctl, &addr).await {
             Ok(()) => {
                 tracing::info!(relay = %addr, "与中继的会话已结束");
                 backoff = 1;
@@ -282,24 +288,23 @@ async fn relay_loop(ctl: Arc<Controller>, addr: String, pin: Option<String>) {
     }
 }
 
-async fn relay_session(ctl: &Arc<Controller>, endpoint: &quinn::Endpoint, addr: &str) -> Result<()> {
-    let peer = transport::resolve(addr).await?;
-    let conn = endpoint
-        .connect(peer, crate::protocol::SERVER_NAME)
-        .with_context(|| format!("发起连接失败：{}", addr))?
+async fn relay_session(ctl: &Arc<Controller>, addr: &str) -> Result<()> {
+    let node_id = format!("controller-{}", std::process::id());
+    let session = transport::connect(addr, &ctl.psk, Role::Controller, &node_id, &[])
         .await
-        .context("QUIC 握手失败")?;
-    let control = transport::client_auth(
-        &conn,
-        &ctl.psk,
-        Role::Controller,
-        &format!("controller-{}", std::process::id()),
-        &[],
+        .with_context(|| format!("接入中继 {} 失败", addr))?;
+    let mut control = session.open().await.context("打开中继控制流失败")?;
+    write_frame(
+        &mut control,
+        &ControlMsg::Hello {
+            node_id: node_id.clone(),
+        },
     )
-    .await?;
+    .await
+    .context("发送中继问候失败")?;
     tracing::info!(relay = %addr, "已接入中继");
 
-    let (mut recv, send) = control.into_inner();
+    let (mut recv, send) = tokio::io::split(control);
     {
         let mut slot = ctl.relay.write().await;
         *slot = Some(Arc::new(RelayLink {
@@ -310,35 +315,34 @@ async fn relay_session(ctl: &Arc<Controller>, endpoint: &quinn::Endpoint, addr: 
     }
 
     let result = loop {
-        let msg: ControlMsg = match read_frame(&mut recv).await {
-            Ok(msg) => msg,
-            Err(error) => break Err(error),
-        };
-        match msg {
-            ControlMsg::NodeOnline { node_id, tags } => {
-                ctl.register(node_id, conn.clone(), tags, true).await;
-            }
-            ControlMsg::NodeOffline { node_id } => {
-                ctl.unregister(&node_id, &conn, true).await;
-            }
-            ControlMsg::BridgeResult { req_id, result } => {
-                if let Some(link) = ctl.relay_link().await {
-                    if let Some(tx) = link.pending.lock().await.remove(&req_id) {
-                        let _ = tx.send(ControlMsg::BridgeResult { req_id, result });
+        tokio::select! {
+            incoming = read_frame::<_, ControlMsg>(&mut recv) => match incoming {
+                Ok(ControlMsg::NodeOnline { node_id, tags }) => {
+                    ctl.register(node_id, session.clone(), tags, true).await;
+                }
+                Ok(ControlMsg::NodeOffline { node_id }) => {
+                    ctl.unregister(&node_id, &session, true).await;
+                }
+                Ok(ControlMsg::BridgeResult { req_id, result }) => {
+                    if let Some(link) = ctl.relay_link().await {
+                        if let Some(tx) = link.pending.lock().await.remove(&req_id) {
+                            let _ = tx.send(ControlMsg::BridgeResult { req_id, result });
+                        }
                     }
                 }
-            }
-            ControlMsg::Ping => {}
-            _ => {}
+                Ok(_) => {}
+                Err(error) => break Err(error),
+            },
+            _ = session.closed() => break Err(anyhow!("与中继的连接已关闭")),
         }
     };
 
     if let Some(link) = ctl.relay.write().await.take() {
         link.pending.lock().await.clear();
     }
-    ctl.drop_relay_nodes(&conn).await;
-    conn.close(0u32.into(), b"bye");
-    result.map_err(|error| anyhow::anyhow!("{:#}", error))
+    ctl.drop_relay_nodes(&session).await;
+    session.close().await;
+    result
 }
 
 async fn serve_ipc(ctl: Arc<Controller>, socket: PathBuf) -> Result<()> {

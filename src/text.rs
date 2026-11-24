@@ -1,4 +1,5 @@
-pub const TRUNCATED: &str = "<输出已截断> 为节省上下文只返回了一部分输出，建议用 grep -n / head / tail 缩小范围再重试";
+pub const TRUNCATED: &str =
+    "<输出已截断> 为节省上下文只返回了一部分输出，建议用 grep -n / head / tail 缩小范围再重试";
 pub const STDERR_LABEL: &str = "[标准错误]";
 pub const NO_OUTPUT: &str = "（这条命令没有任何输出）";
 
@@ -125,14 +126,9 @@ pub fn signal_name(signal: i32) -> String {
     name.to_string()
 }
 
+#[derive(Default)]
 pub struct ChunkDecoder {
     carry: Vec<u8>,
-}
-
-impl Default for ChunkDecoder {
-    fn default() -> Self {
-        Self { carry: Vec::new() }
-    }
 }
 
 impl ChunkDecoder {

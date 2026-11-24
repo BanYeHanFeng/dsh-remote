@@ -11,22 +11,19 @@ use crate::fileio;
 use crate::frame::{read_frame, write_frame};
 use crate::protocol::{Failure, OpFrame, OpRequest, Role};
 use crate::text::ChunkDecoder;
-use crate::transport;
-use quinn::Endpoint;
+use crate::transport::{self, Stream};
 
 pub struct AgentOptions {
     pub connect: String,
     pub id: String,
     pub tags: Vec<String>,
     pub psk: Vec<u8>,
-    pub cert_pin: Option<String>,
 }
 
 pub async fn run(opts: AgentOptions) -> Result<()> {
-    let endpoint = transport::client_endpoint(opts.cert_pin.as_deref())?;
     let mut backoff = 1u64;
     loop {
-        match session(&endpoint, &opts).await {
+        match session(&opts).await {
             Ok(()) => {
                 tracing::info!("与控制端的会话已结束，准备重连");
                 backoff = 1;
@@ -40,23 +37,28 @@ pub async fn run(opts: AgentOptions) -> Result<()> {
     }
 }
 
-async fn session(endpoint: &Endpoint, opts: &AgentOptions) -> Result<()> {
-    let peer = transport::resolve(&opts.connect).await?;
-    let connecting = endpoint
-        .connect(peer, crate::protocol::SERVER_NAME)
-        .with_context(|| format!("发起连接失败：{}", opts.connect))?;
-    let conn = connecting.await.context("QUIC 握手失败")?;
-    let control = transport::client_auth(&conn, &opts.psk, Role::Agent, &opts.id, &opts.tags).await?;
-    tracing::info!(node = %opts.id, peer = %conn.remote_address(), "已接入控制端");
+async fn session(opts: &AgentOptions) -> Result<()> {
+    let session = transport::connect(&opts.connect, &opts.psk, Role::Agent, &opts.id, &opts.tags)
+        .await
+        .with_context(|| format!("接入 {} 失败", opts.connect))?;
+    let mut control = session.open().await.context("打开控制流失败")?;
+    write_frame(
+        &mut control,
+        &crate::protocol::ControlMsg::Hello {
+            node_id: opts.id.clone(),
+        },
+    )
+    .await
+    .context("发送控制流问候失败")?;
+    tracing::info!(node = %opts.id, peer = %session.peer(), "已接入控制端");
 
     let mut control_task = tokio::spawn(control_loop(control));
     loop {
         tokio::select! {
-            accepted = transport::accept(&conn) => match accepted {
+            accepted = session.accept() => match accepted {
                 Ok(stream) => {
-                    let conn = conn.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = handle_op(conn, stream).await {
+                        if let Err(error) = handle_op(stream).await {
                             tracing::warn!(error = %format!("{error:#}"), "处理远程操作失败");
                         }
                     });
@@ -64,29 +66,25 @@ async fn session(endpoint: &Endpoint, opts: &AgentOptions) -> Result<()> {
                 Err(_) => break,
             },
             _ = &mut control_task => break,
-            reason = conn.closed() => {
-                tracing::info!(reason = %reason, "连接已关闭");
+            _ = session.closed() => {
+                tracing::info!("与控制端的连接已关闭");
                 break;
             }
         }
     }
     control_task.abort();
+    session.close().await;
     Ok(())
 }
 
-async fn control_loop(mut stream: transport::Stream) {
-    loop {
-        match read_frame::<_, crate::protocol::ControlMsg>(&mut stream).await {
-            Ok(crate::protocol::ControlMsg::Ping) => {
-                let _ = write_frame(&mut stream, &crate::protocol::ControlMsg::Pong).await;
-            }
-            Ok(_) => {}
-            Err(_) => return,
-        }
-    }
+async fn control_loop(mut control: Stream) {
+    while read_frame::<_, crate::protocol::ControlMsg>(&mut control)
+        .await
+        .is_ok()
+    {}
 }
 
-async fn handle_op(_conn: quinn::Connection, mut stream: transport::Stream) -> Result<()> {
+async fn handle_op(mut stream: Stream) -> Result<()> {
     let request: OpRequest = match read_frame(&mut stream).await {
         Ok(request) => request,
         Err(error) => {
@@ -111,13 +109,8 @@ async fn handle_op(_conn: quinn::Connection, mut stream: transport::Stream) -> R
     Ok(())
 }
 
-async fn run_exec(
-    stream: transport::Stream,
-    command: String,
-    workdir: Option<String>,
-    timeout_secs: u64,
-) {
-    let (mut recv, send) = stream.into_inner();
+async fn run_exec(stream: Stream, command: String, workdir: Option<String>, timeout_secs: u64) {
+    let (mut recv, send) = tokio::io::split(stream);
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
         .arg(&command)
@@ -148,8 +141,8 @@ async fn run_exec(
         let mut buf = [0u8; 64];
         loop {
             match recv.read(&mut buf).await {
-                Ok(Some(_)) => continue,
-                _ => break,
+                Ok(0) | Err(_) => break,
+                Ok(_) => continue,
             }
         }
         let _ = cancel_tx.send(()).await;
@@ -241,7 +234,7 @@ async fn deliver(tx: &mpsc::Sender<OpFrame>, is_stdout: bool, text: String) -> b
 }
 
 async fn run_upload(
-    mut stream: transport::Stream,
+    mut stream: Stream,
     remote_path: String,
     size: u64,
     mode: Option<u32>,
@@ -281,7 +274,7 @@ async fn run_upload(
     let _ = stream.shutdown().await;
 }
 
-async fn run_download(mut stream: transport::Stream, remote_path: String) {
+async fn run_download(mut stream: Stream, remote_path: String) {
     let path = PathBuf::from(&remote_path);
     let (mut file, size, mode) = match fileio::open_regular(&path).await {
         Ok(parts) => parts,
@@ -291,7 +284,10 @@ async fn run_download(mut stream: transport::Stream, remote_path: String) {
             return;
         }
     };
-    if write_frame(&mut stream, &OpFrame::Ack { size, mode }).await.is_err() {
+    if write_frame(&mut stream, &OpFrame::Ack { size, mode })
+        .await
+        .is_err()
+    {
         return;
     }
     match fileio::pump_file_to(&mut file, &mut stream, size).await {
@@ -318,17 +314,4 @@ pub fn default_node_id() -> String {
         .and_then(|name| name.into_string().ok())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| format!("node-{}", std::process::id()))
-}
-
-pub fn validate_node_id(id: &str) -> Result<()> {
-    if id.trim().is_empty() {
-        return Err(anyhow::anyhow!("节点标识不能为空"));
-    }
-    if id.contains(|c: char| c.is_whitespace() || c == ':' || c == '/') {
-        return Err(anyhow::anyhow!(
-            "节点标识不能包含空白字符、冒号或斜杠：{}",
-            id
-        ));
-    }
-    Ok(())
 }

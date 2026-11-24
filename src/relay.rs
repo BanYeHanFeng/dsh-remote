@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -10,18 +10,16 @@ use tokio::sync::{mpsc, RwLock};
 use crate::fileio;
 use crate::frame::{read_frame, write_frame};
 use crate::protocol::{ControlMsg, ErrorCode, Failure, OpFrame, OpRequest, RelayHeader, Role};
-use crate::transport::{self, Stream};
+use crate::transport::{self, Peer, Session, Stream};
 
 pub struct RelayOptions {
     pub listen: String,
     pub psk: Vec<u8>,
-    pub cert: Option<PathBuf>,
-    pub key: Option<PathBuf>,
 }
 
 struct NodeHandle {
     role: Role,
-    conn: quinn::Connection,
+    session: Session,
     tags: Vec<String>,
 }
 
@@ -42,26 +40,27 @@ impl Relay {
         }
     }
 
-    async fn register(&self, node_id: String, role: Role, conn: quinn::Connection, tags: Vec<String>) {
+    async fn register(&self, node_id: String, role: Role, session: Session, tags: Vec<String>) {
         let mut nodes = self.nodes.write().await;
         if let Some(old) = nodes.insert(
-            node_id.clone(),
+            node_id,
             NodeHandle {
                 role,
-                conn: conn.clone(),
+                session: session.clone(),
                 tags,
             },
         ) {
-            if old.conn.stable_id() != conn.stable_id() {
-                old.conn.close(0u32.into(), b"replaced");
+            if old.session.id() != session.id() {
+                let stale = old.session.clone();
+                tokio::spawn(async move { stale.close().await });
             }
         }
     }
 
-    async fn unregister(&self, node_id: &str, conn: &quinn::Connection) -> bool {
+    async fn unregister(&self, node_id: &str, session: &Session) -> bool {
         let mut nodes = self.nodes.write().await;
         match nodes.get(node_id) {
-            Some(handle) if handle.conn.stable_id() == conn.stable_id() => {
+            Some(handle) if handle.session.id() == session.id() => {
                 nodes.remove(node_id);
                 true
             }
@@ -79,10 +78,10 @@ impl Relay {
             .collect()
     }
 
-    async fn agent_conn(&self, node_id: &str) -> Option<quinn::Connection> {
+    async fn agent_session(&self, node_id: &str) -> Option<Session> {
         let nodes = self.nodes.read().await;
         match nodes.get(node_id) {
-            Some(handle) if handle.role == Role::Agent => Some(handle.conn.clone()),
+            Some(handle) if handle.role == Role::Agent => Some(handle.session.clone()),
             _ => None,
         }
     }
@@ -98,12 +97,14 @@ impl Relay {
     }
 
     async fn open_op(&self, node_id: &str) -> Result<Stream, Failure> {
-        let conn = self
-            .agent_conn(node_id)
-            .await
-            .ok_or_else(|| Failure::new(ErrorCode::NodeOffline, format!("节点 {} 不在线", node_id)))?;
-        transport::open(&conn).await.map_err(|error| {
-            Failure::new(ErrorCode::NodeOffline, format!("无法连接节点 {}：{:#}", node_id, error))
+        let session = self.agent_session(node_id).await.ok_or_else(|| {
+            Failure::new(ErrorCode::NodeOffline, format!("节点 {} 不在线", node_id))
+        })?;
+        session.open().await.map_err(|error| {
+            Failure::new(
+                ErrorCode::NodeOffline,
+                format!("无法连接节点 {}：{:#}", node_id, error),
+            )
         })
     }
 
@@ -124,9 +125,9 @@ impl Relay {
         )
         .await
         .map_err(|e| Failure::new(ErrorCode::IoError, format!("向源节点发送请求失败：{:#}", e)))?;
-        let ack: OpFrame = read_frame(&mut dl)
-            .await
-            .map_err(|e| Failure::new(ErrorCode::IoError, format!("读取源节点响应失败：{:#}", e)))?;
+        let ack: OpFrame = read_frame(&mut dl).await.map_err(|e| {
+            Failure::new(ErrorCode::IoError, format!("读取源节点响应失败：{:#}", e))
+        })?;
         let (size, mode) = match ack {
             OpFrame::Ack { size, mode } => (size, mode),
             OpFrame::Err { code, message } => return Err(Failure { code, message }),
@@ -144,24 +145,27 @@ impl Relay {
             },
         )
         .await
-        .map_err(|e| Failure::new(ErrorCode::IoError, format!("向目标节点发送请求失败：{:#}", e)))?;
-        match read_frame::<_, OpFrame>(&mut up)
-            .await
-            .map_err(|e| Failure::new(ErrorCode::IoError, format!("读取目标节点响应失败：{:#}", e)))?
-        {
+        .map_err(|e| {
+            Failure::new(
+                ErrorCode::IoError,
+                format!("向目标节点发送请求失败：{:#}", e),
+            )
+        })?;
+        match read_frame::<_, OpFrame>(&mut up).await.map_err(|e| {
+            Failure::new(ErrorCode::IoError, format!("读取目标节点响应失败：{:#}", e))
+        })? {
             OpFrame::Ack { .. } => {}
             other => {
-                return Err(other
-                    .into_result()
-                    .err()
-                    .unwrap_or_else(|| crate::protocol::internal("目标节点返回了意料之外的响应帧")))
+                return Err(other.into_result().err().unwrap_or_else(|| {
+                    crate::protocol::internal("目标节点返回了意料之外的响应帧")
+                }))
             }
         }
 
         let sha = fileio::write_hashed_copy(&mut dl, &mut up, size).await?;
-        let source: OpFrame = read_frame(&mut dl)
-            .await
-            .map_err(|e| Failure::new(ErrorCode::IoError, format!("读取源节点响应失败：{:#}", e)))?;
+        let source: OpFrame = read_frame(&mut dl).await.map_err(|e| {
+            Failure::new(ErrorCode::IoError, format!("读取源节点响应失败：{:#}", e))
+        })?;
         if let OpFrame::Err { code, message } = source {
             return Err(Failure { code, message });
         }
@@ -184,96 +188,102 @@ async fn read_done(stream: &mut Stream) -> Result<crate::protocol::TransferDone,
 }
 
 pub async fn run(opts: RelayOptions) -> Result<()> {
-    let server = transport::server_endpoint(
-        &opts.listen,
-        opts.cert.as_deref(),
-        opts.key.as_deref(),
-    )?;
-    tracing::info!(
-        listen = %opts.listen,
-        fingerprint = %server.fingerprint,
-        "中继已启动"
-    );
+    let listener = transport::listen(&opts.listen).await?;
+    tracing::info!(listen = %opts.listen, "中继已启动");
     let relay = Arc::new(Relay::new(opts.psk));
 
     loop {
-        let incoming = match server.endpoint.accept().await {
-            Some(incoming) => incoming,
-            None => break,
+        let (stream, peer) = match listener.accept().await {
+            Ok(parts) => parts,
+            Err(error) => {
+                tracing::warn!(error = %error, "接受连接失败");
+                continue;
+            }
         };
         let relay = relay.clone();
         tokio::spawn(async move {
-            let conn = match incoming.await {
-                Ok(conn) => conn,
-                Err(error) => {
-                    tracing::warn!(error = %error, "QUIC 握手失败");
-                    return;
-                }
-            };
-            if let Err(error) = handle_conn(relay, conn).await {
-                tracing::warn!(error = %format!("{error:#}"), "中继连接处理结束");
+            if let Err(error) = handle_conn(relay, stream, peer).await {
+                tracing::warn!(peer = %peer, error = %format!("{error:#}"), "中继连接处理结束");
             }
         });
     }
-    Ok(())
 }
 
-async fn handle_conn(relay: Arc<Relay>, conn: quinn::Connection) -> Result<()> {
-    let (role, node_id, tags, control) =
-        transport::serve_auth(&conn, &relay.psk, &[Role::Agent, Role::Controller]).await?;
-    match role {
+async fn handle_conn(
+    relay: Arc<Relay>,
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+) -> Result<()> {
+    let (session, info) =
+        transport::accept(stream, &relay.psk, &[Role::Agent, Role::Controller]).await?;
+    let result = serve_session(relay, session.clone(), info, peer).await;
+    session.close().await;
+    result
+}
+
+async fn serve_session(
+    relay: Arc<Relay>,
+    session: Session,
+    info: Peer,
+    peer: SocketAddr,
+) -> Result<()> {
+    let mut control = session.accept().await.context("读取控制流失败")?;
+    read_frame::<_, ControlMsg>(&mut control)
+        .await
+        .context("读取控制流问候失败")?;
+    match info.role {
         Role::Agent => {
             relay
-                .register(node_id.clone(), role, conn.clone(), tags.clone())
+                .register(
+                    info.node_id.clone(),
+                    Role::Agent,
+                    session.clone(),
+                    info.tags.clone(),
+                )
                 .await;
-            tracing::info!(node = %node_id, peer = %conn.remote_address(), "被控端已接入");
+            tracing::info!(node = %info.node_id, peer = %peer, "被控端已接入");
             relay
                 .broadcast(ControlMsg::NodeOnline {
-                    node_id: node_id.clone(),
-                    tags,
+                    node_id: info.node_id.clone(),
+                    tags: info.tags,
                 })
                 .await;
-            let accept = tokio::spawn(accept_loop(relay.clone(), conn.clone(), node_id.clone()));
-            control_loop(&conn, control).await;
+            let accept = tokio::spawn(accept_loop(
+                relay.clone(),
+                session.clone(),
+                info.node_id.clone(),
+            ));
+            control_loop(&session, control).await;
             accept.abort();
-            if relay.unregister(&node_id, &conn).await {
-                tracing::info!(node = %node_id, "被控端已离线");
+            if relay.unregister(&info.node_id, &session).await {
+                tracing::info!(node = %info.node_id, "被控端已离线");
                 relay
                     .broadcast(ControlMsg::NodeOffline {
-                        node_id: node_id.clone(),
+                        node_id: info.node_id.clone(),
                     })
                     .await;
             }
+            session.close().await;
         }
         Role::Controller => {
-            serve_controller(relay, &node_id, conn, control).await;
+            serve_controller(relay, &info.node_id, session, control, peer).await;
         }
     }
     Ok(())
 }
 
-async fn control_loop(conn: &quinn::Connection, mut control: Stream) {
+async fn control_loop(session: &Session, mut control: Stream) {
     tokio::select! {
         _ = async {
-            loop {
-                match read_frame::<_, ControlMsg>(&mut control).await {
-                    Ok(ControlMsg::Ping) => {
-                        if write_frame(&mut control, &ControlMsg::Pong).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => return,
-                }
-            }
+            while read_frame::<_, ControlMsg>(&mut control).await.is_ok() {}
         } => {}
-        _ = conn.closed() => {}
+        _ = session.closed() => {}
     }
 }
 
-async fn accept_loop(relay: Arc<Relay>, conn: quinn::Connection, node_id: String) {
+async fn accept_loop(relay: Arc<Relay>, session: Session, node_id: String) {
     loop {
-        let stream = match transport::accept(&conn).await {
+        let stream = match session.accept().await {
             Ok(stream) => stream,
             Err(_) => return,
         };
@@ -288,10 +298,12 @@ async fn accept_loop(relay: Arc<Relay>, conn: quinn::Connection, node_id: String
 }
 
 async fn route(relay: Arc<Relay>, mut stream: Stream) -> Result<()> {
-    let header: RelayHeader = read_frame(&mut stream).await.context("读取中继流头部失败")?;
+    let header: RelayHeader = read_frame(&mut stream)
+        .await
+        .context("读取中继流头部失败")?;
     tracing::debug!(target = %header.target, "中继流准备转发");
-    let conn = match relay.agent_conn(&header.target).await {
-        Some(conn) => conn,
+    let session = match relay.agent_session(&header.target).await {
+        Some(session) => session,
         None => {
             let failure = Failure::new(
                 ErrorCode::NodeOffline,
@@ -301,7 +313,7 @@ async fn route(relay: Arc<Relay>, mut stream: Stream) -> Result<()> {
             return Ok(());
         }
     };
-    let mut target = transport::open(&conn).await.context("连接目标节点失败")?;
+    let mut target = session.open().await.context("连接目标节点失败")?;
     let (uploaded, downloaded) = tokio::io::copy_bidirectional(&mut stream, &mut target)
         .await
         .context("双向转发失败")?;
@@ -309,12 +321,18 @@ async fn route(relay: Arc<Relay>, mut stream: Stream) -> Result<()> {
     Ok(())
 }
 
-async fn serve_controller(relay: Arc<Relay>, node_id: &str, conn: quinn::Connection, control: Stream) {
-    let (mut recv, mut send) = control.into_inner();
+async fn serve_controller(
+    relay: Arc<Relay>,
+    node_id: &str,
+    session: Session,
+    control: Stream,
+    peer: SocketAddr,
+) {
+    let (mut recv, mut send) = tokio::io::split(control);
     let id = relay.next_controller.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::channel::<ControlMsg>(256);
     relay.controllers.write().await.insert(id, tx.clone());
-    tracing::info!(controller = %node_id, peer = %conn.remote_address(), "控制端已接入");
+    tracing::info!(controller = %node_id, peer = %peer, "控制端已接入");
 
     for (agent, tags) in relay.agent_list().await {
         if tx
@@ -337,41 +355,41 @@ async fn serve_controller(relay: Arc<Relay>, node_id: &str, conn: quinn::Connect
         }
         let _ = send.shutdown().await;
     });
-    let accept = tokio::spawn(accept_loop(relay.clone(), conn.clone(), node_id.to_string()));
+    let accept = tokio::spawn(accept_loop(
+        relay.clone(),
+        session.clone(),
+        node_id.to_string(),
+    ));
 
     loop {
-        let msg: ControlMsg = match read_frame(&mut recv).await {
-            Ok(msg) => msg,
-            Err(_) => break,
-        };
-        match msg {
-            ControlMsg::BridgeTransfer {
-                req_id,
-                src_node,
-                src_path,
-                dst_node,
-                dst_path,
-                overwrite,
-            } => {
-                let relay = relay.clone();
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let result = relay
-                        .bridge_transfer(&src_node, &src_path, &dst_node, &dst_path, overwrite)
-                        .await;
-                    let _ = tx.send(ControlMsg::BridgeResult { req_id, result }).await;
-                });
-            }
-            ControlMsg::Ping => {
-                let _ = tx.send(ControlMsg::Pong).await;
-            }
-            _ => {}
+        tokio::select! {
+            incoming = read_frame::<_, ControlMsg>(&mut recv) => match incoming {
+                Ok(ControlMsg::BridgeTransfer {
+                    req_id,
+                    src_node,
+                    src_path,
+                    dst_node,
+                    dst_path,
+                    overwrite,
+                }) => {
+                    let relay = relay.clone();
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let result = relay
+                            .bridge_transfer(&src_node, &src_path, &dst_node, &dst_path, overwrite)
+                            .await;
+                        let _ = tx.send(ControlMsg::BridgeResult { req_id, result }).await;
+                    });
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            },
+            _ = session.closed() => break,
         }
     }
 
     relay.controllers.write().await.remove(&id);
     accept.abort();
     writer.abort();
-    conn.close(0u32.into(), b"bye");
     tracing::info!(controller = %node_id, "控制端已断开");
 }
