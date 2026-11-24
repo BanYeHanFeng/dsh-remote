@@ -25,6 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 yamux = "0.13"
 
 [profile.release]
-lto = "thin"
+lto = "fat"
+codegen-units = 1
 strip = true
 panic = "abort"
