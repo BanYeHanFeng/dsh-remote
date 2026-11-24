@@ -29,9 +29,9 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-latest
           - arch: aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -71,7 +71,7 @@ jobs:
   publish:
     name: Publish
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
