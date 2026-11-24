@@ -385,7 +385,7 @@ configure_controller() {
   listen=$(normalize_addr "${listen}")
   write_controller_config "${listen}" "${relay_normalized}" "${mcp_http}" "${psk}"
   enable_service controller
-  print_access_command controller "${listen}"
+  msg "部署完成，接入命令见主菜单「5) 生成被控端一键接入命令」"
 }
 
 configure_relay() {
@@ -407,7 +407,7 @@ configure_relay() {
   parse_tags "${tags}"
   write_relay_config "${listen}" "${id}" "${psk}" "${local_enabled}" "${TAG_LIST[@]:-}"
   enable_service relay
-  print_access_command relay "${listen}"
+  msg "部署完成，接入命令见主菜单「5) 生成被控端一键接入命令」"
 }
 
 configure_agent() {
@@ -427,6 +427,7 @@ configure_agent() {
   parse_tags "${tags}"
   write_agent_config "$(normalize_addr "${connect}")" "${id}" "${psk}" "${TAG_LIST[@]:-}"
   enable_service agent
+  msg "部署完成"
 }
 
 service_menu() {
