@@ -9,8 +9,6 @@ DEFAULT_PORT="7443"
 REPO="BanYeHanFeng/dsh-remote"
 SCRIPT_URL="https://raw.githubusercontent.com/${REPO}/dev/scripts/dsh-remote.sh"
 
-ROLES=(controller "控制端" relay "中继" agent "被控端")
-
 msg() { printf '%s\n' "$*" >&2; }
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
 
@@ -220,7 +218,7 @@ EOF
   msg "已写入 ${unit}"
 }
 
-enable_service() {
+deploy_service() {
   local role="$1"
   write_unit "${role}"
   systemctl enable "dsh-remote-${role}.service" >/dev/null 2>&1 || true
@@ -229,11 +227,27 @@ enable_service() {
   systemctl --no-pager --lines=0 status "dsh-remote-${role}.service" || true
 }
 
+config_value() {
+  local file="${ETC_DIR}/$1.toml"
+  [[ -f ${file} ]] || return 0
+  sed -n "s/^$2 = \"\(.*\)\"\$/\1/p" "${file}"
+}
+
+update_role() {
+  local role="$1"
+  if [[ ! -f "${ETC_DIR}/${role}.toml" ]]; then
+    msg "未找到 ${ETC_DIR}/${role}.toml，请先执行「安装」"
+    return 1
+  fi
+  install_binary
+  deploy_service "${role}"
+}
+
 service_action() {
   local role="$1" action="$2"
   local unit="dsh-remote-${role}.service"
   if [[ ! -f $(unit_path "${role}") ]]; then
-    msg "${unit} 未安装，请先执行「配置并部署${role}」"
+    msg "${unit} 未安装，请先执行「安装」"
     return 1
   fi
   case ${action} in
@@ -259,7 +273,7 @@ service_action() {
 print_access_command() {
   local role="$1" connect="$2"
   local psk
-  psk=$(sed -n 's/^psk = "\(.*\)"$/\1/p' "${ETC_DIR}/${role}.toml" | head -n1)
+  psk=$(config_value "${role}" psk)
   [[ -n ${psk} ]] || die "读取 ${ETC_DIR}/${role}.toml 中的 psk 失败"
   local url="${DSH_REMOTE_SCRIPT_URL:-${SCRIPT_URL}}"
   msg ""
@@ -307,8 +321,8 @@ configure_controller() {
   fi
   listen=$(normalize_addr "${listen}")
   write_controller_config "${listen}" "${relay_normalized}" "${mcp_http}" "${psk}"
-  enable_service controller
-  msg "部署完成；重新运行脚本选择「生成被控端一键接入命令」即可查看接入命令"
+  deploy_service controller
+  msg "部署完成；可在本菜单选择「生成被控端一键接入命令」查看接入命令"
 }
 
 configure_relay() {
@@ -324,8 +338,8 @@ configure_relay() {
   install_binary
   listen=$(normalize_addr "${listen}")
   write_relay_config "${listen}" "${id}" "${psk}" "${local_enabled}"
-  enable_service relay
-  msg "部署完成；重新运行脚本选择「生成被控端一键接入命令」即可查看接入命令"
+  deploy_service relay
+  msg "部署完成；可在本菜单选择「生成被控端一键接入命令」查看接入命令"
 }
 
 configure_agent() {
@@ -339,45 +353,60 @@ configure_agent() {
   [[ -n ${psk} ]] || die "PSK 不能为空"
   install_binary
   write_agent_config "$(normalize_addr "${connect}")" "${id}" "${psk}"
-  enable_service agent
+  deploy_service agent
   msg "部署完成"
 }
 
+role_label() {
+  case $1 in
+    controller) printf '控制端（controller）' ;;
+    relay) printf '中继（relay）' ;;
+    agent) printf '被控端（agent）' ;;
+  esac
+}
+
 service_menu() {
-  local role action
-  role=$(ask_menu "服务管理" "选择角色" "返回上一级" "${ROLES[@]}") || return 1
-  action=$(ask_menu "服务管理 - ${role}" "选择操作" "返回上一级" \
+  local role="$1" action
+  action=$(ask_menu "服务管理 - $(role_label "${role}")" "选择操作" "返回上一级" \
     status "查看状态" start "启动" stop "停止" restart "重启" logs "实时日志" uninstall "卸载服务") || return 1
   service_action "${role}" "${action}"
 }
 
-access_menu() {
-  local role addr
-  role=$(ask_menu "一键接入命令" "选择服务角色" "返回上一级" "${ROLES[@]}") || return 1
-  addr=$(sed -n 's/^listen = "\(.*\)"$/\1/p' "${ETC_DIR}/${role}.toml" | head -n1)
-  [[ -n ${addr} ]] || die "读取 ${ETC_DIR}/${role}.toml 中的 listen 失败"
-  print_access_command "${role}" "${addr}"
+role_menu() {
+  local role="$1" action addr
+  local -a items=(install "安装 / 重新配置" update "更新二进制并重启服务" service "服务管理（状态/启停/日志/卸载）")
+  if [[ ${role} != "agent" ]]; then
+    items+=(access "生成被控端一键接入命令")
+  fi
+  while true; do
+    action=$(ask_menu "$(role_label "${role}")" "选择要执行的操作" "返回上一级" "${items[@]}") || return 0
+    case ${action} in
+      install) "configure_${role}" ;;
+      update) update_role "${role}" ;;
+      service) service_menu "${role}" || true ;;
+      access)
+        addr=$(config_value "${role}" listen)
+        if [[ -z ${addr} ]]; then
+          msg "读取 ${ETC_DIR}/${role}.toml 中的 listen 失败，请先执行「安装」"
+          continue
+        fi
+        print_access_command "${role}" "${addr}"
+        ;;
+    esac
+    printf '\n按回车继续...' >&2
+    read -r _ || true
+  done
 }
 
 main_menu() {
   need_tty
-  local choice
+  local role
   while true; do
-    choice=$(ask_menu "dsh-remote 一键配置" "请选择要执行的操作" "退出" \
-      controller "配置并部署控制端（controller）" \
-      relay "配置并部署中继（relay）" \
-      agent "配置并部署被控端（agent）" \
-      service "服务管理（状态/启停/日志/卸载）" \
-      access "生成被控端一键接入命令") || return 0
-    case ${choice} in
-      controller) configure_controller ;;
-      relay) configure_relay ;;
-      agent) configure_agent ;;
-      service) service_menu || continue ;;
-      access) access_menu || continue ;;
-    esac
-    printf '\n按回车返回主菜单...' >&2
-    read -r _ || true
+    role=$(ask_menu "dsh-remote 一键配置" "请选择要管理的角色" "退出" \
+      controller "控制端（controller）" \
+      relay "中继（relay）" \
+      agent "被控端（agent）") || return 0
+    role_menu "${role}"
   done
 }
 
@@ -391,6 +420,7 @@ usage() {
   relay                   交互式配置并部署中继
   agent                   配置并部署被控端（支持全参数非交互）
   install                 按当前架构下载并安装最新发布的二进制
+  update <controller|relay|agent>     更新二进制并按现有配置重启服务
   status|start|stop|restart|logs|uninstall <controller|relay|agent>
   access [controller|relay]   打印被控端一键接入命令
 
@@ -456,15 +486,15 @@ case ${subcmd} in
   agent) configure_agent ;;
   install) install_binary ;;
   access)
+    role="${ARGS[1]:-controller}"
+    addr=$(config_value "${role}" listen)
+    [[ -n ${addr} ]] || die "读取 ${ETC_DIR}/${role}.toml 中的 listen 失败"
+    print_access_command "${role}" "${addr}"
+    ;;
+  update)
     role="${ARGS[1]:-}"
-    if [[ -z ${role} ]]; then
-      need_tty
-      access_menu
-    else
-      addr=$(sed -n 's/^listen = "\(.*\)"$/\1/p' "${ETC_DIR}/${role}.toml" | head -n1)
-      [[ -n ${addr} ]] || die "读取 ${ETC_DIR}/${role}.toml 中的 listen 失败"
-      print_access_command "${role}" "${addr}"
-    fi
+    [[ -n ${role} ]] || die "请指定角色：controller / relay / agent"
+    update_role "${role}"
     ;;
   status | start | stop | restart | logs | uninstall)
     role="${ARGS[1]:-}"
