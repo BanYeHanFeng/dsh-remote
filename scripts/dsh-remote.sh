@@ -226,6 +226,12 @@ deploy_service() {
   systemctl --no-pager --lines=0 status "dsh-remote-${role}.service" || true
 }
 
+config_value() {
+  local file="${ETC_DIR}/$1.toml"
+  [[ -f ${file} ]] || return 0
+  sed -n "s/^$2 = \"\(.*\)\"\$/\1/p" "${file}"
+}
+
 update_role() {
   local role="$1"
   if [[ ! -f "${ETC_DIR}/${role}.toml" ]]; then
@@ -264,7 +270,12 @@ service_action() {
 }
 
 ask_psk() {
-  local generated psk
+  local current="${1:-}" generated psk
+  if [[ -n ${current} ]]; then
+    psk=$(ask_password "PSK（回车保持现有）")
+    printf '%s\n' "${psk:-${current}}"
+    return 0
+  fi
   generated=$(gen_psk)
   if ask_yesno "是否自动生成 32 字节随机 PSK？\n（选否可手动输入，需与控制端/中继一致）"; then
     msg "已生成 PSK：${generated}"
@@ -277,11 +288,13 @@ ask_psk() {
 }
 
 configure_controller() {
-  local listen relay_addr mcp_http psk
-  listen=$(ask_input "监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "0.0.0.0:${DEFAULT_PORT}")
-  relay_addr=$(ask_input "可选：要接入的中继地址，留空表示纯直连模式")
-  mcp_http=$(ask_input "可选：MCP Streamable HTTP 监听地址，留空表示不开启")
-  psk=$(ask_psk)
+  local listen relay_addr mcp_http psk default_listen
+  default_listen=$(config_value controller listen)
+  default_listen="${default_listen:-0.0.0.0:${DEFAULT_PORT}}"
+  listen=$(ask_input "监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "${default_listen}")
+  relay_addr=$(ask_input "可选：要接入的中继地址，留空表示纯直连模式" "$(config_value controller relay)")
+  mcp_http=$(ask_input "可选：MCP Streamable HTTP 监听地址，留空表示不开启" "$(config_value controller mcp_http)")
+  psk=$(ask_psk "$(config_value controller psk)")
   install_binary
   local relay_normalized=""
   if [[ -n ${relay_addr} ]]; then
@@ -290,38 +303,55 @@ configure_controller() {
   listen=$(normalize_addr "${listen}")
   write_controller_config "${listen}" "${relay_normalized}" "${mcp_http}" "${psk}"
   deploy_service controller
-  msg "部署完成；可在本菜单选择「生成被控端一键接入命令」查看接入命令"
+  msg "部署完成"
 }
 
 configure_relay() {
-  local listen psk id local_enabled
-  listen=$(ask_input "监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "0.0.0.0:${DEFAULT_PORT}")
+  local listen psk id local_enabled old_id default_local default_listen
+  default_listen=$(config_value relay listen)
+  default_listen="${default_listen:-0.0.0.0:${DEFAULT_PORT}}"
+  listen=$(ask_input "监听地址（如 0.0.0.0:${DEFAULT_PORT}）" "${default_listen}")
+  old_id=$(config_value relay id)
+  default_local=y
+  if grep -qx 'local = false' "${ETC_DIR}/relay.toml" 2>/dev/null; then
+    default_local=n
+  fi
   local_enabled=0
   id=""
-  if ask_yesno "是否允许控制端在中继本机上执行命令？\n（开启后中继本机会以节点形式出现在节点列表）" y; then
+  if ask_yesno "是否允许控制端在中继本机上执行命令？\n（开启后中继本机会以节点形式出现在节点列表）" "${default_local}"; then
     local_enabled=1
-    id=$(ask_input "中继本机作为节点时使用的标识" "$(hostname)")
+    id=$(ask_input "中继本机作为节点时使用的标识" "${old_id:-$(hostname)}")
   fi
-  psk=$(ask_psk)
+  psk=$(ask_psk "$(config_value relay psk)")
   install_binary
   listen=$(normalize_addr "${listen}")
   write_relay_config "${listen}" "${id}" "${psk}" "${local_enabled}"
   deploy_service relay
-  msg "部署完成；可在本菜单选择「生成被控端一键接入命令」查看接入命令"
+  msg "部署完成"
 }
 
 configure_agent() {
-  local connect id psk
+  local connect id psk prompt old_connect old_id old_psk
+  old_connect=$(config_value agent connect)
+  old_id=$(config_value agent id)
+  old_psk=$(config_value agent psk)
   connect="${AGENT_CONNECT:-}"
-  [[ -n ${connect} ]] || connect=$(ask_input "控制端或中继地址（如 10.0.0.1:${DEFAULT_PORT}）")
+  [[ -n ${connect} ]] || connect=$(ask_input "控制端或中继地址（如 10.0.0.1:${DEFAULT_PORT}）" "${old_connect}")
   [[ -n ${connect} ]] || die "接入地址不能为空"
   id="${AGENT_ID:-}"
   if [[ -z ${id} && -t 0 ]]; then
-    id=$(ask_input "节点标识（用于在控制端区分不同机器）" "$(hostname)")
+    id=$(ask_input "节点标识（用于在控制端区分不同机器）" "${old_id:-$(hostname)}")
   fi
-  id="${id:-$(hostname)}"
+  id="${id:-${old_id:-$(hostname)}}"
   psk="${AGENT_PSK:-}"
-  [[ -n ${psk} ]] || psk=$(ask_password "请输入与控制端/中继一致的 PSK")
+  prompt="请输入与控制端/中继一致的 PSK"
+  if [[ -n ${old_psk} ]]; then
+    prompt="PSK（回车保持现有）"
+  fi
+  if [[ -z ${psk} && -t 0 ]]; then
+    psk=$(ask_password "${prompt}")
+  fi
+  psk="${psk:-${old_psk}}"
   [[ -n ${psk} ]] || die "PSK 不能为空"
   install_binary
   write_agent_config "$(normalize_addr "${connect}")" "${id}" "${psk}"
