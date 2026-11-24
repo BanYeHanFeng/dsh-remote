@@ -11,6 +11,8 @@ SCRIPT_URL="https://raw.githubusercontent.com/${REPO}/dev/scripts/dsh-remote.sh"
 
 UI=""
 
+ROLES=(controller "控制端" relay "中继" agent "被控端")
+
 msg() { printf '%s\n' "$*" >&2; }
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
 
@@ -35,25 +37,35 @@ ui_menu() {
   shift 2
   local -a items=("$@")
   local choice
-  if [[ ${UI} == "plain" ]]; then
-    {
-      printf '\n== %s ==\n%s\n' "${title}" "${text}"
-      local i=0
-      while [[ ${i} -lt ${#items[@]} ]]; do
-        printf '  %s) %s\n' "${items[i]}" "${items[i + 1]:-}"
-        i=$((i + 2))
-      done
-    } >&2
-    read -r -p "请输入编号：" choice
+  if [[ ${UI} != "plain" ]]; then
+    if [[ ${UI} == "whiptail" ]]; then
+      choice=$(whiptail --title "${title}" --menu "${text}" 20 72 10 "${items[@]}" 3>&1 1>&2 2>&3) || return 0
+    else
+      choice=$(dialog --stdout --title "${title}" --menu "${text}" 20 72 10 "${items[@]}") || return 0
+    fi
     printf '%s\n' "${choice}"
     return 0
   fi
-  if [[ ${UI} == "whiptail" ]]; then
-    choice=$(whiptail --title "${title}" --menu "${text}" 20 72 10 "${items[@]}" 3>&1 1>&2 2>&3)
-  else
-    choice=$(dialog --stdout --title "${title}" --menu "${text}" 20 72 10 "${items[@]}")
-  fi
-  printf '%s\n' "${choice}"
+  local -a keys=()
+  local i=0 n
+  printf '\n== %s ==\n%s\n' "${title}" "${text}" >&2
+  while [[ ${i} -lt ${#items[@]} ]]; do
+    keys+=("${items[i]}")
+    printf '  %d) %s\n' "$((i / 2 + 1))" "${items[i + 1]:-}" >&2
+    i=$((i + 2))
+  done
+  while true; do
+    read -r -p "请输入编号（回车返回）：" choice || return 0
+    [[ -n ${choice} ]] || return 0
+    if [[ ${choice} =~ ^[0-9]{1,3}$ ]]; then
+      n=$((10#${choice}))
+      if ((n >= 1 && n <= ${#keys[@]})); then
+        printf '%s\n' "${keys[n - 1]}"
+        return 0
+      fi
+    fi
+    msg "无效编号：${choice}"
+  done
 }
 
 ui_input() {
@@ -294,14 +306,21 @@ service_action() {
   local role="$1" action="$2"
   case ${action} in
     status) systemctl --no-pager --lines=20 status "dsh-remote-${role}.service" || true ;;
-    logs) journalctl -u "dsh-remote-${role}.service" -n 100 --no-pager -f ;;
+    logs)
+      trap '' INT
+      (trap - INT; journalctl -u "dsh-remote-${role}.service" -n 100 --no-pager -f) || true
+      trap - INT
+      ;;
     uninstall)
       systemctl disable --now "dsh-remote-${role}.service" >/dev/null 2>&1 || true
       rm -f "$(unit_path "${role}")"
       systemctl daemon-reload
       msg "已停止并移除 dsh-remote-${role}.service（配置文件与二进制保留）"
       ;;
-    *) systemctl "${action}" "dsh-remote-${role}.service" ;;
+    *)
+      systemctl "${action}" "dsh-remote-${role}.service"
+      systemctl is-active "dsh-remote-${role}.service" >&2 || true
+      ;;
   esac
 }
 
@@ -400,19 +419,18 @@ configure_agent() {
 
 service_menu() {
   local role action
-  role=$(ui_menu "服务管理" "选择角色" controller "控制端" relay "中继" agent "被控端")
-  [[ -n ${role} ]] || return 0
+  role=$(ui_menu "服务管理" "选择角色" "${ROLES[@]}")
+  [[ -n ${role} ]] || return 1
   action=$(ui_menu "服务管理 - ${role}" "选择操作" \
     status "查看状态" start "启动" stop "停止" restart "重启" logs "实时日志" uninstall "卸载服务")
-  [[ -n ${action} ]] || return 0
+  [[ -n ${action} ]] || return 1
   service_action "${role}" "${action}"
 }
 
 access_menu() {
-  local role
-  role=$(ui_menu "一键接入命令" "选择服务角色" controller "控制端" relay "中继")
-  [[ -n ${role} ]] || return 0
-  local addr
+  local role addr
+  role=$(ui_menu "一键接入命令" "选择服务角色" "${ROLES[@]:0:4}")
+  [[ -n ${role} ]] || return 1
   addr=$(sed -n 's/^listen = "\(.*\)"$/\1/p' "${ETC_DIR}/${role}.toml" | head -n1)
   [[ -n ${addr} ]] || die "读取 ${ETC_DIR}/${role}.toml 中的 listen 失败"
   print_access_command "${role}" "${addr}"
@@ -422,20 +440,19 @@ main_menu() {
   while true; do
     local choice
     choice=$(ui_menu "dsh-remote 一键配置" "请选择要执行的操作" \
-      1 "配置并部署控制端（controller）" \
-      2 "配置并部署中继（relay）" \
-      3 "配置并部署被控端（agent）" \
-      4 "服务管理（状态/启停/日志/卸载）" \
-      5 "生成被控端一键接入命令" \
-      0 "退出") || return 0
+      controller "配置并部署控制端（controller）" \
+      relay "配置并部署中继（relay）" \
+      agent "配置并部署被控端（agent）" \
+      service "服务管理（状态/启停/日志/卸载）" \
+      access "生成被控端一键接入命令" \
+      quit "退出") || return 0
     case ${choice} in
-      1) configure_controller ;;
-      2) configure_relay ;;
-      3) configure_agent ;;
-      4) service_menu ;;
-      5) access_menu ;;
-      0 | "") return 0 ;;
-      *) msg "无效选择：${choice}" ;;
+      controller) configure_controller ;;
+      relay) configure_relay ;;
+      agent) configure_agent ;;
+      service) service_menu || continue ;;
+      access) access_menu || continue ;;
+      quit | "") return 0 ;;
     esac
     printf '\n按回车返回主菜单...' >&2
     read -r _ || true
