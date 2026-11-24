@@ -5,16 +5,24 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
 
 use crate::fileio;
 use crate::frame::{read_frame, write_frame};
+use crate::node;
 use crate::protocol::{ControlMsg, ErrorCode, Failure, OpFrame, OpRequest, RelayHeader, Role};
 use crate::transport::{self, Peer, Session, Stream};
 
 pub struct RelayOptions {
     pub listen: String,
     pub psk: Vec<u8>,
+    pub local: Option<LocalNode>,
+}
+
+pub struct LocalNode {
+    pub id: String,
+    pub tags: Vec<String>,
 }
 
 struct NodeHandle {
@@ -25,22 +33,53 @@ struct NodeHandle {
 
 pub struct Relay {
     psk: Vec<u8>,
+    local: Option<LocalNode>,
     nodes: RwLock<HashMap<String, NodeHandle>>,
     controllers: RwLock<HashMap<u64, mpsc::Sender<ControlMsg>>>,
     next_controller: AtomicU64,
 }
 
 impl Relay {
-    fn new(psk: Vec<u8>) -> Self {
+    pub fn new(psk: Vec<u8>, local: Option<LocalNode>) -> Self {
         Self {
             psk,
+            local,
             nodes: RwLock::new(HashMap::new()),
             controllers: RwLock::new(HashMap::new()),
             next_controller: AtomicU64::new(1),
         }
     }
 
+    pub async fn serve(self: Arc<Self>, listener: TcpListener) -> ! {
+        loop {
+            let (stream, peer) = match listener.accept().await {
+                Ok(parts) => parts,
+                Err(error) => {
+                    tracing::warn!(error = %error, "接受连接失败");
+                    continue;
+                }
+            };
+            let relay = self.clone();
+            tokio::spawn(async move {
+                if let Err(error) = handle_conn(relay, stream, peer).await {
+                    tracing::warn!(peer = %peer, error = %format!("{error:#}"), "中继连接处理结束");
+                }
+            });
+        }
+    }
+
+    /// 中继本机作为节点：同名的远端被控端优先，本地让位
+    async fn is_local(&self, node_id: &str) -> bool {
+        match &self.local {
+            Some(local) if local.id == node_id => !self.nodes.read().await.contains_key(node_id),
+            _ => false,
+        }
+    }
+
     async fn register(&self, node_id: String, role: Role, session: Session, tags: Vec<String>) {
+        if self.local.as_ref().is_some_and(|local| local.id == node_id) {
+            tracing::warn!(node = %node_id, "远端被控端与中继本机同名，本机节点让位");
+        }
         let mut nodes = self.nodes.write().await;
         if let Some(old) = nodes.insert(
             node_id,
@@ -69,13 +108,20 @@ impl Relay {
     }
 
     async fn agent_list(&self) -> Vec<(String, Vec<String>)> {
-        self.nodes
+        let mut list: Vec<(String, Vec<String>)> = self
+            .nodes
             .read()
             .await
             .iter()
             .filter(|(_, handle)| handle.role == Role::Agent)
             .map(|(id, handle)| (id.clone(), handle.tags.clone()))
-            .collect()
+            .collect();
+        if let Some(local) = &self.local {
+            if !list.iter().any(|(id, _)| id == &local.id) {
+                list.push((local.id.clone(), local.tags.clone()));
+            }
+        }
+        list
     }
 
     async fn agent_session(&self, node_id: &str) -> Option<Session> {
@@ -97,6 +143,15 @@ impl Relay {
     }
 
     async fn open_op(&self, node_id: &str) -> Result<Stream, Failure> {
+        if self.is_local(node_id).await {
+            let (mine, theirs) = transport::local_pair();
+            tokio::spawn(async move {
+                if let Err(error) = node::serve(theirs).await {
+                    tracing::warn!(error = %format!("{error:#}"), "本机节点处理操作失败");
+                }
+            });
+            return Ok(mine);
+        }
         let session = self.agent_session(node_id).await.ok_or_else(|| {
             Failure::new(ErrorCode::NodeOffline, format!("节点 {} 不在线", node_id))
         })?;
@@ -190,23 +245,11 @@ async fn read_done(stream: &mut Stream) -> Result<crate::protocol::TransferDone,
 pub async fn run(opts: RelayOptions) -> Result<()> {
     let listener = transport::listen(&opts.listen).await?;
     tracing::info!(listen = %opts.listen, "中继已启动");
-    let relay = Arc::new(Relay::new(opts.psk));
-
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(parts) => parts,
-            Err(error) => {
-                tracing::warn!(error = %error, "接受连接失败");
-                continue;
-            }
-        };
-        let relay = relay.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_conn(relay, stream, peer).await {
-                tracing::warn!(peer = %peer, error = %format!("{error:#}"), "中继连接处理结束");
-            }
-        });
+    if let Some(local) = &opts.local {
+        tracing::info!(node = %local.id, "中继本机已作为节点加入");
     }
+    let relay = Arc::new(Relay::new(opts.psk, opts.local));
+    relay.serve(listener).await
 }
 
 async fn handle_conn(
@@ -301,6 +344,10 @@ async fn route(relay: Arc<Relay>, mut stream: Stream) -> Result<()> {
     let header: RelayHeader = read_frame(&mut stream)
         .await
         .context("读取中继流头部失败")?;
+    if relay.is_local(&header.target).await {
+        tracing::debug!(target = %header.target, "本机节点处理业务流");
+        return node::serve(stream).await;
+    }
     tracing::debug!(target = %header.target, "中继流准备转发");
     let session = match relay.agent_session(&header.target).await {
         Some(session) => session,

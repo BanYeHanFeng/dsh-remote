@@ -75,6 +75,12 @@ struct ControllerArgs {
 struct RelayArgs {
     #[arg(long, value_name = "ADDR", help = "监听地址，如 0.0.0.0:7443")]
     listen: Option<String>,
+    #[arg(long, value_name = "ID", help = "中继本机作为节点的标识，默认取主机名")]
+    id: Option<String>,
+    #[arg(long = "tag", value_name = "K=V", help = "中继本机节点标签，可重复")]
+    tags: Vec<String>,
+    #[arg(long, help = "不把中继本机作为节点")]
+    no_local: bool,
 }
 
 #[derive(Args)]
@@ -208,9 +214,24 @@ async fn run_relay(config_path: Option<PathBuf>, args: RelayArgs) -> Result<()> 
         config::pick_string(args.listen, file.listen),
         "中继监听地址（--listen）",
     )?;
+    let local = if args.no_local || file.local == Some(false) {
+        None
+    } else {
+        let id = config::pick_string(args.id, file.id).unwrap_or_else(agent::default_node_id);
+        dsh_remote::protocol::validate_node_id(&id)?;
+        Some(relay::LocalNode {
+            id,
+            tags: if args.tags.is_empty() {
+                file.tags
+            } else {
+                args.tags
+            },
+        })
+    };
     let opts = relay::RelayOptions {
         listen: config::with_port(&listen),
         psk: config::psk(file.psk)?,
+        local,
     };
     relay::run(opts).await
 }

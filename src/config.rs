@@ -15,6 +15,7 @@ pub struct FileConfig {
     pub mcp_http: Option<String>,
     pub psk: Option<String>,
     pub connect: Option<String>,
+    pub local: Option<bool>,
     pub id: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
