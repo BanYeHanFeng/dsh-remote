@@ -8,10 +8,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::aead::{AeadInOut, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use socket2::{SockRef, TcpKeepalive};
@@ -172,7 +172,7 @@ async fn handshake_client(
 ) -> Result<Session> {
     let peer = stream.peer_addr().context("读取对端地址失败")?;
     let mut client_nonce = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut client_nonce);
+    rand::rng().fill(&mut client_nonce);
 
     let key = hello_key(psk);
     let hello = Hello {
@@ -274,7 +274,7 @@ async fn handshake_server(
     }
 
     let mut server_nonce = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut server_nonce);
+    rand::rng().fill(&mut server_nonce);
     let mut ack = serde_json::to_vec(&Ack {
         version: PROTO_VERSION,
     })
@@ -422,7 +422,7 @@ async fn reply_error(stream: &mut TcpStream, message: &str) -> Result<()> {
 }
 
 fn mac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let mut hasher = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC 接受任意长度密钥");
+    let mut hasher = <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC 接受任意长度密钥");
     for part in parts {
         hasher.update(part);
     }
@@ -445,7 +445,7 @@ fn session_keys(
 }
 
 fn aead_key(bytes: &[u8; 32]) -> ChaCha20Poly1305 {
-    ChaCha20Poly1305::new(Key::from_slice(bytes))
+    ChaCha20Poly1305::new(&Key::from(*bytes))
 }
 
 fn short_nonce(bytes: &[u8; 16]) -> [u8; 12] {
@@ -461,12 +461,12 @@ fn counter_nonce(counter: u64) -> [u8; 12] {
 }
 
 fn seal(key: &ChaCha20Poly1305, nonce: &[u8; 12], aad: &[u8], payload: &mut Vec<u8>) -> Result<()> {
-    key.encrypt_in_place(Nonce::from_slice(nonce), aad, payload)
+    key.encrypt_in_place(&Nonce::from(*nonce), aad, payload)
         .map_err(|_| anyhow!("加密握手消息失败"))
 }
 
 fn open(key: &ChaCha20Poly1305, nonce: &[u8; 12], aad: &[u8], payload: &mut Vec<u8>) -> Result<()> {
-    key.decrypt_in_place(Nonce::from_slice(nonce), aad, payload)
+    key.decrypt_in_place(&Nonce::from(*nonce), aad, payload)
         .map_err(|_| anyhow!("解密握手消息失败"))
 }
 
@@ -495,7 +495,7 @@ async fn pump_records(
             .context("读取加密记录失败")?;
         let nonce = counter_nonce(counter);
         counter += 1;
-        key.decrypt_in_place(Nonce::from_slice(&nonce), &head, &mut payload)
+        key.decrypt_in_place(&Nonce::from(nonce), &head, &mut payload)
             .map_err(|_| anyhow!("解密记录失败，链路可能被篡改"))?;
         out.write_all(&payload).await.context("交付明文失败")?;
     }
@@ -545,7 +545,7 @@ impl RecordWriter {
         self.scratch.clear();
         self.scratch.extend_from_slice(buf);
         self.key
-            .encrypt_in_place(Nonce::from_slice(&nonce), &head, &mut self.scratch)
+            .encrypt_in_place(&Nonce::from(nonce), &head, &mut self.scratch)
             .expect("AEAD 加密不会失败");
         self.pending.clear();
         self.pending.extend_from_slice(&head);

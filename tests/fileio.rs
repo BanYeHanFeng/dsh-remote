@@ -1,10 +1,10 @@
 use dsh_remote::fileio;
 use dsh_remote::protocol::ErrorCode;
+use rand::RngExt as _;
 
 fn temp_dir() -> std::path::PathBuf {
     let mut suffix = [0u8; 6];
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(&mut suffix);
+    rand::rng().fill(&mut suffix);
     std::env::temp_dir().join(format!("dsh-remote-test-{}", hex::encode(suffix)))
 }
 

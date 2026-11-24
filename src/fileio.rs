@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rand::RngCore;
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -178,7 +178,7 @@ where
 
 pub fn temp_sibling(path: &Path) -> PathBuf {
     let mut suffix = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut suffix);
+    rand::rng().fill(&mut suffix);
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
