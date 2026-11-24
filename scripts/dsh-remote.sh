@@ -7,7 +7,6 @@ UNIT_DIR="/etc/systemd/system"
 SOCKET_PATH="/run/dsh-remote/controller.sock"
 DEFAULT_PORT="7443"
 REPO="BanYeHanFeng/dsh-remote"
-SCRIPT_URL="https://raw.githubusercontent.com/${REPO}/dev/scripts/dsh-remote.sh"
 
 msg() { printf '%s\n' "$*" >&2; }
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
@@ -227,12 +226,6 @@ deploy_service() {
   systemctl --no-pager --lines=0 status "dsh-remote-${role}.service" || true
 }
 
-config_value() {
-  local file="${ETC_DIR}/$1.toml"
-  [[ -f ${file} ]] || return 0
-  sed -n "s/^$2 = \"\(.*\)\"\$/\1/p" "${file}"
-}
-
 update_role() {
   local role="$1"
   if [[ ! -f "${ETC_DIR}/${role}.toml" ]]; then
@@ -268,31 +261,6 @@ service_action() {
       systemctl is-active "${unit}" >&2 || true
       ;;
   esac
-}
-
-print_access_command() {
-  local role="$1" connect="$2"
-  local psk
-  psk=$(config_value "${role}" psk)
-  [[ -n ${psk} ]] || die "读取 ${ETC_DIR}/${role}.toml 中的 psk 失败"
-  local url="${DSH_REMOTE_SCRIPT_URL:-${SCRIPT_URL}}"
-  msg ""
-  msg "在被控端机器上执行下面这条命令即可完成静默接入："
-  msg ""
-  {
-    printf 'curl -fsSL %s | sudo bash -s -- agent \\\n' "${url}"
-    printf '  --connect %s \\\n' "${connect}"
-    printf '  --psk %s \\\n' "${psk}"
-    printf '  --id "$(hostname)"\n'
-  } >&2
-  cat <<EOF
-
-说明：
-  1. 若能用 scp 传递脚本，也可把 dsh-remote.sh 拷到被控端后执行同样的参数；
-  2. 接入只依赖 PSK：握手用 PSK 双向校验，之后整条 TCP 链路用会话密钥加密；
-  3. 被控端会自动安装二进制、写入 ${ETC_DIR}/agent.toml 并注册启动 dsh-remote-agent.service。
-
-EOF
 }
 
 ask_psk() {
@@ -365,33 +333,22 @@ role_label() {
   esac
 }
 
-service_menu() {
-  local role="$1" action
-  action=$(ask_menu "服务管理 - $(role_label "${role}")" "选择操作" "返回上一级" \
-    status "查看状态" start "启动" stop "停止" restart "重启" logs "实时日志" uninstall "卸载服务") || return 1
-  service_action "${role}" "${action}"
-}
-
 role_menu() {
-  local role="$1" action addr
-  local -a items=(install "安装 / 重新配置" update "更新二进制并重启服务" service "服务管理（状态/启停/日志/卸载）")
-  if [[ ${role} != "agent" ]]; then
-    items+=(access "生成被控端一键接入命令")
-  fi
+  local role="$1" action
   while true; do
-    action=$(ask_menu "$(role_label "${role}")" "选择要执行的操作" "返回上一级" "${items[@]}") || return 0
+    action=$(ask_menu "$(role_label "${role}")" "选择要执行的操作" "返回上一级" \
+      install "安装 / 重新配置" \
+      update "更新二进制并重启服务" \
+      status "查看状态" \
+      start "启动" \
+      stop "停止" \
+      restart "重启" \
+      logs "实时日志" \
+      uninstall "卸载服务") || return 0
     case ${action} in
       install) "configure_${role}" ;;
       update) update_role "${role}" ;;
-      service) service_menu "${role}" || true ;;
-      access)
-        addr=$(config_value "${role}" listen)
-        if [[ -z ${addr} ]]; then
-          msg "读取 ${ETC_DIR}/${role}.toml 中的 listen 失败，请先执行「安装」"
-          continue
-        fi
-        print_access_command "${role}" "${addr}"
-        ;;
+      status | start | stop | restart | logs | uninstall) service_action "${role}" "${action}" || true ;;
     esac
     printf '\n按回车继续...' >&2
     read -r _ || true
@@ -422,15 +379,11 @@ usage() {
   install                 按当前架构下载并安装最新发布的二进制
   update <controller|relay|agent>     更新二进制并按现有配置重启服务
   status|start|stop|restart|logs|uninstall <controller|relay|agent>
-  access [controller|relay]   打印被控端一键接入命令
 
 agent 专用选项：
   --connect <地址>        控制端或中继地址
   --psk <密钥>            预共享密钥
   --id <节点标识>         节点标识，默认主机名
-
-环境变量：
-  DSH_REMOTE_SCRIPT_URL   本脚本的公网地址（用于生成接入命令）
 EOF
 }
 
@@ -485,12 +438,6 @@ case ${subcmd} in
   relay) configure_relay ;;
   agent) configure_agent ;;
   install) install_binary ;;
-  access)
-    role="${ARGS[1]:-controller}"
-    addr=$(config_value "${role}" listen)
-    [[ -n ${addr} ]] || die "读取 ${ETC_DIR}/${role}.toml 中的 listen 失败"
-    print_access_command "${role}" "${addr}"
-    ;;
   update)
     role="${ARGS[1]:-}"
     [[ -n ${role} ]] || die "请指定角色：controller / relay / agent"
