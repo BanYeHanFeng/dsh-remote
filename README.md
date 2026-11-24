@@ -1,3 +1,5 @@
+![CI](https://github.com/BanYeHanFeng/dsh-remote/actions/workflows/ci.yml/badge.svg?branch=dev)
+
 ## 简介
 - 将任意 Linux 接入 dsh
 - 本项目仅个人使用
